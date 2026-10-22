@@ -1,0 +1,23 @@
+[server]
+address = "127.0.0.1"
+port = 8501
+headless = true
+runOnSave = false
+# 不监视源码文件：避免运行中更新代码时部分模块被热重载，导致前后台使用不同版本的类
+fileWatcherType = "none"
+
+[browser]
+gatherUsageStats = false
+serverAddress = "127.0.0.1"
+
+[theme]
+base = "light"
+primaryColor = "#2563EB"
+backgroundColor = "#F4F7FB"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#1F2937"
+font = "sans serif"
+
+[client]
+toolbarMode = "minimal"
+showErrorDetails = true
