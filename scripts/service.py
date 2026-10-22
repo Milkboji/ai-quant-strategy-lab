@@ -19,6 +19,9 @@ CHECK_SEC = int(os.environ.get("AIQUANT_WATCH_SEC", "60"))   # 健康检查间�
 FAILS_BEFORE_RESTART = 3  # 连续多少次无响应后重启
 MEM_LIMIT_MB = int(os.environ.get("AIQUANT_MEM_LIMIT_MB", "2500"))   # 内存超过此值主动重启
 URL = "http://127.0.0.1:8501"
+STOP_FLAG = ROOT / "logs" / "stopped.flag"      # 用户主动停止：后台保活不再自动拉起
+START_LOCK = ROOT / "logs" / "starting.lock"    # 防止开机自启 / 定时保活 / 桌面图标同时启动
+NO_WINDOW = {"creationflags": 0x08000000} if os.name == "nt" else {}   # 后台运行时不闪黑窗口
 sys.path.insert(0, str(ROOT))
 
 
@@ -86,7 +89,7 @@ def _port_pid() -> int | None:
     """实际监听 8501 端口的进程（Windows 虚拟环境的 python.exe 是启动器，真正占内存的是它的子进程）。"""
     try:
         if os.name == "nt":
-            out = subprocess.run("netstat -ano", capture_output=True, text=True, shell=True).stdout
+            out = subprocess.run("netstat -ano", capture_output=True, text=True, shell=True, **NO_WINDOW).stdout
             for line in out.splitlines():
                 if "127.0.0.1:8501" in line and "LISTENING" in line:
                     return int(line.split()[-1])
@@ -104,10 +107,20 @@ def _app_pid() -> int | None:
         return None
 
 
-def _detach_kw() -> dict:
+def _detach_kw(breakaway: bool = True) -> dict:
     if os.name == "nt":
-        return {"creationflags": 0x00000008 | 0x00000200 | 0x08000000}  # DETACHED | NEW_GROUP | NO_WINDOW
+        f = 0x00000008 | 0x00000200 | 0x08000000  # DETACHED | NEW_GROUP | NO_WINDOW
+        if breakaway:
+            f |= 0x01000000   # BREAKAWAY_FROM_JOB：不随启动它的计划任务 / 父程序一起被关闭
+        return {"creationflags": f}
     return {"start_new_session": True}
+
+
+def _spawn(cmd: list, **kw) -> subprocess.Popen:
+    try:
+        return subprocess.Popen(cmd, **kw, **_detach_kw(True))
+    except OSError:   # 所在作业不允许脱离时退回普通方式
+        return subprocess.Popen(cmd, **kw, **_detach_kw(False))
 
 
 def _wlog(msg: str) -> None:
@@ -128,7 +141,7 @@ def _kill(pid: int | None) -> None:
         return
     try:
         if os.name == "nt":
-            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True)
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, **NO_WINDOW)
         else:
             os.killpg(os.getpgid(pid), signal.SIGTERM)
     except Exception:
@@ -136,10 +149,10 @@ def _kill(pid: int | None) -> None:
 
 
 def _launch_app() -> subprocess.Popen:
-    cmd = [sys.executable, "-m", "streamlit", "run", str(ROOT / "app.py"), "--server.address", "127.0.0.1",
-           "--server.port", "8501", "--server.headless", "true"]
+    # 先启动后台交易循环再启动网页（scripts/run_server.py），没人打开网页也照常自动交易
+    cmd = [sys.executable, str(ROOT / "scripts" / "run_server.py")]
     logf = open(LOG, "a", encoding="utf-8")
-    p = subprocess.Popen(cmd, cwd=str(ROOT), stdout=logf, stderr=subprocess.STDOUT, **_detach_kw())
+    p = _spawn(cmd, cwd=str(ROOT), stdout=logf, stderr=subprocess.STDOUT)
     PID.write_text(str(p.pid))
     return p
 
@@ -190,12 +203,72 @@ def _start_watchdog() -> None:
         wp = None
     if _alive(wp):
         return
-    subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "watch"], cwd=str(ROOT),
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **_detach_kw())
+    _spawn([sys.executable, str(Path(__file__).resolve()), "watch"], cwd=str(ROOT),
+           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def _lock() -> bool:
+    """获取启动锁；120 秒内已有其他启动在进行时返回 False。"""
+    try:
+        if START_LOCK.exists() and time.time() - START_LOCK.stat().st_mtime < 120:
+            return False
+        START_LOCK.write_text(str(os.getpid()))
+        return True
+    except Exception:
+        return True
+
+
+def _msgbox(text: str, title: str = "AI 量化交易") -> None:
+    if os.name == "nt":
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(None, text, title, 0x40)
+        except Exception:
+            pass
+
+
+def ensure() -> int:
+    """后台保活（开机自启与每 5 分钟的计划任务调用）：没在运行就启动，不打开浏览器。用户手动停止后不启动。"""
+    (ROOT / "logs").mkdir(exist_ok=True)
+    if STOP_FLAG.exists():
+        return 0
+    if healthy():
+        _start_watchdog()
+        return 0
+    if not _lock():
+        return 0
+    try:
+        _wlog("后台保活：服务未运行，自动启动")
+        return start(open_browser=False)
+    finally:
+        START_LOCK.unlink(missing_ok=True)
+
+
+def open_ui() -> int:
+    """桌面图标：确保服务运行（必要时启动），就绪后打开浏览器。"""
+    (ROOT / "logs").mkdir(exist_ok=True)
+    STOP_FLAG.unlink(missing_ok=True)
+    if not healthy():
+        if _lock():
+            try:
+                start(open_browser=False)
+            finally:
+                START_LOCK.unlink(missing_ok=True)
+        for _ in range(120):          # 另一个启动正在进行：等它就绪
+            if healthy():
+                break
+            time.sleep(1)
+    if healthy():
+        _start_watchdog()
+        webbrowser.open(URL)
+        return 0
+    _msgbox(f"量化系统启动失败。\n请查看日志：{LOG}")
+    return 1
 
 
 def start(open_browser: bool = True) -> int:
     (ROOT / "logs").mkdir(exist_ok=True)
+    STOP_FLAG.unlink(missing_ok=True)
     if healthy():
         _start_watchdog()
         print(f"[OK] 服务已在运行：{URL}")
@@ -224,22 +297,24 @@ def start(open_browser: bool = True) -> int:
 
 
 def stop() -> int:
+    (ROOT / "logs").mkdir(exist_ok=True)
+    STOP_FLAG.write_text(time.strftime("%Y-%m-%d %H:%M:%S"))   # 手动停止后，后台保活不会再自动启动
     WPID.unlink(missing_ok=True)   # 先让守护进程退出，避免它把服务重新拉起
     pid = int(PID.read_text()) if PID.exists() else None
     if pid:
         try:
             if os.name == "nt":
-                subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True)
+                subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, **NO_WINDOW)
             else:
                 os.killpg(os.getpgid(pid), signal.SIGTERM)
         except Exception:
             pass
         PID.unlink(missing_ok=True)
     if os.name == "nt" and healthy():
-        out = subprocess.run("netstat -ano", capture_output=True, text=True, shell=True).stdout
+        out = subprocess.run("netstat -ano", capture_output=True, text=True, shell=True, **NO_WINDOW).stdout
         for line in out.splitlines():
             if "127.0.0.1:8501" in line and "LISTENING" in line:
-                subprocess.run(["taskkill", "/PID", line.split()[-1], "/T", "/F"], capture_output=True)
+                subprocess.run(["taskkill", "/PID", line.split()[-1], "/T", "/F"], capture_output=True, **NO_WINDOW)
     time.sleep(1)
     print("[OK] 已停止" if not healthy() else "[WARN] 端口 8501 仍有服务在运行")
     return 0
@@ -264,4 +339,5 @@ def status() -> int:
 
 if __name__ == "__main__":
     a = sys.argv[1] if len(sys.argv) > 1 else "status"
-    sys.exit({"start": start, "stop": stop, "status": status, "watch": watch}[a]())
+    sys.exit({"start": start, "stop": stop, "status": status, "watch": watch, "ensure": ensure,
+              "open": open_ui}[a]())

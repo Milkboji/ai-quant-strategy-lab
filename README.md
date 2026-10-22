@@ -37,6 +37,16 @@
 
 其他系统：`python -m venv .venv && .venv/bin/pip install -r requirements.txt && .venv/bin/streamlit run app.py`。
 
+### 后台常驻（推荐，Windows）
+
+双击 `install_autostart.bat`（只需一次）：
+- 登录 Windows 后自动在后台启动（无黑窗口），并每 5 分钟检查一次，停了自动拉起；
+- 自动交易循环在服务启动时就运行，不需要打开网页；
+- 桌面 / 开始菜单出现「AI量化交易」图标，双击即打开（没在运行会先启动）；
+- `stop.bat` 停止并暂停自动拉起，下次点图标或 `start.bat` 恢复；`uninstall_autostart.bat` 移除自启。
+
+电脑睡眠或关机时程序无法运行，需要 7×24 运行请在 Windows 电源设置里关闭自动睡眠。
+
 ### 开启模拟盘自动下单（可选）
 
 双重锁，缺一不可：
