@@ -313,6 +313,16 @@ class PaperRunner:
             event(self.did, "ERROR", f"订单被拒绝：{e}", self.is_test)
         return None
 
+    def _rhythm_exit(self, now: datetime, reason: str, pnl_est: float) -> None:
+        try:
+            from .. import rhythm
+            msg = rhythm.live_on_exit(self.did, now, reason, pnl_est)
+            if msg:
+                event(self.did, "INFO", f"交易节奏：本笔{'盈利' if pnl_est > 0 else '亏损'}约 {pnl_est:,.0f} USD → {msg}",
+                      self.is_test)
+        except Exception:  # noqa: BLE001
+            pass
+
     def step(self, df5: pd.DataFrame, now: datetime) -> dict:
         dep = get_deployment(self.did)
         status = dep["status"]
@@ -385,8 +395,10 @@ class PaperRunner:
                 reason = "止盈"
             if reason:
                 bar_ts = sig_ts if reason == "退出规则" else pd.Timestamp(last["ts"]).isoformat()
-                self._order("sell", my_qty, bar_ts, price)
+                res = self._order("sell", my_qty, bar_ts, price)
                 out.update(action="sell", reason=reason)
+                if res is not None:
+                    self._rhythm_exit(now, reason, (price - ep) * my_qty - (price + ep) * my_qty * 0.0025)
             else:
                 out["reason"] = "持仓中，未触发退出"
             return out
@@ -404,6 +416,21 @@ class PaperRunner:
                     self._note("WARN", out["reason"])
                     self._last_stale = sig_ts
                 return out
+            # 交易节奏：冷却 / 连亏刹车 / 每日上限 → 跳过本次入场；波动率定仓 → 缩小仓位
+            try:
+                from .. import rhythm
+                block, vmult, _info = rhythm.live_gate(self.did, now, df5)
+            except Exception as e:  # noqa: BLE001  节奏模块异常时保守处理：不开新仓
+                block, vmult = f"交易节奏检查异常：{type(e).__name__}", 1.0
+            if block:
+                out.update(action="none", reason=f"交易节奏：{block}，跳过本次入场信号")
+                self._note("INFO", out["reason"])
+                return out
+            if self.broker.name == "alpaca_paper" and "budget_usd" in dep["config"] \
+                    and float(dep["config"]["budget_usd"] or 0) <= 0:
+                out.update(action="blocked", reason="资金额度为 0（等待重新分配），不开新仓")
+                self._note("WARN", out["reason"])
+                return out
             budget_pct = float(dep["config"].get("alloc_pct", 100)) * self.schema.alloc_pct / 100
             usd = acct.cash * budget_pct / 100 * 0.99
             if dep["config"].get("budget_usd"):
@@ -411,12 +438,21 @@ class PaperRunner:
             cap = dep["config"].get("max_position_usd")
             if cap:
                 usd = min(usd, float(cap))
+            if vmult < 0.999:
+                usd *= vmult
+                out["rhythm_size"] = round(vmult, 3)
             qty = float(f"{usd / price:.6f}")
             if qty * price < 10:
                 out.update(action="blocked", reason="可用资金不足最小下单额")
                 return out
-            self._order("buy", qty, sig_ts, price)
-            out.update(action="buy", reason="入场规则")
+            res = self._order("buy", qty, sig_ts, price)
+            out.update(action="buy", reason="入场规则" + (f"（波动率定仓 {vmult:.0%}）" if vmult < 0.999 else ""))
+            if res is not None:
+                try:
+                    from .. import rhythm
+                    rhythm.live_on_entry(self.did, now)
+                except Exception:  # noqa: BLE001
+                    pass
         else:
             out["reason"] = "空仓，等待入场信号"
         return out

@@ -68,6 +68,7 @@ def render() -> None:
             flash("evolve", "success", "设置已保存")
             st.rerun()
     status_panel()
+    rhythm_panel()
     challengers_panel()
     results_panel()
 
@@ -145,6 +146,50 @@ def results_panel() -> None:
                  column_config={"原因": st.column_config.TextColumn(width="large"),
                                 "改动": st.column_config.TextColumn(width="medium")})
     st.caption("稳健分越高越好；“替换”的策略会在空仓时自动切换到新版本，切换记录可在模拟盘日志中查看。")
+
+
+def rhythm_panel() -> None:
+    from .. import rhythm
+    rc = rhythm.get_config()
+    rh = rhythm.current()
+    with st.container(border=True):
+        C.section("交易节奏（系统统一把控）", purple=True, right=C.pill("开启" if rh else "已关闭", "purple" if rh else "gray"))
+        st.markdown(
+            '<div class="aq-sub">在每个策略的买卖信号之上加一层统一纪律：信号照常产生，但<b>要不要做、做多大</b>由节奏规则决定。'
+            '规则是用 2021 年至今 BTC 和 ETH 的 5 分钟历史，对全部 8 个策略逐年回测、比较 25 种方案后选定的；'
+            '进化、挑战者检验和模拟盘下单用的是同一套规则。</div>', unsafe_allow_html=True)
+        cols = st.columns([2.2, 1])
+        with cols[0]:
+            rules = (rh or rhythm.RULES_V1).describe()
+            extra = [f"自动进化不再生成 {rc['min_signal_tf']} 分钟以下的版本（0.25% 单边手续费下，短周期长期被成本吃掉）",
+                     f"长周期体检（每天）：近 {rc['long_years']} 年平均年收益为负且盈利年份少于 {rc['long_min_pos_years']} 个 → 暂停新开仓并释放额度",
+                     "资金额度按长周期 年均收益 / 年均回撤 分配：长期最稳的日线趋势策略拿最多"]
+            st.markdown("".join(f"<div>• {C.esc(x)}</div>" for x in rules + extra), unsafe_allow_html=True)
+        with cols[1]:
+            en = st.toggle("启用交易节奏", value=bool(rc.get("enabled")), key="rh_en",
+                           help="关闭后每个信号都按原额度执行（不建议）")
+            if en != bool(rc.get("enabled")):
+                rhythm.set_config(enabled=en)
+                flash("evolve", "success", "交易节奏已" + ("开启" if en else "关闭"))
+                st.rerun()
+            last = db.get_setting("rhythm_long_refreshed") or {}
+            st.caption(f"长周期体检：{_bj(last.get('at')) if last.get('at') else '尚未运行'}")
+        rows = rhythm.status_rows()
+        if rows:
+            tbl = []
+            for r in rows:
+                lm = r["long"] or {}
+                tbl.append({
+                    "部署": f"#{r['id']}", "策略": r["label"],
+                    "状态": "🟢 运行" if r["status"] == "running" else "⏸ 暂停开仓",
+                    "节奏": f"⏳ {r['block_why']}" if r["blocked"] else "✅ 可开仓",
+                    "连亏": r["streak"],
+                    "长周期年均": f"{lm['mean_ret']:+.1f}%" if lm else "--",
+                    "年均回撤": f"{lm['mean_dd']:.1f}%" if lm else "--",
+                    "盈利年份": f"{lm['pos_years']}/{lm['n_years']}" if lm else "--",
+                    "体检": ("✅ 达标" if lm.get("ok") else "❌ 不达标") if lm else "待计算",
+                    "额度": f"{float(r['budget'] or 0):,.0f}"})
+            st.dataframe(pd.DataFrame(tbl), hide_index=True, use_container_width=True)
 
 
 STATUS_CN = {"running": "🟣 模拟运行中", "promoted": "🟢 已晋级上线", "rejected": "⚪ 已淘汰", "expired": "⚪ 已作废",

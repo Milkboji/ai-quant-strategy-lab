@@ -22,6 +22,7 @@ import pandas as pd
 from ..strategy.schema import StrategySchema
 from . import risk
 from .execution import CostModel, fill, max_buy_qty
+from .rhythm import Gate, Rhythm, daily_context, lookup
 from .signals import build_frame, group_signal
 
 ASSUMPTIONS = [
@@ -53,6 +54,7 @@ class BTConfig:
     max_alloc_pct: float = 100.0
     cost: CostModel = CostModel()
     reserve_pct: float = 0.5
+    rhythm: Rhythm | None = None
 
 
 def _naive(s: pd.Series) -> np.ndarray:
@@ -121,6 +123,13 @@ def run(df5: pd.DataFrame, s: StrategySchema, signal_tf: int, aux_tf: int | None
             events[fi] = int(mi)  # 多根主K线落在同一执行K线时保留最新一根
 
     alloc = min(s.alloc_pct, cfg.max_alloc_pct)
+    rh = cfg.rhythm if (cfg.rhythm is not None and cfg.rhythm.active) else None
+    gate = Gate(rh) if rh else None
+    if rh and (rh.regime_sma_days or rh.vol_target_pct):
+        reg_ok, vmult = lookup(daily_context(df5, rh), frame["close_time"])
+    else:
+        reg_ok, vmult = np.ones(len(frame), bool), np.ones(len(frame))
+    rhythm_skipped = 0
     cm = cfg.cost
     cash = cfg.initial_cash
     qty = 0.0
@@ -153,6 +162,8 @@ def run(df5: pd.DataFrame, s: StrategySchema, signal_tf: int, aux_tf: int | None
         })
         qty = 0.0
         entry_fill = None
+        if gate is not None:
+            gate.on_exit(pd.Timestamp(ts[i]).tz_localize("UTC"), reason, pnl)
 
     for k, i in enumerate(range(i0, n)):
         if should_stop is not None and k % 4000 == 0 and should_stop():
@@ -170,8 +181,11 @@ def run(df5: pd.DataFrame, s: StrategySchema, signal_tf: int, aux_tf: int | None
                 if reason:
                     do_sell(i, o[i], reason, sig_ts)
                     exited_this_bar = True
+            elif ent[mi] and not ex[mi] and gate is not None and \
+                    gate.check(pd.Timestamp(ts[i]).tz_localize("UTC"), bool(reg_ok[mi])) is not None:
+                rhythm_skipped += 1
             elif ent[mi] and not ex[mi]:
-                q = max_buy_qty(cash, o[i], alloc, cm, cfg.reserve_pct)
+                q = max_buy_qty(cash, o[i], alloc * float(vmult[mi]), cm, cfg.reserve_pct)
                 f = fill("buy", o[i], q, cm)
                 rd = risk.check_buy(cash, f.notional, f.fee, alloc, max_alloc_pct=cfg.max_alloc_pct)
                 if rd.ok:
@@ -183,6 +197,8 @@ def run(df5: pd.DataFrame, s: StrategySchema, signal_tf: int, aux_tf: int | None
                                   "slip": f.slippage_cost}
                     entry_main = mi
                     peak = f.price
+                    if gate is not None:
+                        gate.on_entry(pd.Timestamp(ts[i]).tz_localize("UTC"))
                 else:
                     blocked += 1
         if qty > 0 and not exited_this_bar:
@@ -231,6 +247,7 @@ def run(df5: pd.DataFrame, s: StrategySchema, signal_tf: int, aux_tf: int | None
         "exposure_pct": hold_bars / max(len(ets), 1) * 100,
         "avg_trade_pnl": (sum(t["pnl"] for t in trades) / len(trades)) if trades else None,
         "orders_blocked_by_risk": blocked,
+        "signals_skipped_by_rhythm": rhythm_skipped,
         "signal_bars": int(in_win.sum()),
         "signals_dropped_data_gap": dropped_gap,
         "partial_bars_excluded": int(frame.attrs.get("partial_bars_excluded", 0)),

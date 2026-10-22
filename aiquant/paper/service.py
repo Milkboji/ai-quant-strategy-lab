@@ -109,6 +109,11 @@ def _loop() -> None:
                     challenger.evaluate_all()
             except Exception:  # noqa: BLE001
                 log.error("challenger error: %s", traceback.format_exc())
+            try:   # 交易节奏：每天一次长周期体检 → 暂停/恢复 → 重新分配额度（后台线程）
+                from .. import rhythm
+                rhythm.maybe_daily()
+            except Exception:  # noqa: BLE001
+                log.error("rhythm daily error: %s", traceback.format_exc())
             try:
                 _snapshot_account()
             except Exception:  # noqa: BLE001

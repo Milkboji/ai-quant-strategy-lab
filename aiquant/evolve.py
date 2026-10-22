@@ -179,7 +179,11 @@ def mutations(sch: dict) -> list[tuple[dict, str]]:
     # 5) K 线周期（相邻周期；辅助周期必须更长）
     if tf in SEARCH_TFS:
         k = SEARCH_TFS.index(tf)
+        from . import rhythm
+        min_tf = int(rhythm.get_config().get("min_signal_tf") or 0)
         for ntf in SEARCH_TFS[max(0, k - 1):k] + SEARCH_TFS[k + 1:k + 2]:
+            if ntf < min_tf and ntf < tf:
+                continue   # 交易节奏：不再往更短的周期进化（短周期长期被手续费吃掉）
             aux = sch.get("aux_tf")
             if aux and ntf >= aux:
                 continue
@@ -216,8 +220,10 @@ def evaluate(df5: pd.DataFrame, sch: dict, start: datetime, end: datetime, r: di
     if errs:
         raise ValueError("；".join(errs))
     tf = int(sch.get("signal_tf") or 15)
+    from . import rhythm
     cfg = bt.BTConfig(start=start, end=end, initial_cash=float(r["initial_cash"]),
-                      max_alloc_pct=float(r["max_alloc_pct"]), cost=research.cost_model(r))
+                      max_alloc_pct=float(r["max_alloc_pct"]), cost=research.cost_model(r),
+                      rhythm=rhythm.current())
     res = bt.run(df5, obj, tf, sch.get("aux_tf"), cfg)
     m = res["metrics"]
     segs = segment_returns(res["equity"], start, end)
@@ -560,6 +566,11 @@ def run(job: dict, stage, should_stop) -> int:
     except Exception:  # noqa: BLE001
         log.exception("challenger evaluation failed")
     try:
+        try:   # 新版本的长周期体检（2021 年起逐年回测）
+            from . import rhythm
+            rhythm.refresh_long_all()
+        except Exception:  # noqa: BLE001
+            log.exception("rhythm long refresh failed")
         health_check()   # 按本轮结果立即执行长期亏损暂停 / 恢复
     except Exception:  # noqa: BLE001
         log.exception("health_check failed")
@@ -678,6 +689,23 @@ def _resume(dep: dict, reason: str) -> None:
     _save_cfg(dep["id"], cfg)
     pr.set_status(dep["id"], "running")
     pr.event(dep["id"], "INFO", f"自动恢复新开仓：{reason}"[:480], bool(dep["is_test"]))
+    if not dep["is_test"] and dep.get("broker") == "alpaca_paper":
+        try:   # 恢复后立即重新分配额度（长周期暂停期间额度为 0）
+            rebalance()
+        except Exception:  # noqa: BLE001
+            log.exception("rebalance after resume failed")
+
+
+def _long_check(dep: dict) -> dict | None:
+    """长周期体检结果（只读缓存）。节奏总控关闭或未开启体检否决时返回 None。"""
+    try:
+        from . import rhythm
+        rc = rhythm.get_config()
+        if not rc.get("enabled") or not rc.get("long_veto") or dep.get("broker") != "alpaca_paper":
+            return None
+        return rhythm.long_metrics(dep)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def health_check(price: float | None = None) -> list[str]:
@@ -685,6 +713,7 @@ def health_check(price: float | None = None) -> list[str]:
     from .paper import runner as pr
     c = get_config()
     out = []
+    converted = False
     for d in db.q("SELECT id FROM paper_deployments WHERE status IN ('running','paused_entries')"):
         dep = pr.get_deployment(d["id"])
         cfg = dep["config"]
@@ -697,8 +726,26 @@ def health_check(price: float | None = None) -> list[str]:
             pr.event(dep["id"], "INFO", "已手动恢复：该版本不再因长期亏损被自动暂停", bool(dep["is_test"]))
             continue
         tr = _active_train_return(dep)
+        lm = _long_check(dep)
         if dep["status"] == "paused_entries" and ap:
             new_version = dep["version_id"] != ap.get("version_id")
+            if ap["kind"] == "long":
+                if lm is not None and lm["ok"]:
+                    _resume(dep, f"长周期体检达标：近 {lm['n_years']} 年平均年收益 {lm['mean_ret']:+.1f}%，"
+                                 f"盈利 {lm['pos_years']} 年" + ("（自动进化已换上新版本）" if new_version else ""))
+                    out.append(f"#{dep['id']} 恢复（长周期）")
+                continue
+            if lm is not None and not lm["ok"]:
+                # 已因其他原因暂停、长周期体检也不达标：转为长周期暂停（额度释放，达标后才恢复）
+                ap.update(kind="long", reason=f"长周期体检不达标：近 {lm['n_years']} 年平均年收益 {lm['mean_ret']:+.1f}%，"
+                                              f"只有 {lm['pos_years']} 年盈利", at=db.now_iso())
+                cfg["auto_pause"] = ap
+                _save_cfg(dep["id"], cfg)
+                pr.event(dep["id"], "INFO", f"暂停原因更新为{ap['reason']}；额度将释放给长期有优势的策略", bool(dep["is_test"]))
+                out.append(f"#{dep['id']} 转为长周期暂停")
+                if not dep["is_test"]:
+                    converted = True
+                continue
             if tr is not None and tr > 0 and (ap["kind"] == "backtest" or new_version):
                 _resume(dep, f"当前版本训练集收益 {tr:+.1f}%" + ("（自动进化已换上新版本）" if new_version else ""))
                 out.append(f"#{dep['id']} 恢复")
@@ -706,6 +753,11 @@ def health_check(price: float | None = None) -> list[str]:
         if dep["status"] != "running" or not c.get("pause_losers"):
             continue
         if cfg.get("auto_pause_override") == dep["version_id"]:
+            continue
+        if lm is not None and not lm["ok"]:
+            _pause(dep, "long", f"长周期体检不达标：2021 年起 {lm['n_years']} 个年度平均年收益 {lm['mean_ret']:+.1f}%，"
+                                f"只有 {lm['pos_years']} 年盈利（含交易节奏规则）")
+            out.append(f"#{dep['id']} 暂停（长周期）")
             continue
         if tr is not None and tr <= float(c["pause_train_loss_pct"]):
             _pause(dep, "backtest", f"训练集一年回测收益 {tr:+.1f}%（阈值 {c['pause_train_loss_pct']:g}%）")
@@ -718,6 +770,11 @@ def health_check(price: float | None = None) -> list[str]:
                 _pause(dep, "live", f"本版本上线以来模拟盘亏损 {pnl:,.0f} USD（额度 {budget:,.0f} 的 "
                                     f"{pnl / budget * 100:.1f}%，阈值 {c['pause_live_loss_pct']:g}%）")
                 out.append(f"#{dep['id']} 暂停（实盘）")
+    if converted:
+        try:
+            rebalance()
+        except Exception:  # noqa: BLE001
+            log.exception("rebalance after long conversion failed")
     return out
 
 
@@ -758,11 +815,26 @@ def plan_budgets(equity: float, deps: list[dict], cfgv: dict | None = None) -> d
     running = [d for d in deps if d["status"] == "running"]
     floor = equity * float(c["paused_floor_pct"]) / 100
     plan: dict[int, dict] = {}
+    n_floor = 0
     for d in paused:
+        if ((d.get("config") or {}).get("auto_pause") or {}).get("kind") == "long":
+            plan[d["id"]] = {"budget": 0, "weight": None, "why": "长周期体检暂停：额度释放给长期有优势的策略"}
+            continue
+        n_floor += 1
         plan[d["id"]] = {"budget": int(floor // 100 * 100), "weight": None, "why": "暂停中，保留最低额度"}
-    left = max(0.0, total - floor * len(paused))
+    left = max(0.0, total - floor * n_floor)
     w = {}
     for d in running:
+        lm = _long_check(d)
+        if lm is not None:
+            raw = 2 * lm["mean_ret"] / max(lm["mean_dd"], 1.0)
+            if lm["mean_ret"] <= 0:
+                w[d["id"]] = (float(c["weight_min"]), f"长周期年均收益 {lm['mean_ret']:+.1f}%，最低权重")
+            else:
+                w[d["id"]] = (min(max(raw, float(c["weight_min"])), float(c["weight_max"])),
+                              f"长周期 {lm['n_years']} 年：年均收益 {lm['mean_ret']:+.1f}% / 年均回撤 {lm['mean_dd']:.1f}%，"
+                              f"盈利 {lm['pos_years']} 年 → 权重 {raw:.2f}")
+            continue
         m = _train_metrics(d) or {}
         ret, dd = m.get("return_pct"), m.get("max_dd_pct")
         if ret is None or ret <= 0:

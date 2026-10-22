@@ -289,6 +289,14 @@ def _health(clock: dict | None) -> None:
          (f"收盘 {_bj(clock.get('next_close'))}" if clock else "--")),
         ("真实资金交易", "永久关闭", "gray", "LIVE_ORDERS = 0"),
     ]
+    try:
+        from .. import rhythm
+        rows = rhythm.status_rows()
+        cool = sum(1 for r in rows if r["blocked"])
+        items.insert(3, ("交易节奏", "纪律执行中" if rhythm.current() else "已关闭", "purple" if rhythm.current() else "gray",
+                         f"{cool} 个策略冷却中" if cool else "冷却 · 连亏刹车 · 波动率定仓"))
+    except Exception:  # noqa: BLE001
+        pass
     cells = "".join(f'<div class="hm-h"><span>{n}</span>{C.pill(s, t)}<em>{C.esc(d)}</em></div>' for n, s, t, d in items)
     st.markdown(f'<div class="hm-health">{cells}</div>', unsafe_allow_html=True)
 

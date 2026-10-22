@@ -54,7 +54,8 @@ def test_mutations_are_valid_and_distinct():
     for m, why in muts:
         assert not validate(m)[1] and why
     tfs = {m["signal_tf"] for m, _ in muts}
-    assert {30, 240} <= tfs                          # 相邻K线周期
+    assert 240 in tfs                                # 相邻K线周期
+    assert 30 not in tfs                             # 交易节奏：不往 1 小时以下进化
 
 
 def test_segment_returns_and_score():
