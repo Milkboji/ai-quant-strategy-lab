@@ -6,6 +6,7 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 import webbrowser
 from pathlib import Path
@@ -164,6 +165,9 @@ CF_EXE = ROOT / "tools" / "cloudflared.exe"
 CF_CFG = ROOT / "config" / "cloudflared.yml"
 CF_PID = ROOT / "logs" / "cloudflared.pid"
 CF_LOG = ROOT / "logs" / "cloudflared.log"
+CF_METRICS = "127.0.0.1:20241"          # cloudflared 本地状态接口：/ready 在至少有 1 条通道连接时返回 200
+CF_STALL_CHECKS = 3                     # 连续 3 次（约 3 分钟）没有可用通道 → 重启 cloudflared
+_cf_state = {"started": 0.0, "fails": 0}
 
 
 def tunnel_configured() -> bool:
@@ -188,9 +192,46 @@ def ensure_tunnel() -> None:
     except Exception:
         pass
     p = _spawn([exe, "tunnel", "--no-autoupdate", "--loglevel", "info", "--logfile", str(CF_LOG),
-                "--config", str(CF_CFG), "run"], cwd=str(ROOT), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                "--metrics", CF_METRICS, "--config", str(CF_CFG), "run"],
+               cwd=str(ROOT), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     CF_PID.write_text(str(p.pid))
+    _cf_state.update(started=time.time(), fails=0)
     _wlog(f"外网通道（Cloudflare Tunnel）已启动，PID {p.pid}")
+
+
+def tunnel_ready() -> bool | None:
+    """cloudflared 是否至少有一条到 Cloudflare 的可用连接（None = 状态接口不可用，无法判断）。"""
+    try:
+        with urllib.request.urlopen(f"http://{CF_METRICS}/ready", timeout=3) as r:
+            return r.status == 200
+    except urllib.error.HTTPError:
+        return False
+    except Exception:
+        return None
+
+
+def check_tunnel() -> None:
+    """通道自愈：连接全部掉线且几分钟内没有自己恢复时，重启 cloudflared。"""
+    if not tunnel_configured() or not _alive(_cf_pid()):
+        return
+    if time.time() - _cf_state["started"] < 90:      # 刚启动，给它时间建立连接
+        return
+    ok = tunnel_ready()
+    if ok is None:                                    # 旧进程没有状态接口：重启一次换成新参数
+        if _cf_state["started"] == 0.0:
+            _wlog("外网通道没有状态接口（旧进程），重启以启用自动检测")
+            stop_tunnel(); ensure_tunnel()
+        return
+    if ok:
+        if _cf_state["fails"]:
+            _wlog("外网通道已恢复")
+        _cf_state["fails"] = 0
+        return
+    _cf_state["fails"] += 1
+    if _cf_state["fails"] >= CF_STALL_CHECKS:
+        _wlog(f"外网通道连续 {_cf_state['fails']} 次检查没有可用连接，重启 cloudflared")
+        stop_tunnel()
+        ensure_tunnel()
 
 
 def stop_tunnel() -> None:
@@ -210,8 +251,9 @@ def watch() -> int:
             return 0
         try:
             ensure_tunnel()
+            check_tunnel()
         except Exception as e:  # noqa: BLE001
-            _wlog(f"外网通道启动失败：{e}")
+            _wlog(f"外网通道启动/检测失败：{e}")
         pid = _pid()
         mem = _mem_mb(_app_pid() or _port_pid() or pid)
         if time.time() - last_mem_log >= 600:
@@ -378,7 +420,9 @@ def status() -> int:
     print(f"PID 文件      : {PID.read_text() if PID.exists() else '-'}  内存 {_mem_mb(_app_pid() or _pid())} MB")
     wp = int(WPID.read_text()) if WPID.exists() else None
     print(f"守护进程      : {'运行中' if _alive(wp) else '未运行'}  日志 {WLOG}")
-    print(f"外网通道      : {('运行中' if _alive(_cf_pid()) else '未运行') if tunnel_configured() else '未配置'}  日志 {CF_LOG}")
+    rd = tunnel_ready() if tunnel_configured() and _alive(_cf_pid()) else None
+    print(f"外网通道      : {('运行中' if _alive(_cf_pid()) else '未运行') if tunnel_configured() else '未配置'}"
+          f"{'（已连接 Cloudflare）' if rd else ('（暂时没有可用连接）' if rd is False else '')}  日志 {CF_LOG}")
     print(f"PAPER_ORDERS  : {'已解锁' if http.paper_orders_unlocked() else '0 (锁定)'}")
     print(f"LIVE_ORDERS   : 0 (永久禁用)")
     print(f"Alpaca 行情Key: {config.mask(config.secret('ALPACA_API_KEY_ID'))}")
