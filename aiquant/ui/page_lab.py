@@ -33,6 +33,28 @@ def _chart_data(bt_id: int):
         return pd.DataFrame(), pd.DataFrame()
 
 
+def _research_status(act: int) -> str:
+    """研究状态：手动回测/AI 任务 + 后台自动进化与挑战者（它们不在实验室任务队列里，单独显示）。"""
+    if act:
+        return C.pill(f"回测/AI 任务进行中 {act} 个", "blue")
+    parts = []
+    try:
+        from .. import challenger, evolve
+        job = db.q1("SELECT status FROM jobs WHERE kind='evolve' AND is_test=0 ORDER BY id DESC LIMIT 1")
+        if job and job["status"] in ("queued", "running"):
+            parts.append(C.pill("自动进化进行中", "purple"))
+        nch = len(challenger.running())
+        if nch:
+            parts.append(C.pill(f"{nch} 个挑战者在实时行情上验证", "purple"))
+        nxt = evolve.next_run_at()
+        if nxt:
+            parts.append(f'<span class="aq-sub">下次自动进化 {(pd.Timestamp(nxt) + pd.Timedelta(hours=8)).strftime("%m-%d %H:%M")}</span>')
+    except Exception:  # noqa: BLE001
+        pass
+    head = C.pill("手动回测空闲", "gray")
+    return head + (" " + " ".join(parts) if parts else "")
+
+
 # ---------------------------------------------------------------------------
 # 全局研究设置
 # ---------------------------------------------------------------------------
@@ -169,7 +191,7 @@ def target_banner(r: dict) -> None:
         f'最大仓位 {r["max_alloc_pct"]:.0f}% | 仅做多 | 1倍 | 不使用杠杆）</span>'
         f'<span>最佳训练收益 {f("训练集")}</span><span>最佳验证收益 {f("验证集")}</span>'
         f'<span>独立测试收益 {test_txt}</span><span>距离目标 <b>{gap}</b>（训练集结果不代表目标达成）</span>'
-        f'<span>研究状态 {C.pill("运行中 " + str(act), "blue") if act else C.pill("空闲", "gray")}</span>'
+        f'<span>研究状态 {_research_status(act)}</span>'
         f'<span class="aq-sub" style="flex-basis:100%">{data_txt}</span></div>', unsafe_allow_html=True)
 
 
