@@ -168,8 +168,9 @@ CF_LOG = ROOT / "logs" / "cloudflared.log"
 CF_METRICS = "127.0.0.1:20241"          # cloudflared 本地状态接口：/ready 在至少有 1 条通道连接时返回 200
 CF_STALL_CHECKS = 3                     # 连续 3 次（约 3 分钟）没有可用通道 → 重启 cloudflared
 CF_ERR = ROOT / "logs" / "cloudflared.stderr.log"
-# 优先 QUIC（UDP，不受部分网络定时掐断 TCP 长连接的影响）；启动失败或连不上时自动退回 HTTP/2
-_cf_state = {"started": 0.0, "fails": 0, "proto": os.environ.get("AIQUANT_TUNNEL_PROTOCOL", "quic"), "quick_exits": 0}
+# 默认 HTTP/2：实测这台电脑的网络每约 12 分钟断一次，HTTP/2 约 10 秒重连，QUIC 要 100 秒左右。
+# 可用环境变量 AIQUANT_TUNNEL_PROTOCOL=quic 试用 QUIC；QUIC 启动失败或连不上时自动退回 HTTP/2
+_cf_state = {"started": 0.0, "fails": 0, "proto": os.environ.get("AIQUANT_TUNNEL_PROTOCOL", "http2"), "quick_exits": 0}
 
 
 def tunnel_configured() -> bool:
