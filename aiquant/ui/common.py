@@ -30,10 +30,17 @@ def header() -> None:
     from ..data import http as _http
     perm = pill("模拟盘自动交易中", "green") if _http.paper_orders_unlocked() else pill("模拟下单未授权", "gray")
     mock = (" " + pill("DeepSeek 测试替身模式", "orange")) if test_mode else ""
-    from .login import current_user, logout_button
+    from .. import auth as _auth
+    from .login import current_user, logout_button, role
     if current_user():
         with right:
-            logout_button()
+            ucol, bcol = st.columns([3, 1])
+            ucol.markdown(f'<div style="text-align:right;margin-top:6px">👤 <b>{esc(current_user())}</b> '
+                          f'{pill(_auth.ROLES.get(role(), role()), "purple" if role() == "admin" else "gray")}'
+                          f'{" " + pill("只读", "orange") if role() == "viewer" else ""}</div>',
+                          unsafe_allow_html=True)
+            with bcol:
+                logout_button()
     right.markdown(
         f'<div style="text-align:right;margin-top:4px">{perm}{mock} {pill(stt["label"], t)} {pill("真实资金交易：关闭", "gray")}'
         f'<div class="aq-sub" title="{esc(stt.get("detail", ""))}">券商连接检查 {checked} UTC · {esc(stt.get("detail", ""))[:60]}</div></div>',

@@ -38,8 +38,8 @@ def render() -> None:
             ]), unsafe_allow_html=True)
     with st.container(border=True):
         C.section("登录账号（外网访问需要登录）")
-        from .login import settings_panel
-        settings_panel()
+        st.markdown("账号、角色、登录记录和安全设置已移到顶部「账号 → 用户管理」。")
+        st.page_link(st.session_state["_pages"]["users"], label="打开用户管理", icon="🛡️")
     with st.container(border=True):
         C.section("外部端点访问审计（不含密钥）")
         a = pd.DataFrame(db.q("SELECT ts,method,url,status FROM endpoint_audit ORDER BY id DESC LIMIT 500"))

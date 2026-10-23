@@ -13,7 +13,7 @@ st.set_page_config(page_title="AI Quant Strategy Lab", page_icon="📈", layout=
 
 from aiquant.ui import style, common  # noqa: E402
 from aiquant.ui import page_lab, page_paper, page_versions, page_history, page_data, page_settings  # noqa: E402
-from aiquant.ui import page_live, page_evolve, page_home, page_bollinger  # noqa: E402
+from aiquant.ui import page_live, page_evolve, page_home, page_bollinger, page_account, page_users  # noqa: E402
 
 actions.init()
 style.inject()
@@ -33,12 +33,20 @@ pages = {
     "history": st.Page(page_history.render, title="历史记录", icon="🕘", url_path="history"),
     "data": st.Page(page_data.render, title="数据管理", icon="🗄️", url_path="data"),
     "settings": st.Page(page_settings.render, title="系统设置", icon="⚙️", url_path="settings"),
+    "account": st.Page(page_account.render, title="我的账号", icon="👤", url_path="account"),
+    "users": st.Page(page_users.render, title="用户管理", icon="🛡️", url_path="users"),
 }
 st.session_state["_pages"] = pages
 # 常用页面直接显示；研究与管理类页面收进“研究与设置”下拉
-nav = st.navigation({
-    "": [pages[k] for k in ("home", "live", "boll", "paper", "evolve")],
-    "研究与设置": [pages[k] for k in ("lab", "versions", "history", "data", "settings")],
-}, position="top")
+# 按角色显示页面（观察员只读；交易员看不到用户管理和系统设置）
+from aiquant import auth  # noqa: E402
+allowed = auth.ROLE_PAGES[login.role()]
+groups = {
+    "": ("home", "live", "boll", "paper", "evolve"),
+    "研究与设置": ("lab", "versions", "history", "data", "settings"),
+    "账号": ("account", "users"),
+}
+nav = st.navigation({g: [pages[k] for k in keys if k in allowed] for g, keys in groups.items()
+                     if any(k in allowed for k in keys)}, position="top")
 common.header()
 nav.run()
