@@ -30,6 +30,28 @@ def atr(df: pd.DataFrame, n: int) -> pd.Series:
     return tr.ewm(alpha=1 / n, adjust=False, min_periods=n).mean()
 
 
+def bollinger(src: pd.Series, period: int, k: float, what: str, lookback: int = 120, recent: int = 5) -> pd.Series:
+    """布林带衍生指标（只用当前及以前数据）。
+    BB_PCTB  %B：(收盘 − 下轨) / (上轨 − 下轨) ×100；0 = 在下轨，100 = 在上轨，>100 冲出上轨。
+    BB_WIDTH 带宽：(上轨 − 下轨) / 中轨 ×100（百分比），越小越“收口”。
+    BB_WIDTH_RANK 带宽分位：当前带宽在最近 lookback 根中的百分位（0 = 最窄，100 = 最宽）。
+    BB_SQUEEZE 近期收口度：前 recent 根（不含当前）带宽分位的最小值；小 = 刚经历过收口。
+    """
+    mid = sma(src, period)
+    sd = src.rolling(period, min_periods=period).std(ddof=0)
+    up, lo = mid + k * sd, mid - k * sd
+    if what == "BB_PCTB":
+        w = (up - lo).replace(0, np.nan)
+        return (src - lo) / w * 100
+    width = (up - lo) / mid * 100
+    if what == "BB_WIDTH":
+        return width
+    rank = width.rolling(lookback, min_periods=lookback).rank(pct=True) * 100
+    if what == "BB_WIDTH_RANK":
+        return rank
+    return rank.shift(1).rolling(recent, min_periods=recent).min()
+
+
 def compute(df: pd.DataFrame, typ: str, params: dict, source: str = "close") -> pd.Series:
     p = {k: (int(v) if k in ("period", "fast", "slow", "signal") else float(v)) for k, v in params.items()}
     src = df[source]
@@ -43,6 +65,8 @@ def compute(df: pd.DataFrame, typ: str, params: dict, source: str = "close") -> 
         mid = sma(src, p["period"])
         sd = src.rolling(p["period"], min_periods=p["period"]).std(ddof=0)
         return {"BB_UPPER": mid + p["std"] * sd, "BB_MID": mid, "BB_LOWER": mid - p["std"] * sd}[typ]
+    if typ in ("BB_PCTB", "BB_WIDTH", "BB_WIDTH_RANK", "BB_SQUEEZE"):
+        return bollinger(src, p["period"], p["std"], typ, int(p.get("lookback", 120)), int(p.get("recent", 5)))
     if typ == "DONCHIAN_HIGH":
         return df["high"].rolling(p["period"], min_periods=p["period"]).max().shift(1)
     if typ == "DONCHIAN_LOW":

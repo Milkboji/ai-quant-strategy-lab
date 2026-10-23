@@ -96,6 +96,15 @@ def analyze(c: pd.DataFrame) -> dict:
             txt, tone = "价格靠近布林带下沿（区间低位）。", "gray"
         else:
             txt, tone = "价格在布林带中间区域，没有明显极端。", "gray"
+        try:
+            wid = (c["bb_up"] - c["bb_low"]) / c["bb_mid"] * 100
+            rk = wid.tail(120).rank(pct=True).iloc[-1] * 100
+            if rk <= 15:
+                txt += " 带宽处于近期最窄（收口），之后常有较大波动。"
+            elif rk >= 85:
+                txt += " 带宽处于近期最宽，波动正在释放。"
+        except Exception:  # noqa: BLE001
+            pass
         items.append({"name": "位置（布林带）", "tone": tone, "value": f"{pos * 100:.0f}%", "explain": txt})
     # 5) 波动：ATR
     if _ok(last["atr"]):

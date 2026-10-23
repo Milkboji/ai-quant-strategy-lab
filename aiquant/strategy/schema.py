@@ -19,6 +19,10 @@ INDICATOR_TYPES = {
     "BB_UPPER": {"period": (5, 200), "std": (0.5, 5.0)},
     "BB_MID": {"period": (5, 200), "std": (0.5, 5.0)},
     "BB_LOWER": {"period": (5, 200), "std": (0.5, 5.0)},
+    "BB_PCTB": {"period": (5, 200), "std": (0.5, 5.0)},
+    "BB_WIDTH": {"period": (5, 200), "std": (0.5, 5.0)},
+    "BB_WIDTH_RANK": {"period": (5, 200), "std": (0.5, 5.0), "lookback": (20, 500)},
+    "BB_SQUEEZE": {"period": (5, 200), "std": (0.5, 5.0), "lookback": (20, 500), "recent": (1, 50)},
     "DONCHIAN_HIGH": {"period": (2, 500)},   # 前 N 根已完成K线最高价（不含当前）
     "DONCHIAN_LOW": {"period": (2, 500)},
     "ATR": {"period": (2, 200)},
@@ -29,7 +33,8 @@ INDICATOR_TYPES = {
 }
 INDICATOR_CN = {
     "EMA": "指数均线", "SMA": "简单均线", "RSI": "RSI", "BB_UPPER": "布林上轨", "BB_MID": "布林中轨",
-    "BB_LOWER": "布林下轨", "DONCHIAN_HIGH": "前N根最高价", "DONCHIAN_LOW": "前N根最低价", "ATR": "ATR",
+    "BB_LOWER": "布林下轨", "BB_PCTB": "布林%B", "BB_WIDTH": "布林带宽%", "BB_WIDTH_RANK": "布林带宽分位",
+    "BB_SQUEEZE": "布林近期收口度", "DONCHIAN_HIGH": "前N根最高价", "DONCHIAN_LOW": "前N根最低价", "ATR": "ATR",
     "ROC": "变化率%", "VOL_SMA": "成交量均线", "MACD": "MACD", "MACD_SIGNAL": "MACD信号线",
 }
 PRICE_FIELDS = {"open", "high", "low", "close", "volume"}

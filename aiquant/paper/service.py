@@ -101,6 +101,12 @@ def _loop() -> None:
                     etf_trend.step()
                 except Exception:  # noqa: BLE001
                     log.error("etf trend error: %s", traceback.format_exc())
+            try:   # 一次性策略升级（登记为挑战者，走系统自己的检验）
+                from .. import upgrades
+                if upgrades.run_pending():
+                    db.set_setting("challenger_eval_hour", "")   # 立即评估新登记的挑战者
+            except Exception:  # noqa: BLE001
+                log.error("upgrades error: %s", traceback.format_exc())
             try:   # 挑战者每小时用最新行情评估一次，满足条件自动晋级部署
                 hr = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H")
                 if (db.get_setting("challenger_eval_hour") or "") != hr:

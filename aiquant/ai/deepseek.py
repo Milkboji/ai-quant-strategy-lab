@@ -24,6 +24,8 @@ Strategy Schema（JSON）字段：
 - indicators: 列表，每项 {{"id": 小写字母开头的标识, "type": 指标类型, "tf": "main"|"aux", "params": {{...}}}}
   允许的指标类型与参数范围: {json.dumps({k: v for k, v in INDICATOR_TYPES.items()}, ensure_ascii=False)}
   DONCHIAN_HIGH/LOW 为前 N 根已完成K线的最高/最低价（不含当前K线）
+  BB_PCTB = 布林%B（0=下轨，100=上轨）；BB_WIDTH = 带宽%；BB_WIDTH_RANK = 带宽在最近 lookback 根中的百分位（0=最窄）；
+  BB_SQUEEZE = 前 recent 根带宽分位的最小值（小=刚收口）。历史检验：布林带单独做买卖信号在 BTC 上长期不稳，作为趋势策略的离场/过滤更有效
 - entry / exit: {{"mode": "all"|"any", "conditions": [{{"left": {{"ref": 指标id或价格字段}}, "op": ">"|"<"|">="|"<="|"cross_above"|"cross_below", "right": {{"ref": ..., "mult": 1.0}} 或 {{"value": 数字}}}}]}}
   价格字段: open/high/low/close/volume；辅助周期价格: aux.open/aux.high/aux.low/aux.close/aux.volume
 - stop_loss_pct, take_profit_pct: 百分比数字或 null
