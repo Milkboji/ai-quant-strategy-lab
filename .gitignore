@@ -15,3 +15,8 @@ freqtrade_lab/user_data/data/
 freqtrade_lab/user_data/backtest_results/
 freqtrade_lab/user_data/logs/
 freqtrade_lab/backtest_result.txt
+config/auth.json
+config/*.tmp
+config/tunnel.json
+config/cloudflared.yml
+tools/cloudflared.exe

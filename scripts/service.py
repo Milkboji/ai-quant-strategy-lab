@@ -157,6 +157,47 @@ def _launch_app() -> subprocess.Popen:
     return p
 
 
+# ---------------------------------------------------------------------------
+# Cloudflare Tunnel（外网访问）：配置好 config/cloudflared.yml 后随服务一起运行，掉线自动拉起
+# ---------------------------------------------------------------------------
+CF_EXE = ROOT / "tools" / "cloudflared.exe"
+CF_CFG = ROOT / "config" / "cloudflared.yml"
+CF_PID = ROOT / "logs" / "cloudflared.pid"
+CF_LOG = ROOT / "logs" / "cloudflared.log"
+
+
+def tunnel_configured() -> bool:
+    return CF_CFG.exists() and (CF_EXE.exists() or os.name != "nt")
+
+
+def _cf_pid() -> int | None:
+    try:
+        return int(CF_PID.read_text())
+    except Exception:
+        return None
+
+
+def ensure_tunnel() -> None:
+    if not tunnel_configured() or _alive(_cf_pid()):
+        return
+    exe = str(CF_EXE) if CF_EXE.exists() else "cloudflared"
+    # 日志只保留最近一份，避免无限增长
+    try:
+        if CF_LOG.exists() and CF_LOG.stat().st_size > 5_000_000:
+            CF_LOG.replace(CF_LOG.with_suffix(".log.1"))
+    except Exception:
+        pass
+    p = _spawn([exe, "tunnel", "--no-autoupdate", "--loglevel", "info", "--logfile", str(CF_LOG),
+                "--config", str(CF_CFG), "run"], cwd=str(ROOT), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    CF_PID.write_text(str(p.pid))
+    _wlog(f"外网通道（Cloudflare Tunnel）已启动，PID {p.pid}")
+
+
+def stop_tunnel() -> None:
+    _kill(_cf_pid())
+    CF_PID.unlink(missing_ok=True)
+
+
 def watch() -> int:
     """守护进程：服务无响应、进程退出或内存过高时自动重启（模拟盘会在重启后自动对账恢复）。"""
     WPID.write_text(str(os.getpid()))
@@ -167,6 +208,10 @@ def watch() -> int:
         if not WPID.exists() or WPID.read_text().strip() != str(os.getpid()):
             _wlog("收到停止信号，守护进程退出")
             return 0
+        try:
+            ensure_tunnel()
+        except Exception as e:  # noqa: BLE001
+            _wlog(f"外网通道启动失败：{e}")
         pid = _pid()
         mem = _mem_mb(_app_pid() or _port_pid() or pid)
         if time.time() - last_mem_log >= 600:
@@ -197,6 +242,10 @@ def watch() -> int:
 
 
 def _start_watchdog() -> None:
+    try:
+        ensure_tunnel()
+    except Exception as e:  # noqa: BLE001
+        _wlog(f"外网通道启动失败：{e}")
     try:
         wp = int(WPID.read_text()) if WPID.exists() else None
     except Exception:
@@ -300,6 +349,7 @@ def stop() -> int:
     (ROOT / "logs").mkdir(exist_ok=True)
     STOP_FLAG.write_text(time.strftime("%Y-%m-%d %H:%M:%S"))   # 手动停止后，后台保活不会再自动启动
     WPID.unlink(missing_ok=True)   # 先让守护进程退出，避免它把服务重新拉起
+    stop_tunnel()
     pid = int(PID.read_text()) if PID.exists() else None
     if pid:
         try:
@@ -328,6 +378,7 @@ def status() -> int:
     print(f"PID 文件      : {PID.read_text() if PID.exists() else '-'}  内存 {_mem_mb(_app_pid() or _pid())} MB")
     wp = int(WPID.read_text()) if WPID.exists() else None
     print(f"守护进程      : {'运行中' if _alive(wp) else '未运行'}  日志 {WLOG}")
+    print(f"外网通道      : {('运行中' if _alive(_cf_pid()) else '未运行') if tunnel_configured() else '未配置'}  日志 {CF_LOG}")
     print(f"PAPER_ORDERS  : {'已解锁' if http.paper_orders_unlocked() else '0 (锁定)'}")
     print(f"LIVE_ORDERS   : 0 (永久禁用)")
     print(f"Alpaca 行情Key: {config.mask(config.secret('ALPACA_API_KEY_ID'))}")

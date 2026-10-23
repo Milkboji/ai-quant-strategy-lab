@@ -37,6 +37,10 @@ def render() -> None:
                 ("解锁条件", "代码常量 + 本地授权文件，二者同时满足（需用户未来单独授权）"),
             ]), unsafe_allow_html=True)
     with st.container(border=True):
+        C.section("登录账号（外网访问需要登录）")
+        from .login import settings_panel
+        settings_panel()
+    with st.container(border=True):
         C.section("外部端点访问审计（不含密钥）")
         a = pd.DataFrame(db.q("SELECT ts,method,url,status FROM endpoint_audit ORDER BY id DESC LIMIT 500"))
         if not a.empty:

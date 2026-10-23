@@ -20,4 +20,4 @@ font = "sans serif"
 
 [client]
 toolbarMode = "minimal"
-showErrorDetails = true
+showErrorDetails = false   # 外网访问时不向浏览器暴露错误堆栈（详见 logs/）

@@ -48,6 +48,14 @@
 
 电脑睡眠或关机时程序无法运行，需要 7×24 运行请在 Windows 电源设置里关闭自动睡眠。
 
+### 外网访问（可选，Cloudflare Tunnel，免费）
+
+1. 在 Cloudflare 添加你的域名（免费版），把 `config/tunnel.json` 写成 `{"hostname": "quant.你的域名"}`。
+2. 双击 `setup_tunnel.bat`：自动下载官方 cloudflared（校验 Cloudflare 数字签名）、浏览器授权一次、创建隧道并写 DNS。
+3. 之后服务启动时自动带上外网通道（掉线自动重连）。外网访问必须登录：账号在本机「系统设置 → 登录账号」创建
+   （密码 PBKDF2 加密保存、连续输错 5 次锁 15 分钟、签名 Cookie 保持登录 7 天）。建议再在 Cloudflare 加一条
+   Managed Challenge 规则或 Cloudflare Access。
+
 ### 开启模拟盘自动下单（可选）
 
 双重锁，缺一不可：

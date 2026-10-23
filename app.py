@@ -18,6 +18,10 @@ from aiquant.ui import page_live, page_evolve, page_home, page_bollinger  # noqa
 actions.init()
 style.inject()
 
+from aiquant.ui import login  # noqa: E402
+if not login.gate():   # 外网访问必须登录（本机默认免登录）
+    st.stop()
+
 pages = {
     "home": st.Page(page_home.render, title="总览", icon="🏠", url_path="home", default=True),
     "live": st.Page(page_live.render, title="实时看盘", icon="📈", url_path="live"),

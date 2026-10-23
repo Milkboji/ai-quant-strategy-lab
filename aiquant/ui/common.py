@@ -24,11 +24,16 @@ def header() -> None:
     left, right = st.columns([3, 2])
     left.markdown(
         '<div class="aq-brand"><div class="aq-logo"></div><div><span class="aq-title">AI Quant Strategy Lab</span>'
-        '<span class="aq-ver">v1.0</span><div class="aq-sub">AI 量化策略研究实验室 · 本地运行 · 127.0.0.1</div></div></div>',
+        f'<span class="aq-ver">v1.0</span><div class="aq-sub">AI 量化策略研究实验室 · '
+        f'{"外网访问 · " + esc((st.session_state.get("auth_info") or {}).get("host", "")) if (st.session_state.get("auth_info") or {}).get("remote") else "本地运行 · 127.0.0.1"}</div></div></div>',
         unsafe_allow_html=True)
     from ..data import http as _http
     perm = pill("模拟盘自动交易中", "green") if _http.paper_orders_unlocked() else pill("模拟下单未授权", "gray")
     mock = (" " + pill("DeepSeek 测试替身模式", "orange")) if test_mode else ""
+    from .login import current_user, logout_button
+    if current_user():
+        with right:
+            logout_button()
     right.markdown(
         f'<div style="text-align:right;margin-top:4px">{perm}{mock} {pill(stt["label"], t)} {pill("真实资金交易：关闭", "gray")}'
         f'<div class="aq-sub" title="{esc(stt.get("detail", ""))}">券商连接检查 {checked} UTC · {esc(stt.get("detail", ""))[:60]}</div></div>',
