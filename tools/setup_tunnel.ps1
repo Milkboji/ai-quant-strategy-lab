@@ -51,7 +51,7 @@ Write-Host "[OK] 隧道 $name ($id)"
 $content = @"
 tunnel: $id
 credentials-file: $cred
-protocol: http2
+protocol: quic
 edge-ip-version: auto
 ingress:
   - hostname: $hostname

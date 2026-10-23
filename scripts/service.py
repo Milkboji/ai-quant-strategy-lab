@@ -167,7 +167,9 @@ CF_PID = ROOT / "logs" / "cloudflared.pid"
 CF_LOG = ROOT / "logs" / "cloudflared.log"
 CF_METRICS = "127.0.0.1:20241"          # cloudflared 本地状态接口：/ready 在至少有 1 条通道连接时返回 200
 CF_STALL_CHECKS = 3                     # 连续 3 次（约 3 分钟）没有可用通道 → 重启 cloudflared
-_cf_state = {"started": 0.0, "fails": 0}
+CF_ERR = ROOT / "logs" / "cloudflared.stderr.log"
+# 优先 QUIC（UDP，不受部分网络定时掐断 TCP 长连接的影响）；启动失败或连不上时自动退回 HTTP/2
+_cf_state = {"started": 0.0, "fails": 0, "proto": os.environ.get("AIQUANT_TUNNEL_PROTOCOL", "quic"), "quick_exits": 0}
 
 
 def tunnel_configured() -> bool:
@@ -181,22 +183,54 @@ def _cf_pid() -> int | None:
         return None
 
 
+def _fallback(reason: str) -> None:
+    if _cf_state["proto"] != "http2":
+        _cf_state["proto"] = "http2"
+        tail = ""
+        try:
+            tail = CF_ERR.read_text(encoding="utf-8", errors="ignore").strip().splitlines()[-1][:200]
+        except Exception:
+            pass
+        _wlog(f"外网通道 QUIC 不可用（{reason}），改用 HTTP/2{('：' + tail) if tail else ''}")
+
+
+def _spawn_tunnel(exe: str) -> subprocess.Popen:
+    err = open(CF_ERR, "ab")   # 配置错误等启动失败信息（--logfile 生效之前就退出的情况）
+    try:
+        return _spawn([exe, "tunnel", "--no-autoupdate", "--loglevel", "info", "--logfile", str(CF_LOG),
+                       "--metrics", CF_METRICS, "--protocol", _cf_state["proto"], "--config", str(CF_CFG), "run"],
+                      cwd=str(ROOT), stdout=err, stderr=err)
+    finally:
+        err.close()
+
+
 def ensure_tunnel() -> None:
     if not tunnel_configured() or _alive(_cf_pid()):
         return
+    if _cf_state["started"] and time.time() - _cf_state["started"] < 60:   # 刚启动就退出
+        _cf_state["quick_exits"] += 1
+        if _cf_state["proto"] == "quic":
+            _fallback("启动后立即退出")
     exe = str(CF_EXE) if CF_EXE.exists() else "cloudflared"
     # 日志只保留最近一份，避免无限增长
     try:
         if CF_LOG.exists() and CF_LOG.stat().st_size > 5_000_000:
             CF_LOG.replace(CF_LOG.with_suffix(".log.1"))
+        if CF_ERR.exists() and CF_ERR.stat().st_size > 1_000_000:
+            CF_ERR.unlink()
     except Exception:
         pass
-    p = _spawn([exe, "tunnel", "--no-autoupdate", "--loglevel", "info", "--logfile", str(CF_LOG),
-                "--metrics", CF_METRICS, "--config", str(CF_CFG), "run"],
-               cwd=str(ROOT), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    p = _spawn_tunnel(exe)
+    if _cf_state["proto"] == "quic":
+        for _ in range(16):                    # 8 秒内退出 = QUIC 在这台电脑上不可用 → 立刻改用 HTTP/2
+            time.sleep(0.5)
+            if p.poll() is not None:
+                _fallback(f"启动后立即退出，退出码 {p.returncode}")
+                p = _spawn_tunnel(exe)
+                break
     CF_PID.write_text(str(p.pid))
     _cf_state.update(started=time.time(), fails=0)
-    _wlog(f"外网通道（Cloudflare Tunnel）已启动，PID {p.pid}")
+    _wlog(f"外网通道（Cloudflare Tunnel）已启动，PID {p.pid}，协议 {_cf_state['proto']}")
 
 
 def tunnel_ready() -> bool | None:
@@ -228,6 +262,11 @@ def check_tunnel() -> None:
         _cf_state["fails"] = 0
         return
     _cf_state["fails"] += 1
+    if _cf_state["proto"] == "quic" and _cf_state["fails"] >= 2:
+        _fallback("连续 2 次检查没有可用连接")
+        stop_tunnel()
+        ensure_tunnel()
+        return
     if _cf_state["fails"] >= CF_STALL_CHECKS:
         _wlog(f"外网通道连续 {_cf_state['fails']} 次检查没有可用连接，重启 cloudflared")
         stop_tunnel()

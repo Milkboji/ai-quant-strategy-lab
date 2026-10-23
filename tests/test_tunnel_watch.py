@@ -23,7 +23,7 @@ def _setup(monkeypatch, ready_seq):
         calls["restart"] += 1
         svc._cf_state.update(started=time.time() - 1000, fails=0)
     monkeypatch.setattr(svc, "ensure_tunnel", ens)
-    svc._cf_state.update(started=time.time() - 1000, fails=0)
+    svc._cf_state.update(started=time.time() - 1000, fails=0, proto="http2")
     return calls
 
 
@@ -48,3 +48,32 @@ def test_legacy_process_restarted_once(monkeypatch):
     for _ in range(3):
         svc.check_tunnel()
     assert calls["restart"] == 1
+
+
+def test_quic_quick_exit_falls_back(monkeypatch, tmp_path):
+    class P:
+        def __init__(self, dies): self.dies, self.pid, self.returncode = dies, 1, (1 if dies else None)
+        def poll(self): return 1 if self.dies else None
+    protos = []
+
+    def spawn(exe):
+        protos.append(svc._cf_state["proto"])
+        return P(svc._cf_state["proto"] == "quic")
+    monkeypatch.setattr(svc, "tunnel_configured", lambda: True)
+    monkeypatch.setattr(svc, "_alive", lambda pid: False)
+    monkeypatch.setattr(svc, "_spawn_tunnel", spawn)
+    monkeypatch.setattr(svc, "_wlog", lambda m: None)
+    monkeypatch.setattr(svc.time, "sleep", lambda s: None)
+    monkeypatch.setattr(svc, "CF_PID", tmp_path / "cf.pid")
+    monkeypatch.setattr(svc, "CF_LOG", tmp_path / "cf.log")
+    monkeypatch.setattr(svc, "CF_ERR", tmp_path / "cf.err")
+    svc._cf_state.update(started=0.0, fails=0, proto="quic")
+    svc.ensure_tunnel()
+    assert protos == ["quic", "http2"] and svc._cf_state["proto"] == "http2"
+
+
+def test_quic_without_connections_falls_back(monkeypatch):
+    calls = _setup(monkeypatch, [False, False])
+    svc._cf_state["proto"] = "quic"
+    svc.check_tunnel(); svc.check_tunnel()
+    assert calls["restart"] == 1 and svc._cf_state["proto"] == "http2"
