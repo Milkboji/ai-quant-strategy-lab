@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Quant Strategy Lab · 让策略自己进化</title>
+<meta name="description" content="AI Quant Strategy Lab — 让策略自己进化。严格回测 · 自动进化 · 模拟盘验证。Let your strategy evolve: rigorous backtests, self-evolving strategies, paper-proven.">
+<meta property="og:title" content="AI Quant Strategy Lab · 让策略自己进化 / Let your strategy evolve.">
+<meta property="og:description" content="严格回测 · 自动进化 · 模拟盘验证 — Rigorous backtests · Self-evolving · Paper-proven">
+<meta property="og:image" content="https://20261023.xyz/og-card.jpg">
+<meta property="og:type" content="website">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" type="image/png" href="favicon.png">
+<style>
+:root{--bg:#F4F7FB;--card:#fff;--ink:#0F172A;--sub:#64748B;--line:#E5E7EB;--blue:#2563EB;--violet:#7C3AED;--gold:#FCD34D}
+@media (prefers-color-scheme: dark){:root{--bg:#0B1120;--card:#111827;--ink:#E5E7EB;--sub:#94A3B8;--line:#1F2937}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.65 Inter,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+a{color:inherit}
+.top{max-width:1040px;margin:0 auto;padding:18px 16px 0;display:flex;align-items:center;justify-content:space-between;gap:12px}
+.brand{display:flex;align-items:center;gap:10px;font-weight:800;letter-spacing:-.2px}
+.brand svg{border-radius:9px}
+.lang{display:flex;border:1px solid var(--line);border-radius:999px;overflow:hidden;background:var(--card)}
+.lang button{border:0;background:transparent;color:var(--sub);font:600 13px/1 inherit;padding:8px 13px;cursor:pointer}
+.lang button[aria-pressed="true"]{background:var(--blue);color:#fff}
+.hero{max-width:1040px;margin:18px auto 0;padding:0 16px}
+.panel{position:relative;overflow:hidden;border-radius:24px;padding:48px 40px;color:#fff;
+  background:radial-gradient(900px 420px at -10% -30%,#60A5FA 0%,transparent 60%),radial-gradient(700px 500px at 120% 130%,#A78BFA 0%,transparent 60%),linear-gradient(135deg,#1D4ED8,#6D28D9);
+  box-shadow:0 24px 60px rgba(37,99,235,.28)}
+.mark{border-radius:18px;box-shadow:0 0 0 4px rgba(255,255,255,.25),0 10px 28px rgba(15,23,42,.3)}
+.slogan{font-size:clamp(34px,7vw,64px);line-height:1.08;font-weight:900;letter-spacing:-.5px;margin:26px 0 10px}
+.slogan em{font-style:normal;color:var(--gold)}
+.pillars{font-size:clamp(15px,2.4vw,19px);opacity:.92;font-weight:600}
+.lead{max-width:640px;opacity:.88;margin:14px 0 0}
+.cta{display:flex;flex-wrap:wrap;gap:12px;margin-top:28px}
+.btn{display:inline-flex;align-items:center;gap:8px;padding:13px 22px;border-radius:12px;font-weight:700;text-decoration:none}
+.btn.primary{background:#fff;color:#1E3A8A}.btn.primary:hover{filter:brightness(.96)}
+.btn.ghost{border:1px solid rgba(255,255,255,.5);color:#fff}
+.loop{max-width:1040px;margin:34px auto 0;padding:0 16px}
+.loop h2,.grid h2{font-size:20px;margin:0 0 14px}
+.steps{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+.step{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px;position:relative}
+.step b{display:inline-flex;width:26px;height:26px;border-radius:8px;align-items:center;justify-content:center;background:linear-gradient(135deg,var(--blue),var(--violet));color:#fff;font-size:13px;margin-bottom:8px}
+.step h3{margin:0 0 4px;font-size:16px}.step p{margin:0;color:var(--sub);font-size:14px}
+.grid{max-width:1040px;margin:34px auto 0;padding:0 16px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:18px}
+.card h3{margin:0 0 6px;font-size:16px}.card p{margin:0;color:var(--sub);font-size:14px}
+.note{max-width:1040px;margin:30px auto 0;padding:0 16px}
+.note p{margin:0;padding:14px 16px;border-radius:12px;border:1px solid var(--line);background:var(--card);color:var(--sub);font-size:13px}
+footer{max-width:1040px;margin:0 auto;padding:22px 16px 40px;color:var(--sub);font-size:13px}
+@media (max-width:760px){.panel{padding:30px 22px;border-radius:18px}.steps{grid-template-columns:1fr 1fr}.mark{width:56px;height:56px}}
+@media (max-width:420px){.steps{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="brand"><svg width="30" height="30" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="AI Quant Strategy Lab"> <defs><linearGradient id="aqg2" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#3B82F6"/><stop offset="1" stop-color="#7C3AED"/></linearGradient></defs> <rect width="64" height="64" rx="16" fill="url(#aqg2)"/> <line x1="21.82" y1="29.86" x2="21.82" y2="46.86" stroke="#fff" stroke-width="2.2" stroke-linecap="round" opacity="0.78"/><rect x="18.22" y="33.86" width="7.2" height="9" rx="1.8" fill="#fff" opacity="0.78"/><line x1="42.18" y1="15.14" x2="42.18" y2="36.14" stroke="#fff" stroke-width="2.2" stroke-linecap="round" opacity="1"/><rect x="38.58" y="19.64" width="7.2" height="12" rx="1.8" fill="#fff" opacity="1"/> <g transform="rotate(-32 32 32)"> <path d="M8.00,32.00 L8.67,30.91 L9.33,29.83 L10.00,28.76 L10.67,27.72 L11.33,26.72 L12.00,25.75 L12.67,24.83 L13.33,23.97 L14.00,23.16 L14.67,22.42 L15.33,21.76 L16.00,21.17 L16.67,20.67 L17.33,20.25 L18.00,19.93 L18.67,19.69 L19.33,19.55 L20.00,19.50 L20.67,19.55 L21.33,19.69 L22.00,19.93 L22.67,20.25 L23.33,20.67 L24.00,21.17 L24.67,21.76 L25.33,22.42 L26.00,23.16 L26.67,23.97 L27.33,24.83 L28.00,25.75 L28.67,26.72 L29.33,27.72 L30.00,28.76 L30.67,29.83 L31.33,30.91 L32.00,32.00 L32.67,33.09 L33.33,34.17 L34.00,35.24 L34.67,36.28 L35.33,37.28 L36.00,38.25 L36.67,39.17 L37.33,40.03 L38.00,40.84 L38.67,41.58 L39.33,42.24 L40.00,42.83 L40.67,43.33 L41.33,43.75 L42.00,44.07 L42.67,44.31 L43.33,44.45 L44.00,44.50 L44.67,44.45 L45.33,44.31 L46.00,44.07 L46.67,43.75 L47.33,43.33 L48.00,42.83 L48.67,42.24 L49.33,41.58 L50.00,40.84 L50.67,40.03 L51.33,39.17 L52.00,38.25 L52.67,37.28 L53.33,36.28 L54.00,35.24 L54.67,34.17 L55.33,33.09 L56.00,32.00" fill="none" stroke="#FCD34D" stroke-width="4.2" stroke-linecap="round" stroke-linejoin="round"/> <path d="M8.00,32.00 L8.67,33.09 L9.33,34.17 L10.00,35.24 L10.67,36.28 L11.33,37.28 L12.00,38.25 L12.67,39.17 L13.33,40.03 L14.00,40.84 L14.67,41.58 L15.33,42.24 L16.00,42.83 L16.67,43.33 L17.33,43.75 L18.00,44.07 L18.67,44.31 L19.33,44.45 L20.00,44.50 L20.67,44.45 L21.33,44.31 L22.00,44.07 L22.67,43.75 L23.33,43.33 L24.00,42.83 L24.67,42.24 L25.33,41.58 L26.00,40.84 L26.67,40.03 L27.33,39.17 L28.00,38.25 L28.67,37.28 L29.33,36.28 L30.00,35.24 L30.67,34.17 L31.33,33.09 L32.00,32.00 L32.67,30.91 L33.33,29.83 L34.00,28.76 L34.67,27.72 L35.33,26.72 L36.00,25.75 L36.67,24.83 L37.33,23.97 L38.00,23.16 L38.67,22.42 L39.33,21.76 L40.00,21.17 L40.67,20.67 L41.33,20.25 L42.00,19.93 L42.67,19.69 L43.33,19.55 L44.00,19.50 L44.67,19.55 L45.33,19.69 L46.00,19.93 L46.67,20.25 L47.33,20.67 L48.00,21.17 L48.67,21.76 L49.33,22.42 L50.00,23.16 L50.67,23.97 L51.33,24.83 L52.00,25.75 L52.67,26.72 L53.33,27.72 L54.00,28.76 L54.67,29.83 L55.33,30.91 L56.00,32.00" fill="none" stroke="#fff" stroke-width="4.2" stroke-linecap="round" stroke-linejoin="round"/> </g> </svg><span>AI Quant Strategy Lab</span></div>
+  <div class="lang" role="group" aria-label="Language">
+    <button type="button" data-set="zh" aria-pressed="true">中文</button><button type="button" data-set="en" aria-pressed="false">EN</button>
+  </div>
+</header>
+
+<section class="hero"><div class="panel">
+  <svg class="mark" width="72" height="72" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="AI Quant Strategy Lab"> <defs><linearGradient id="aqg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#3B82F6"/><stop offset="1" stop-color="#7C3AED"/></linearGradient></defs> <rect width="64" height="64" rx="16" fill="url(#aqg)"/> <line x1="21.82" y1="29.86" x2="21.82" y2="46.86" stroke="#fff" stroke-width="2.2" stroke-linecap="round" opacity="0.78"/><rect x="18.22" y="33.86" width="7.2" height="9" rx="1.8" fill="#fff" opacity="0.78"/><line x1="42.18" y1="15.14" x2="42.18" y2="36.14" stroke="#fff" stroke-width="2.2" stroke-linecap="round" opacity="1"/><rect x="38.58" y="19.64" width="7.2" height="12" rx="1.8" fill="#fff" opacity="1"/> <g transform="rotate(-32 32 32)"> <path d="M8.00,32.00 L8.67,30.91 L9.33,29.83 L10.00,28.76 L10.67,27.72 L11.33,26.72 L12.00,25.75 L12.67,24.83 L13.33,23.97 L14.00,23.16 L14.67,22.42 L15.33,21.76 L16.00,21.17 L16.67,20.67 L17.33,20.25 L18.00,19.93 L18.67,19.69 L19.33,19.55 L20.00,19.50 L20.67,19.55 L21.33,19.69 L22.00,19.93 L22.67,20.25 L23.33,20.67 L24.00,21.17 L24.67,21.76 L25.33,22.42 L26.00,23.16 L26.67,23.97 L27.33,24.83 L28.00,25.75 L28.67,26.72 L29.33,27.72 L30.00,28.76 L30.67,29.83 L31.33,30.91 L32.00,32.00 L32.67,33.09 L33.33,34.17 L34.00,35.24 L34.67,36.28 L35.33,37.28 L36.00,38.25 L36.67,39.17 L37.33,40.03 L38.00,40.84 L38.67,41.58 L39.33,42.24 L40.00,42.83 L40.67,43.33 L41.33,43.75 L42.00,44.07 L42.67,44.31 L43.33,44.45 L44.00,44.50 L44.67,44.45 L45.33,44.31 L46.00,44.07 L46.67,43.75 L47.33,43.33 L48.00,42.83 L48.67,42.24 L49.33,41.58 L50.00,40.84 L50.67,40.03 L51.33,39.17 L52.00,38.25 L52.67,37.28 L53.33,36.28 L54.00,35.24 L54.67,34.17 L55.33,33.09 L56.00,32.00" fill="none" stroke="#FCD34D" stroke-width="4.2" stroke-linecap="round" stroke-linejoin="round"/> <path d="M8.00,32.00 L8.67,33.09 L9.33,34.17 L10.00,35.24 L10.67,36.28 L11.33,37.28 L12.00,38.25 L12.67,39.17 L13.33,40.03 L14.00,40.84 L14.67,41.58 L15.33,42.24 L16.00,42.83 L16.67,43.33 L17.33,43.75 L18.00,44.07 L18.67,44.31 L19.33,44.45 L20.00,44.50 L20.67,44.45 L21.33,44.31 L22.00,44.07 L22.67,43.75 L23.33,43.33 L24.00,42.83 L24.67,42.24 L25.33,41.58 L26.00,40.84 L26.67,40.03 L27.33,39.17 L28.00,38.25 L28.67,37.28 L29.33,36.28 L30.00,35.24 L30.67,34.17 L31.33,33.09 L32.00,32.00 L32.67,30.91 L33.33,29.83 L34.00,28.76 L34.67,27.72 L35.33,26.72 L36.00,25.75 L36.67,24.83 L37.33,23.97 L38.00,23.16 L38.67,22.42 L39.33,21.76 L40.00,21.17 L40.67,20.67 L41.33,20.25 L42.00,19.93 L42.67,19.69 L43.33,19.55 L44.00,19.50 L44.67,19.55 L45.33,19.69 L46.00,19.93 L46.67,20.25 L47.33,20.67 L48.00,21.17 L48.67,21.76 L49.33,22.42 L50.00,23.16 L50.67,23.97 L51.33,24.83 L52.00,25.75 L52.67,26.72 L53.33,27.72 L54.00,28.76 L54.67,29.83 L55.33,30.91 L56.00,32.00" fill="none" stroke="#fff" stroke-width="4.2" stroke-linecap="round" stroke-linejoin="round"/> </g> </svg>
+  <h1 class="slogan" data-zh="让策略<em>自己进化</em>" data-en="Let your strategy <em>evolve.</em>">让策略<em>自己进化</em></h1>
+  <div class="pillars" data-zh="严格回测 · 自动进化 · 模拟盘验证" data-en="Rigorous backtests · Self-evolving · Paper-proven">严格回测 · 自动进化 · 模拟盘验证</div>
+  <p class="lead" data-zh="个人量化研究与模拟交易实验室。每个策略先过严格的分区回测和多年历史检验，再在模拟账户里自动运行；系统不停地生成挑战者，只有证明更稳的版本才会接班。" data-en="A personal quant research and paper-trading lab. Every strategy first passes strictly split backtests and years of historical checks, then runs automatically in a paper account. The system keeps spawning challengers — only versions proven steadier take over.">个人量化研究与模拟交易实验室。每个策略先过严格的分区回测和多年历史检验，再在模拟账户里自动运行；系统不停地生成挑战者，只有证明更稳的版本才会接班。</p>
+  <div class="cta">
+    <a class="btn primary" href="https://quant.20261023.xyz/" data-zh="进入系统 →" data-en="Open the lab →">进入系统 →</a>
+    <a class="btn ghost" href="#how" data-zh="它如何进化" data-en="How it evolves">它如何进化</a>
+  </div>
+</div></section>
+
+<section class="loop" id="how">
+  <h2 data-zh="进化循环" data-en="The evolution loop">进化循环</h2>
+  <div class="steps">
+    <div class="step"><b>1</b><h3 data-zh="严格回测" data-en="Backtest">严格回测</h3><p data-zh="训练 / 验证 / 独立测试分区，只用已收盘 K 线，计入全部交易成本。" data-en="Train / validation / independent test splits, closed candles only, every trading cost included.">训练 / 验证 / 独立测试分区，只用已收盘 K 线，计入全部交易成本。</p></div>
+    <div class="step"><b>2</b><h3 data-zh="生成挑战者" data-en="Challenge">生成挑战者</h3><p data-zh="在现役策略附近搜索参数，按季度稳健分筛选，可加入 DeepSeek 建议。" data-en="Search parameters around the incumbent, rank by quarterly robustness, optionally add a DeepSeek idea.">在现役策略附近搜索参数，按季度稳健分筛选，可加入 DeepSeek 建议。</p></div>
+    <div class="step"><b>3</b><h3 data-zh="实时行情对决" data-en="Prove it live">实时行情对决</h3><p data-zh="更早历史、ETH 交叉检验，再在实时行情上与现役并行运行。" data-en="Cross-checked on earlier history and ETH, then run side by side with the incumbent on live data.">更早历史、ETH 交叉检验，再在实时行情上与现役并行运行。</p></div>
+    <div class="step"><b>4</b><h3 data-zh="空仓接班" data-en="Take over">空仓接班</h3><p data-zh="不差于现役才晋级，并且只在空仓时切换；每一步都有日志可查。" data-en="Promoted only if no worse than the incumbent, switching only when flat — every step logged.">不差于现役才晋级，并且只在空仓时切换；每一步都有日志可查。</p></div>
+  </div>
+</section>
+
+<section class="grid">
+  <h2 data-zh="还有这些" data-en="Also inside">还有这些</h2>
+  <div class="cards">
+    <div class="card"><h3 data-zh="交易节奏" data-en="Trading rhythm">交易节奏</h3><p data-zh="止损后冷却、连亏刹车、波动率定仓，长期没有优势的策略自动暂停。" data-en="Cooldown after stops, loss-streak brake, volatility sizing; strategies without a long-term edge pause automatically.">止损后冷却、连亏刹车、波动率定仓，长期没有优势的策略自动暂停。</p></div>
+    <div class="card"><h3 data-zh="布林带分析" data-en="Bollinger analysis">布林带分析</h3><p data-zh="多周期 %B、带宽、收口与开口，并作为日线趋势策略的离场条件。" data-en="Multi-timeframe %B, bandwidth, squeezes and expansions — also the exit for daily trend strategies.">多周期 %B、带宽、收口与开口，并作为日线趋势策略的离场条件。</p></div>
+    <div class="card"><h3 data-zh="实时看盘" data-en="Live market">实时看盘</h3><p data-zh="秒级到日线 K 线、买卖点标注、指标大白话解读。" data-en="Second-to-daily candles, trade markers and plain-language indicator readings.">秒级到日线 K 线、买卖点标注、指标大白话解读。</p></div>
+    <div class="card"><h3 data-zh="多用户与权限" data-en="Accounts & roles">多用户与权限</h3><p data-zh="管理员 / 交易员 / 观察员，登录记录与操作审计。" data-en="Admin / trader / viewer roles, sign-in logs and an audit trail.">管理员 / 交易员 / 观察员，登录记录与操作审计。</p></div>
+  </div>
+</section>
+
+<div class="note"><p data-zh="仅用于研究与学习，不构成任何投资建议。系统只连接模拟资金账户，不进行真实资金交易。历史回测与模拟表现不代表未来收益。" data-en="For research and learning only — not investment advice. The system connects to paper-money accounts only and never trades real money. Backtests and paper results don't predict future returns.">仅用于研究与学习，不构成任何投资建议。系统只连接模拟资金账户，不进行真实资金交易。历史回测与模拟表现不代表未来收益。</p></div>
+<footer>© 2026 · AI Quant Strategy Lab · 20261023.xyz</footer>
+
+<script>
+(function(){
+  function get(k){try{return localStorage.getItem(k)}catch(e){return null}}
+  function put(k,v){try{localStorage.setItem(k,v)}catch(e){}}
+  var q=(location.search.match(/[?&]lang=(zh|en)/)||[])[1];
+  var lang=q||get("aq_lang")||((navigator.language||"zh").toLowerCase().indexOf("zh")===0?"zh":"en");
+  function apply(l){
+    document.documentElement.lang=l==="zh"?"zh-CN":"en";
+    document.title=l==="zh"?"AI Quant Strategy Lab · 让策略自己进化":"AI Quant Strategy Lab · Let your strategy evolve.";
+    document.querySelectorAll("[data-zh]").forEach(function(el){el.innerHTML=el.getAttribute("data-"+l)});
+    document.querySelectorAll("[data-set]").forEach(function(b){b.setAttribute("aria-pressed",b.getAttribute("data-set")===l?"true":"false")});
+    var a=document.querySelector(".btn.primary"); a.href="https://quant.20261023.xyz/?lang="+l;
+  }
+  document.querySelectorAll("[data-set]").forEach(function(b){b.addEventListener("click",function(){lang=b.getAttribute("data-set");put("aq_lang",lang);apply(lang)})});
+  apply(lang);
+})();
+</script>
+</body>
+</html>
