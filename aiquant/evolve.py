@@ -176,7 +176,25 @@ def mutations(sch: dict) -> list[tuple[dict, str]]:
                 d["indicators"].append({"id": rid, "type": "EMA", "params": {"period": per}, "tf": "aux"})
                 d["entry"]["conditions"].append({"left": {"ref": "aux.close"}, "op": ">", "right": {"ref": rid}})
             add(d, f"增加大周期过滤：日线收盘价在 EMA{per} 上方才买入")
-    # 5) K 线周期（相邻周期；辅助周期必须更长）
+    # 5) 布林带（策略里还没有布林指标时才尝试；和其他改动一样必须通过稳健分、留出检验和挑战者检验）
+    #    历史检验结论：布林带单独做买卖信号在加密货币上长期不赚钱，作为趋势策略的离场 / 入场过滤更稳，
+    #    所以这里只尝试这两种用法。
+    has_bb = any(str(i["type"]).startswith("BB_") for i in sch.get("indicators", []))
+    if not has_bb and len(sch.get("indicators", [])) < 12:
+        if tf >= 240 and sch.get("exit") is not None and len(sch["exit"]["conditions"]) < 8:
+            for per in (20, 30):
+                d = copy.deepcopy(sch)
+                rid = f"bb_mid{per}"
+                d["indicators"].append({"id": rid, "type": "BB_MID", "params": {"period": per, "std": 2}, "tf": "main"})
+                d["exit"]["conditions"].append({"left": {"ref": "close"}, "op": "<", "right": {"ref": rid}})
+                d["exit"]["mode"] = "any"
+                add(d, f"增加布林离场：收盘跌破布林中轨（{per}）即卖出")
+        if len(sch["entry"]["conditions"]) < 8:
+            d = copy.deepcopy(sch)
+            d["indicators"].append({"id": "bb_pctb", "type": "BB_PCTB", "params": {"period": 20, "std": 2}, "tf": "main"})
+            d["entry"]["conditions"].append({"left": {"ref": "bb_pctb"}, "op": ">", "right": {"value": 50}})
+            add(d, "增加布林入场过滤：%B 高于 50（价格在中轨上方）才买入")
+    # 6) K 线周期（相邻周期；辅助周期必须更长）
     if tf in SEARCH_TFS:
         k = SEARCH_TFS.index(tf)
         from . import rhythm
