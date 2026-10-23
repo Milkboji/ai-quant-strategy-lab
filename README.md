@@ -1,5 +1,11 @@
 # AI Quant Strategy Lab
 
+<img src="assets/logo-zh.svg" alt="AI Quant Strategy Lab · 让策略自己进化" width="400">
+
+**让策略自己进化 · Let your strategy evolve.** 严格回测 · 自动进化 · 模拟盘验证
+
+界面支持中文 / English（右上角切换，或在网址后加 `?lang=en`）。
+
 一个在自己电脑上运行的中文量化研究与模拟交易工作台：用中文描述策略 → 严格分区回测 → AI 辅助优化 →
 部署到 Alpaca Paper 模拟账户自动交易 → 策略自动进化（冠军–挑战者）。覆盖 BTC/USD 与美股 ETF。
 

@@ -4,6 +4,8 @@ from __future__ import annotations
 import pandas as pd
 import streamlit as st
 
+from ..i18n import keep
+
 from .. import actions, db, research
 from ..strategy import registry
 from ..strategy.schema import describe, validate
@@ -119,7 +121,7 @@ def render() -> None:
             with st.expander("Schema（JSON）"):
                 st.json(v["schema"])
             with st.expander("自然语言原文"):
-                st.write(v["nl_text"] or "（无）")
+                st.write(keep(v["nl_text"]) if v["nl_text"] else "（无）")
 
 
 def _mcol(b):

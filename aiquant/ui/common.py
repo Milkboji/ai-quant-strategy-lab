@@ -17,34 +17,39 @@ def paper_status_cached(_nonce: int = 0) -> dict:
 
 
 def header() -> None:
+    from . import brand
+    from .. import auth as _auth
+    from ..data import http as _http
+    from ..i18n import switcher, tr
+    from .login import current_user, logout_button, role
     stt = paper_status_cached(st.session_state.get("paper_nonce", 0))
     t = "green" if stt["ok"] else ("orange" if "未连接" in stt["label"] else "red")
     checked = stt.get("checked_at", "")[11:19]
     test_mode = os.environ.get("AIQUANT_DEEPSEEK_MOCK") == "1"
-    left, right = st.columns([3, 2])
+    info = st.session_state.get("auth_info") or {}
+    where = ("外网访问 · " + esc(info.get("host", ""))) if info.get("remote") else "本地运行 · 127.0.0.1"
+    left, right = st.columns([3, 2], vertical_alignment="center")
     left.markdown(
-        '<div class="aq-brand"><div class="aq-logo"></div><div><span class="aq-title">AI Quant Strategy Lab</span>'
-        f'<span class="aq-ver">v1.0</span><div class="aq-sub">AI 量化策略研究实验室 · '
-        f'{"外网访问 · " + esc((st.session_state.get("auth_info") or {}).get("host", "")) if (st.session_state.get("auth_info") or {}).get("remote") else "本地运行 · 127.0.0.1"}</div></div></div>',
+        f'<div class="aq-brand">{brand.mark_svg(40)}<div><span class="aq-title">AI Quant Strategy Lab</span>'
+        f'<span class="aq-ver">v1.0</span><div class="aq-slogan">{esc(brand.slogan())}</div>'
+        f'<div class="aq-sub aq-hdr-detail">{where}</div></div></div>',
         unsafe_allow_html=True)
-    from ..data import http as _http
     perm = pill("模拟盘自动交易中", "green") if _http.paper_orders_unlocked() else pill("模拟下单未授权", "gray")
     mock = (" " + pill("DeepSeek 测试替身模式", "orange")) if test_mode else ""
-    from .. import auth as _auth
-    from .login import current_user, logout_button, role
-    if current_user():
-        with right:
-            ucol, bcol = st.columns([3, 1])
-            ucol.markdown(f'<div style="text-align:right;margin-top:6px">👤 <b>{esc(current_user())}</b> '
-                          f'{pill(_auth.ROLES.get(role(), role()), "purple" if role() == "admin" else "gray")}'
-                          f'{" " + pill("只读", "orange") if role() == "viewer" else ""}</div>',
-                          unsafe_allow_html=True)
-            with bcol:
-                logout_button()
-    right.markdown(
-        f'<div style="text-align:right;margin-top:4px">{perm}{mock} {pill(stt["label"], t)} {pill("真实资金交易：关闭", "gray")}'
-        f'<div class="aq-sub" title="{esc(stt.get("detail", ""))}">券商连接检查 {checked} UTC · {esc(stt.get("detail", ""))[:60]}</div></div>',
-        unsafe_allow_html=True)
+    with right:
+        a, b = st.columns([4, 2], vertical_alignment="center")
+        user = ""
+        if current_user():
+            user = (f'👤 <b>{esc(current_user())}</b> '
+                    f'{pill(_auth.ROLES.get(role(), role()), "purple" if role() == "admin" else "gray")}'
+                    f'{" " + pill("只读", "orange") if role() == "viewer" else ""} ')
+        a.markdown(
+            f'<div class="aq-hdr-right">{user}{perm}{mock} {pill(stt["label"], t)} {pill("真实资金交易：关闭", "gray")}'
+            f'<div class="aq-sub aq-hdr-detail" title="{esc(stt.get("detail", ""))}">券商连接检查 {checked} UTC · '
+            f'{esc(tr(stt.get("detail", ""))[:90])}</div></div>', unsafe_allow_html=True)
+        with b:
+            switcher()
+            logout_button()
 
 
 def job_signature() -> str:

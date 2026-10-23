@@ -8,8 +8,13 @@ from aiquant import actions, config
 logging.basicConfig(filename=str(config.LOG_DIR / "app.log"), level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
-st.set_page_config(page_title="AI Quant Strategy Lab", page_icon="📈", layout="wide",
-                   initial_sidebar_state="collapsed")
+from aiquant import i18n  # noqa: E402
+from aiquant.ui import brand  # noqa: E402
+
+st.set_page_config(page_title="AI Quant Strategy Lab · " + brand.SLOGAN_EN.rstrip("."), page_icon=brand.favicon(),
+                   layout="wide", initial_sidebar_state="collapsed")
+i18n.install()            # 中英文显示层
+i18n.init_from_request()  # ?lang=en / Cookie / 浏览器语言
 
 from aiquant.ui import style, common  # noqa: E402
 from aiquant.ui import page_lab, page_paper, page_versions, page_history, page_data, page_settings  # noqa: E402

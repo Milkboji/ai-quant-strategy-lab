@@ -43,9 +43,12 @@ label, .stMarkdown p { font-size: 13px; }
 .stTabs [data-baseweb="tab"]{ height: 32px; padding: 0 10px; font-size: 13px; }
 
 /* 自定义元素 */
-.aq-brand{ display:flex; align-items:center; gap:10px; }
-.aq-logo{ width:30px; height:30px; border-radius:50%; background: radial-gradient(circle at 35% 35%, #60A5FA, #2563EB 60%, #1E40AF);
-  box-shadow: 0 0 0 3px #DBEAFE; }
+.aq-brand{ display:flex; align-items:center; gap:12px; }
+.aq-mark{ flex:none; border-radius:11px; box-shadow: 0 4px 14px rgba(79,70,229,.28); }
+.aq-slogan{ font-size:13px; font-weight:700; letter-spacing:.3px; color:#6D28D9; }
+.aq-hdr-right{ text-align:right; line-height:2; }
+.aq-hdr-right .aq-pill{ margin-left:2px; }
+.st-key-lang_switch{ display:flex; justify-content:flex-end; }
 .aq-title{ font-size:20px; font-weight:700; color:#1E3A8A; }
 .aq-ver{ font-size:11px; color:var(--aq-muted); border:1px solid var(--aq-border); border-radius:6px; padding:1px 6px; margin-left:4px; }
 .aq-sub{ font-size:12px; color:var(--aq-muted); }
@@ -91,6 +94,22 @@ label, .stMarkdown p { font-size: 13px; }
   align-items:center; justify-content:center; font-weight:700; }
 .aq-step span.on{ color:var(--aq-blue); font-weight:600; } .aq-step span.on i{ background:var(--aq-blue); color:#fff; }
 [data-testid="stDataFrame"]{ font-size: 12px; }
+/* 手机（≤640px）：单列、紧凑页眉、标题不挤、长文字可换行 */
+@media (max-width: 640px){
+  .block-container{ padding-left:.8rem !important; padding-right:.8rem !important; padding-top:3.4rem !important; }
+  .aq-title{ font-size:17px; } .aq-ver{ display:none; }
+  .aq-brand{ gap:10px; } .aq-mark{ width:34px; height:34px; }
+  .aq-hdr-right{ text-align:left; line-height:1.9; }
+  .aq-hdr-detail{ display:none; }
+  .st-key-lang_switch{ justify-content:flex-start; }
+  .aq-section{ flex-wrap:wrap; font-size:15px !important; row-gap:2px; }
+  .aq-section > span:last-child{ margin-left:0 !important; flex-basis:100%; font-size:12px; font-weight:500; }
+  [data-testid="stMetricValue"]{ font-size:26px !important; }
+  [data-testid="stMetricValue"] > div{ white-space:normal !important; }
+  .aq-big{ font-size:26px; }
+  .stMarkdown, .aq-err, .aq-warn, .aq-ok, .aq-sub{ overflow-wrap:anywhere; }
+  .stTabs [data-baseweb="tab-list"]{ overflow-x:auto; }
+}
 /* 窄屏：五策略横向滚动，保证可读 */
 @media (max-width: 1500px){
   .st-key-lanes [data-testid="stHorizontalBlock"]{ overflow-x:auto; flex-wrap:nowrap !important; }

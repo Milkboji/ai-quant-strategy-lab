@@ -26,8 +26,9 @@ LOGIN_CSS = """
              radial-gradient(900px 600px at 120% 120%,#A78BFA 0%,transparent 55%),
              linear-gradient(135deg,#1D4ED8 0%,#6D28D9 100%);
   box-shadow:0 20px 50px rgba(37,99,235,.25);display:flex;flex-direction:column}
-.aq-lg-logo{width:46px;height:46px;border-radius:13px;background:rgba(255,255,255,.18);
-  display:flex;align-items:center;justify-content:center;font-size:24px;border:1px solid rgba(255,255,255,.35)}
+.aq-lg-logo{width:56px;height:56px;border-radius:15px;box-shadow:0 0 0 3px rgba(255,255,255,.28),0 8px 24px rgba(15,23,42,.25)}
+.aq-lg-slogan{font-size:15px;font-weight:700;letter-spacing:.5px;color:#FDE68A;margin-top:2px}
+.st-key-lang_login{display:flex;justify-content:flex-end;margin-top:14px}
 .aq-lg-hero h1{color:#fff;font-size:30px;line-height:1.25;margin:22px 0 8px}
 .aq-lg-hero .lead{opacity:.9;font-size:15px;line-height:1.7}
 .aq-lg-feat{margin-top:26px;display:grid;gap:12px}
@@ -45,7 +46,7 @@ LOGIN_CSS = """
 .stTextInput [data-baseweb="input"]:focus-within{border-color:#2563EB !important;box-shadow:0 0 0 3px rgba(37,99,235,.12)}
 @media (max-width: 760px){.aq-lg-hero{min-height:auto;padding:20px 20px;border-radius:16px}
   .aq-lg-hero h1{font-size:22px;margin:12px 0 4px}.aq-lg-hero .lead,.aq-lg-feat,.aq-lg-foot{display:none}
-  .aq-lg-logo{width:38px;height:38px;font-size:20px}.aq-lg-wrap{min-height:2vh}}
+  .aq-lg-logo{width:42px;height:42px}.aq-lg-wrap{min-height:0}.aq-lg-hero .aq-lg-slogan{font-size:13px}}
 </style>
 """
 
@@ -231,16 +232,18 @@ def gate() -> bool:
 
 
 def _denied(title: str, msg: str) -> None:
+    from . import brand
     st.markdown(LOGIN_CSS + f'<div style="max-width:440px;margin:14vh auto 0;text-align:center">'
-                f'<div class="aq-lg-logo" style="margin:0 auto;background:#2563EB">📈</div>'
+                f'{brand.mark_svg(56, "aq-lg-logo")}'
                 f'<h2 style="margin:18px 0 6px">{esc(title)}</h2><div style="color:#64748B">{esc(msg)}</div></div>',
                 unsafe_allow_html=True)
 
 
 def _hero() -> None:
+    from . import brand
     st.markdown(
-        '<div class="aq-lg-hero"><div class="aq-lg-logo">📈</div>'
-        '<h1>AI Quant Strategy Lab</h1>'
+        f'<div class="aq-lg-hero">{brand.mark_svg(56, "aq-lg-logo")}'
+        f'<h1>AI Quant Strategy Lab</h1><div class="aq-lg-slogan">{esc(brand.slogan())}</div>'
         '<div class="lead">个人量化研究与模拟交易实验室。策略经过严格回测和多年历史检验，'
         '在模拟账户里自动运行、持续进化。</div>'
         '<div class="aq-lg-feat"><div>🧪　严格分区回测 · 计入全部交易成本</div>'
@@ -250,8 +253,16 @@ def _hero() -> None:
         unsafe_allow_html=True)
 
 
+def _lang_bar() -> None:
+    from ..i18n import switcher
+    _, r = st.columns([5, 1])
+    with r:
+        switcher("lang_login")
+
+
 def _login_page(info: dict) -> None:
     st.markdown(LOGIN_CSS + '<div class="aq-lg-wrap"></div>', unsafe_allow_html=True)
+    _lang_bar()
     if not auth.has_users():
         _denied("还没有设置登录账号",
                 "为了安全，第一个账号只能在运行系统的电脑上创建：在那台电脑上打开 http://127.0.0.1:8501 → 账号 → 用户管理。")
@@ -288,6 +299,7 @@ def _login_page(info: dict) -> None:
 
 def _change_password_page(u: str) -> None:
     st.markdown(LOGIN_CSS + '<div class="aq-lg-wrap"></div>', unsafe_allow_html=True)
+    _lang_bar()
     _, mid, _ = st.columns([1, 1.2, 1])
     with mid:
         st.markdown('<div class="aq-lg-card"><h2>请先修改密码</h2>'

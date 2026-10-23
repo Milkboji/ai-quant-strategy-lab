@@ -26,7 +26,11 @@ SRC_LABEL = {"alpaca": "Alpaca API（只读，实时/历史）", "cache": "本�
 @st.cache_data(show_spinner=False, max_entries=64)
 def _chart_data(bt_id: int):
     b = research.get_backtest(bt_id)
-    return research.chart_data(b)
+    try:
+        return research.chart_data(b)
+    except (FileNotFoundError, OSError, ValueError):   # 数据快照文件缺失或损坏：不画图，页面其余部分照常显示
+        import pandas as pd
+        return pd.DataFrame(), pd.DataFrame()
 
 
 # ---------------------------------------------------------------------------
@@ -325,9 +329,13 @@ def slot_card(n: int, r: dict) -> None:
         # K线缩略图（与回测数据版本一致）
         if res:
             k, trades = _chart_data(res["id"])
-            st.plotly_chart(C.kline_figure(k, trades, height=165, last_n=150), use_container_width=True,
-                            key=f"mini_{n}_{res['id']}", config={"displayModeBar": False})
-            if st.button("🔍 放大查看K线与交易明细", key=f"zoom_{n}", use_container_width=True):
+            if k.empty:
+                st.markdown('<div class="aq-placeholder">K线数据快照缺失，无法绘图（回测结果不受影响）</div>',
+                            unsafe_allow_html=True)
+            else:
+                st.plotly_chart(C.kline_figure(k, trades, height=165, last_n=150), use_container_width=True,
+                                key=f"mini_{n}_{res['id']}", config={"displayModeBar": False})
+            if not k.empty and st.button("🔍 放大查看K线与交易明细", key=f"zoom_{n}", use_container_width=True):
                 kline_dialog(res["id"], f"策略{n} {name}{ver}")
         else:
             st.markdown('<div class="aq-placeholder">暂无回测结果<br>运行回测后显示真实K线与买卖点</div>',
