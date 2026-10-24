@@ -350,3 +350,98 @@ def test_queue_btc_keeps_latest_and_etf_approval(clean):
         assert _status_of(cid)["status"] == "promoted"
     finally:
         db.set_setting("etf_trend_config", dict(db.get_setting("etf_trend_config") or {}, sma=cfg["sma"], band=cfg["band"]))
+
+
+# ---------------------------------------------------------------------------
+# 进化记录（晋级 / 淘汰 / 拒绝）
+# ---------------------------------------------------------------------------
+
+def _log_of(ch_id: int) -> list[dict]:
+    from aiquant import evolog
+    return [r for r in evolog.rows(500, include_test=True) if r["challenger_id"] == ch_id]
+
+
+def test_evolution_log_records_approval_rejection_and_auto(clean):
+    from aiquant import challenger, evolog
+    v1 = _version(5, "记录测试A", new_lineage=True)
+    did = console.deploy_version("slot:5", v1["id"], actor="tester", role="trader", broker="mock")["deployment_id"]
+    # 人工批准
+    ch = _challenger(did, v1, stop_loss_pct=5.5)
+    db.ex("UPDATE evolve_challengers SET status='awaiting', last_eval_json=? WHERE id=?",
+          (json.dumps({"days": 8.0, "need_days": 14, "challenger": {"return_pct": 3.1, "max_dd_pct": -2.0, "trades": 3},
+                       "champion": {"return_pct": 1.2, "max_dd_pct": -2.4, "trades": 2}}), ch["id"]))
+    console.approve(ch["id"], actor="boss", role="admin")
+    (r,) = _log_of(ch["id"])
+    new_vid = _status_of(ch["id"])["new_version_id"]
+    assert r["event"] == "晋级" and r["trigger"] == "人工批准" and r["actor"] == "boss"
+    assert r["from_version_id"] == v1["id"] and r["to_version_id"] == new_vid and r["strategy_key"] == "slot:5"
+    assert r["diff_plain"] and "stop_loss_pct" in r["diff_raw"]
+    assert r["forward"]["challenger"]["return_pct"] == 3.1 and r["forward"]["champion"]["max_dd_pct"] == -2.4
+    assert r["score"]["challenger"]["score"] == 99.0
+    assert "→" in evolog.describe(r)
+    # 人工拒绝
+    cur = registry.get_version(pr.get_deployment(did)["version_id"])
+    ch2 = _challenger(did, cur, take_profit_pct=15.0)
+    db.ex("UPDATE evolve_challengers SET status='awaiting' WHERE id=?", (ch2["id"],))
+    console.reject(ch2["id"], "前向样本太少", actor="boss", role="admin")
+    (r2,) = _log_of(ch2["id"])
+    assert r2["event"] == "拒绝" and r2["trigger"] == "人工拒绝" and "前向样本太少" in r2["reason"]
+    # 自动淘汰
+    ch3 = _challenger(did, cur, take_profit_pct=18.0)
+    challenger._close(ch3, "rejected", "前向表现不如现役，淘汰：测试")
+    (r3,) = _log_of(ch3["id"])
+    assert r3["event"] == "淘汰" and r3["trigger"] == "自动"
+    # 作废 / 被替换不算晋级、淘汰、拒绝
+    ch4 = _challenger(did, cur, take_profit_pct=21.0)
+    challenger._close(ch4, "expired", "现役版本已变化")
+    assert _log_of(ch4["id"]) == []
+
+
+def test_evolution_log_auto_promotion_and_direct(clean):
+    from aiquant import evolog
+    console.set_promotion_config(actor="boss", role="admin", manual_lock_days=0)
+    v1 = _version(5, "记录测试B", new_lineage=True)
+    did = console.deploy_version("slot:5", v1["id"], actor="tester", role="trader", broker="mock")["deployment_id"]
+    ch = _challenger(did, v1, stop_loss_pct=6.5)
+    _win(ch, did)
+    (r,) = _log_of(ch["id"])
+    assert r["event"] == "晋级" and r["trigger"] == "自动"
+    # 进化直接替换（没有挑战者阶段）
+    v2 = registry.get_version(pr.get_deployment(did)["version_id"])
+    v3 = registry.freeze(5, dict(v2["schema"], take_profit_pct=11.0), source="auto_evolve", parent_id=v2["id"])
+    dep = db.q1("SELECT * FROM paper_deployments WHERE id=?", (did,))
+    rec = {"label": "记录测试B", "current": {"score": 1.0, "segments": [1, -1, 2, 0]},
+           "best": {"score": 2.5, "segments": [2, 1, 2, 1], "change": "增加 11% 止盈"}, "reason": "稳健分 1.00 → 2.50"}
+    ho = {"kind": "验证集", "passed": True, "reason": "验证集：候选 +2% / 现役 +1%", "_eval": {}}
+    evolog.record_direct(dep=dep, cur=v2, new=v3, rec=rec, ho=ho, run_id=987654)
+    rd = next(x for x in evolog.rows(500, include_test=True) if x["source"] == "evolve_run:987654")
+    assert rd["event"] == "晋级" and rd["from_version_id"] == v2["id"] and rd["to_version_id"] == v3["id"]
+    assert rd["score"]["challenger"]["score"] == 2.5 and rd["holdout"]["passed"] and "_eval" not in rd["holdout"]
+    assert any("止盈" in a for a, _, _ in rd["diff_plain"])
+
+
+def test_evolution_log_etf_promotion(clean):
+    from aiquant import evolog
+    from aiquant.paper import etf_trend
+    cfg = etf_trend.get_config()
+    cid = db.ex("INSERT INTO evolve_challengers(kind,deployment_id,label,champion_params,candidate_json,change,train_json,"
+                "registered_at,status,decided_at,reason,is_test) VALUES('etf',NULL,'ETF',?,?,?,?,?,?,?,?,1)",
+                (json.dumps({"sma": int(cfg["sma"]), "band": float(cfg["band"])}),
+                 json.dumps({"sma": int(cfg["sma"]) + 20, "band": 0.03}), "均线+20", "{}",
+                 db.now_iso(), "awaiting", db.now_iso(), "挑战者胜出，等待确认"))
+    try:
+        console.approve(cid, actor="boss", role="admin")
+        (r,) = _log_of(cid)
+        assert r["kind"] == "etf" and r["event"] == "晋级" and r["strategy_key"] == "etf"
+        assert any(a.startswith("均线") for a, _, _ in r["diff_plain"]) and any(a == "缓冲带" for a, _, _ in r["diff_plain"])
+        assert "日均线" in evolog.describe(r)
+    finally:
+        db.set_setting("etf_trend_config", dict(db.get_setting("etf_trend_config") or {}, sma=cfg["sma"], band=cfg["band"]))
+
+
+def test_evolution_log_backfill_is_idempotent(clean):
+    from aiquant import evolog
+    n0 = len(evolog.rows(2000, include_test=True))
+    evolog.backfill()
+    evolog.backfill()
+    assert len(evolog.rows(2000, include_test=True)) == n0

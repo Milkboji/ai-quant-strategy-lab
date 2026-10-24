@@ -385,7 +385,9 @@ def evolve_one(dep: dict, cfgv: dict, r: dict, train: tuple[datetime, datetime],
     if not ho.get("kind") or uninformative:
         # 历史留出数据用完或无法给出证据：登记为挑战者，在之后的真实行情上与现役版本并行模拟运行
         from . import challenger
-        cid = challenger.register_btc(dep, cur, best_sch, best_why, rec["best"], bool(dep["is_test"]))
+        cid = challenger.register_btc(dep, cur, best_sch, best_why,
+                                      dict(rec["best"], champion=rec["current"], holdout=rec["holdout"]),
+                                      bool(dep["is_test"]))
         rec["decision"] = "挑战者上线"
         rec["reason"] = f"挑战者 #{cid} 已登记（先做更早历史 + ETH 快速检验，通过则立即上线，否则在实时行情上模拟运行）；" + (ho["reason"] if ho.get("reason") else "")
         if uninformative and ho["kind"] == "验证集":
@@ -401,8 +403,9 @@ def evolve_one(dep: dict, cfgv: dict, r: dict, train: tuple[datetime, datetime],
     block = console.promotion_block(dep if "config" in dep else dict(dep, config=json.loads(dep["config_json"])))
     if block:
         from . import challenger
-        cid = challenger.queue_btc(dep, cur, best_sch, best_why, rec["best"], "通过全部检验：" + ho["reason"], block,
-                                   bool(dep["is_test"]))
+        cid = challenger.queue_btc(dep, cur, best_sch, best_why,
+                                   dict(rec["best"], champion=rec["current"], holdout=rec["holdout"]),
+                                   "通过全部检验：" + ho["reason"], block, bool(dep["is_test"]))
         rec["decision"] = "待人工确认"
         rec["reason"] = f"候选 #{cid} 通过全部检验，等待确认（{block}）：" + ho["reason"]
         return rec
@@ -428,6 +431,11 @@ def evolve_one(dep: dict, cfgv: dict, r: dict, train: tuple[datetime, datetime],
     rec["decision"] = "替换"
     rec["reason"] = (f"稳健分 {cur_eval['score'] if cur_eval['enough_trades'] else '成交不足'} → "
                      f"{best_eval['score']:.2f}；{ho['reason']}")
+    try:   # 进化记录
+        from . import evolog
+        evolog.record_direct(dep=dep, cur=cur, new=nv, rec=rec, ho=ho, run_id=run_id)
+    except Exception:  # noqa: BLE001
+        log.exception("evolution log failed")
     schedule_switch(dep["id"], nv["id"], best_eval["tf"], best_eval["aux"], rec["reason"])
     return rec
 
@@ -718,6 +726,14 @@ def _pause(dep: dict, kind: str, reason: str) -> None:
     pr.set_status(dep["id"], "paused_entries")
     pr.event(dep["id"], "WARN", f"自动暂停新开仓（长期亏损）：{reason}。已有持仓仍按卖出规则管理；"
                                 f"自动进化找到不亏的新版本后会自动恢复。"[:480], bool(dep["is_test"]))
+    if not dep.get("is_test"):
+        try:
+            from . import notify
+            notify.event("auto_pause", f"自动暂停新开仓：{cfg.get('label') or ('部署 #' + str(dep['id']))}",
+                         f"{reason}\n已有持仓仍按卖出规则管理；体检达标或进化出更好的版本后自动恢复。",
+                         dedupe=f"pause:{dep['id']}:{dep['version_id']}:{kind}")
+        except Exception:  # noqa: BLE001
+            log.exception("pause notify failed")
 
 
 def _resume(dep: dict, reason: str) -> None:

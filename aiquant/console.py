@@ -604,7 +604,7 @@ def approve(ch_id: int, *, actor: str | None, role: str | None) -> dict:
             audit(actor, role, "批准晋级", "etf", "美股 ETF 择时", None, None, None, "已作废", "现役参数已变化")
             raise ValueError("现役参数已变化，这个挑战者已作废")
         db.set_setting("etf_trend_config", dict(db.get_setting("etf_trend_config") or {}, sma=cand["sma"], band=cand["band"]))
-        challenger._close(ch, "promoted", f"{actor or '用户'} 批准晋级：{ch['reason'] or ''}")
+        challenger._close(ch, "promoted", f"{actor or '用户'} 批准晋级：{ch['reason'] or ''}", trigger="人工批准", actor=actor)
         pr.event(None, "INFO", f"[ETF趋势] {actor or '用户'} 批准挑战者 #{ch['id']}，参数改为 {cand['sma']} 日均线 ±{cand['band']:.0%}")
         audit(actor, role, "批准晋级", "etf", "美股 ETF 择时", None, None, None, "已晋级",
               f"#{ch['id']}：{champ['sma']}/{champ['band']} → {cand['sma']}/{cand['band']}")
@@ -622,7 +622,8 @@ def approve(ch_id: int, *, actor: str | None, role: str | None) -> dict:
     champ = registry.get_version(dep["version_id"])
     cand = json.loads(ch["candidate_json"])
     rr = dict(research.get_research(), source="test") if ch["is_test"] else research.get_research()
-    msg = challenger._promote_btc(ch, dep, champ, cand, None, rr, f"{actor or '用户'} 批准（{ch['reason'] or ''}）"[:400])
+    msg = challenger._promote_btc(ch, dep, champ, cand, None, rr, f"{actor or '用户'} 批准（{ch['reason'] or ''}）"[:400],
+                                  trigger="人工批准", actor=actor)
     now = pr.get_deployment(dep["id"])
     new_vid = db.q1("SELECT new_version_id FROM evolve_challengers WHERE id=?", (ch["id"],))["new_version_id"]
     switched = now["version_id"] == new_vid
@@ -642,7 +643,7 @@ def reject(ch_id: int, reason: str, *, actor: str | None, role: str | None) -> d
     ch = db.q1("SELECT * FROM evolve_challengers WHERE id=?", (int(ch_id),))
     if not ch or ch["status"] != "awaiting":
         raise ValueError("这条记录不在待确认队列中")
-    challenger._close(ch, "rejected", f"{actor or '用户'} 拒绝：{reason}")
+    challenger._close(ch, "rejected", f"{actor or '用户'} 拒绝：{reason}", trigger="人工拒绝", actor=actor)
     dep = pr.get_deployment(ch["deployment_id"]) if ch["deployment_id"] else None
     pr.event(ch["deployment_id"], "INFO", f"{actor or '用户'} 拒绝挑战者 #{ch['id']}：{reason}"[:480],
              bool(ch["is_test"]))

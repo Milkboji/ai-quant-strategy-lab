@@ -131,6 +131,12 @@ def _loop() -> None:
             except Exception:  # noqa: BLE001
                 log.error("snapshot error: %s", traceback.format_exc())
             _maybe_evolve()
+            try:   # 通知：重试发件箱 + 每日运行摘要
+                from .. import notify
+                notify.flush()
+                notify.maybe_daily()
+            except Exception:  # noqa: BLE001
+                log.error("notify error: %s", traceback.format_exc())
         except Exception:  # noqa: BLE001
             log.error("paper loop error: %s", traceback.format_exc())
         db.set_setting("paper_loop_heartbeat", db.now_iso())

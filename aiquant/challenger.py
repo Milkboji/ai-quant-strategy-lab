@@ -298,6 +298,20 @@ def _await(ch: dict, why: str, block: str) -> None:
     """挑战者胜出但不能自动晋级（版本锁定 / 晋级需人工确认）：进入待确认队列。"""
     db.ex("UPDATE evolve_challengers SET status='awaiting', decided_at=?, reason=? WHERE id=?",
           (db.now_iso(), f"挑战者胜出，等待确认（{block}）：{why}"[:480], ch["id"]))
+    _notify_awaiting(ch.get("label") or ("美股 ETF 择时" if ch.get("kind") == "etf" else ""), ch["id"], ch.get("change"),
+                     why, block, bool(ch.get("is_test")))
+
+
+def _notify_awaiting(label, cid, change, why, block, is_test) -> None:
+    if is_test:
+        return
+    try:
+        from . import notify
+        notify.event("awaiting", f"等待人工确认：{label}",
+                     f"挑战者 #{cid} 胜出，等待确认（{block}）\n改动：{change or '--'}\n{why}\n请到「策略总台」批准或拒绝。",
+                     dedupe=f"awaiting:{cid}")
+    except Exception:  # noqa: BLE001
+        log.exception("awaiting notify failed")
 
 
 def _win_btc(ch, dep, champ, cand, fwd_eval, rr, why) -> str:
@@ -325,15 +339,28 @@ def queue_btc(dep: dict, champion: dict, cand_schema: dict, change: str, train_b
                  json.dumps(train_brief, ensure_ascii=False), db.now_iso(), "awaiting", db.now_iso(),
                  f"挑战者胜出，等待确认（{block}）：{why}"[:480], 1 if is_test else 0))
     _event(dep["id"], "INFO", f"自动进化：候选 #{cid} 通过全部检验，等待确认（{block}）— {change}", is_test)
+    _notify_awaiting(label, cid, change, why, block, is_test)
     return cid
 
 
-def _close(ch: dict, status: str, reason: str, new_vid: int | None = None) -> None:
+def _close(ch: dict, status: str, reason: str, new_vid: int | None = None, trigger: str = "自动",
+           actor: str | None = None) -> None:
+    try:   # 先确保进化记录表就绪（首次会回填历史），避免本条被回填抢先写入
+        from . import evolog
+        evolog.ensure_tables()
+    except Exception:  # noqa: BLE001
+        log.exception("evolution log init failed")
     db.ex("UPDATE evolve_challengers SET status=?, decided_at=?, reason=?, new_version_id=? WHERE id=?",
           (status, db.now_iso(), reason[:480], new_vid, ch["id"]))
+    try:   # 进化记录：晋级 / 淘汰 / 拒绝
+        from . import evolog
+        row = db.q1("SELECT * FROM evolve_challengers WHERE id=?", (ch["id"],))
+        evolog.record_challenger(row, status, reason, new_vid, trigger=trigger, actor=actor)
+    except Exception:  # noqa: BLE001
+        log.exception("evolution log failed")
 
 
-def _promote_btc(ch, dep, champ, cand, fwd_eval, rr, why) -> str:
+def _promote_btc(ch, dep, champ, cand, fwd_eval, rr, why, trigger: str = "自动", actor: str | None = None) -> str:
     from . import evolve
     from .engine import backtest as bt
     nv = registry.freeze(champ["slot_no"], dict(cand, name=champ["schema"]["name"]), nl_text=champ["nl_text"],
@@ -350,7 +377,8 @@ def _promote_btc(ch, dep, champ, cand, fwd_eval, rr, why) -> str:
         log.exception("store training backtest for challenger failed")
     if champ["slot_no"] is None:
         db.set_setting(f"preset_current::{champ['name']}", nv["id"])
-    _close(ch, "promoted", "前向表现不差于现役，晋级上线：" + why, nv["id"])
+    _close(ch, "promoted", ("晋级上线：" if trigger != "自动" else "前向表现不差于现役，晋级上线：") + why, nv["id"],
+           trigger=trigger, actor=actor)
     tf = int(cand.get("signal_tf") or 15)
     evolve.schedule_switch(dep["id"], nv["id"], tf, cand.get("aux_tf"), f"挑战者#{ch['id']}晋级：{why}",
                            trigger="challenger")

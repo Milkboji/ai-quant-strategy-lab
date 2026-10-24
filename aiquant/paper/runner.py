@@ -320,6 +320,10 @@ class PaperRunner:
             if msg:
                 event(self.did, "INFO", f"交易节奏：本笔{'盈利' if pnl_est > 0 else '亏损'}约 {pnl_est:,.0f} USD → {msg}",
                       self.is_test)
+                if "连亏" in msg and not self.is_test:
+                    from .. import notify
+                    notify.event("loss_streak", f"连亏刹车：{dep_label(self.did)}",
+                                 f"{msg}\n期间该策略不开新仓，已有持仓不受影响。")
         except Exception:  # noqa: BLE001
             pass
 

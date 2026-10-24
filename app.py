@@ -19,7 +19,7 @@ i18n.init_from_request()  # ?lang=en / Cookie / 浏览器语言
 from aiquant.ui import style, common  # noqa: E402
 from aiquant.ui import page_lab, page_paper, page_versions, page_history, page_data, page_settings  # noqa: E402
 from aiquant.ui import page_live, page_evolve, page_home, page_bollinger, page_account, page_users  # noqa: E402
-from aiquant.ui import page_console  # noqa: E402
+from aiquant.ui import page_console, page_evolog  # noqa: E402
 
 actions.init()
 style.inject()
@@ -35,6 +35,7 @@ pages = {
     "boll": st.Page(page_bollinger.render, title="布林带", icon="📊", url_path="bollinger"),
     "paper": st.Page(page_paper.render, title="模拟盘交易", icon="💹", url_path="paper"),
     "evolve": st.Page(page_evolve.render, title="策略进化", icon="🧬", url_path="evolve"),
+    "evolog": st.Page(page_evolog.render, title="进化记录", icon="📜", url_path="evolution-log"),
     "lab": st.Page(page_lab.render, title="策略实验室", icon="🧪", url_path="lab"),
     "versions": st.Page(page_versions.render, title="策略版本", icon="🗂️", url_path="versions"),
     "history": st.Page(page_history.render, title="历史记录", icon="🕘", url_path="history"),
@@ -49,7 +50,7 @@ st.session_state["_pages"] = pages
 from aiquant import auth  # noqa: E402
 allowed = auth.ROLE_PAGES[login.role()]
 groups = {
-    "": ("home", "console", "live", "boll", "paper", "evolve"),
+    "": ("home", "console", "live", "boll", "paper", "evolve", "evolog"),
     "研究与设置": ("lab", "versions", "history", "data", "settings"),
     "账号": ("account", "users"),
 }

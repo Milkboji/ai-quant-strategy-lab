@@ -245,6 +245,40 @@ def tunnel_ready() -> bool | None:
         return None
 
 
+TUNNEL_ALERT_SEC = 60     # 外网通道连续断开超过这么久才发通知（避免每 12 分钟的短暂抖动刷屏）
+
+
+def _notify(kind: str, title: str, body: str, dedupe: str | None = None) -> None:
+    """守护进程发通知：写入发件箱并尝试发送（发不出去时由主程序每分钟重试）。任何错误都不影响守护。"""
+    try:
+        from aiquant import notify
+        notify.event(kind, title, body, dedupe=dedupe)
+    except Exception as e:  # noqa: BLE001
+        _wlog(f"通知发送失败：{type(e).__name__}: {e}")
+
+
+def _tunnel_down_tick(ok: bool, now: float | None = None) -> str | None:
+    """记录通道断开时长；断开超过 TUNNEL_ALERT_SEC 发一次通知，恢复时再发一条。返回本次发出的通知类型。"""
+    now = now or time.time()
+    if ok:
+        since, alerted = _cf_state.get("down_since"), _cf_state.get("down_alerted")
+        _cf_state["down_since"], _cf_state["down_alerted"] = None, False
+        if since and alerted:
+            _notify("tunnel_down", "外网通道已恢复", f"断开约 {int(now - since)} 秒后恢复，外网地址可以正常访问。")
+            return "recovered"
+        return None
+    if not _cf_state.get("down_since"):
+        _cf_state["down_since"] = now
+        return None
+    if not _cf_state.get("down_alerted") and now - _cf_state["down_since"] >= TUNNEL_ALERT_SEC:
+        _cf_state["down_alerted"] = True
+        _notify("tunnel_down", "外网通道断开超过 60 秒",
+                f"已断开约 {int(now - _cf_state['down_since'])} 秒。系统和自动交易在电脑上照常运行，守护进程正在自动重连；"
+                "本机访问 http://127.0.0.1:8501 不受影响。")
+        return "down"
+    return None
+
+
 def check_tunnel() -> None:
     """通道自愈：连接全部掉线且几分钟内没有自己恢复时，重启 cloudflared。"""
     if not tunnel_configured() or not _alive(_cf_pid()):
@@ -257,6 +291,7 @@ def check_tunnel() -> None:
             _wlog("外网通道没有状态接口（旧进程），重启以启用自动检测")
             stop_tunnel(); ensure_tunnel()
         return
+    _tunnel_down_tick(bool(ok))
     if ok:
         if _cf_state["fails"]:
             _wlog("外网通道已恢复")
@@ -319,7 +354,10 @@ def watch() -> int:
                 if healthy():
                     break
                 time.sleep(1)
-            _wlog(f"重启{'成功' if healthy() else '后仍无响应，下轮继续检查'}（新 PID {p.pid}）")
+            ok_now = healthy()
+            _wlog(f"重启{'成功' if ok_now else '后仍无响应，下轮继续检查'}（新 PID {p.pid}）")
+            _notify("watchdog_restart", "守护进程自动重启了系统",
+                    f"原因：{reason}\n结果：{'重启成功，模拟盘已自动对账恢复' if ok_now else '重启后仍无响应，下一轮继续检查'}")
             fails = 0
 
 
