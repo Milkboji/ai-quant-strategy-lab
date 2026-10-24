@@ -18,20 +18,23 @@
 
 | 模块 | 说明 |
 |---|---|
+| 策略总台 | 每个策略一张卡片：运行版本 vs 实验室版本（规则差异高亮）、挑战者进度、持仓与资金权重、「为什么没有动作」；按单个策略 / 单个版本部署或下线（空仓才切换）；锁定版本、晋级需人工确认、手动部署后自动锁定 N 天、批准 / 拒绝队列；全部写审计 |
 | 总览首页 | 总资产、累计/今日盈亏、资金分布、各策略状态卡、资产曲线、动态流、系统健康 |
 | 布林带分析 | 1 小时 / 4 小时 / 日线：%B、带宽、收口 / 开口、沿轨运行、中轨方向的大白话解读；带宽与 %B 图；布林带策略的 6 年历史检验（见 `docs/bollinger.md`） |
 | 实时看盘 | 秒级/分钟级 K 线、买卖点、指标大白话解读、本地虚拟账户与快速回放 |
-| 策略实验室 | 中文自然语言 → 策略 Schema（白名单、可校验）；五策略并行回测；买入持有基准；DeepSeek 分析与候选版本 |
+| 策略实验室 | 中文自然语言 → 策略 Schema（白名单、可校验）；解析后用大白话完整复述规则，确认后才能保存 / 回测；识别不了的片段给出 1~3 条可识别写法；「支持的写法」速查表；五策略并行回测；买入持有基准；DeepSeek 分析与候选版本 |
 | 防过拟合 | 训练 / 验证（每条谱系最多 3 次）/ 独立测试（每版本 1 次）分区；只用已收盘 K 线；次根 K 线成交；手续费+滑点+点差 |
 | 模拟盘 | 多策略共用一个 Alpaca Paper 账户，独立资金额度与订单台账、对账、重启恢复、风控暂停 |
-| 美股 ETF 择时 | QQQ 150 日均线 ±2% 缓冲 → 持有 QLD（2 倍纳指 ETF），否则现金；每个交易日开盘后最多一次 |
+| 美股 ETF 择时 | QQQ 150 日均线 ±2% 缓冲 → 持有 QLD（2 倍纳指 ETF），否则现金；每个交易日开盘后最多一次；参数版本化，可在策略实验室修改均线周期 / 缓冲带、预览回测、冻结版本并确认部署 |
 | 策略自动进化 | 参数变异两轮搜索 → 季度分段稳健分 → 留出检验 → 自动替换（空仓时切换） |
 | 冠军–挑战者 | 证据不足的候选作为挑战者：先做快速检验（更早历史 + ETH / 标普 500 交叉检验），再在实时新行情上与现役并行，达标自动上线 |
+| 进化记录 | 每次晋级 / 淘汰 / 拒绝：旧版本 → 新版本、规则差异、季度稳健分、留出 / 快速检验、前向测试对比、触发方式 |
+| 通知 | 邮件 + Telegram（密钥只放 `config/secrets.local`）：晋级、待确认、自动暂停、连亏刹车、守护进程重启、外网断开 > 60 秒、每日摘要；全部经唯一出口与主机白名单并写审计 |
 | 交易节奏 | 止损后冷却 72 小时、连亏 3 笔暂停 72 小时、波动率定仓；每天长周期体检（2021 年起 6 个年度），长期无优势的策略暂停并释放额度（见 `docs/trading_rhythm.md`） |
 | 风控与资金 | 长期亏损自动暂停 / 恢复；按长周期 收益/回撤 自动分配资金额度 |
 | 杠杆研究 | 2 倍杠杆影子账户（本地按逐仓规则记账，不下单）；`freqtrade_lab/` 用 Freqtrade 做合约杠杆离线回测 |
 | 账号与权限 | 登录页、多用户（管理员 / 交易员 / 观察员）、临时密码与首次改密、停用 / 强制退出 / 删除、登录记录与操作审计；观察员全站只读 |
-| 运维 | 一键启停、启动前自动备份数据库、守护进程（无响应/内存过高自动重启）、按天交易日志 |
+| 运维 | 一键启停、启动前自动备份数据库、守护进程（无响应/内存过高自动重启）、按天交易日志；记录运行中的代码提交，有新代码时提示「有更新待生效」，管理员一键安全重启（暂停入场 → 等挂单 → 备份 → 重启 → 恢复） |
 
 ## 快速开始（Windows）
 
@@ -118,6 +121,7 @@ Write a strategy in plain Chinese, backtest it with strict train / validation / 
 let DeepSeek suggest improvements, then run it on an **Alpaca Paper** account. Strategies evolve automatically
 (parameter search → robustness scoring → holdout check → champion–challenger with fast out-of-sample checks on
 older history and cross-asset data → automatic deployment). Includes a US-ETF trend-timing sleeve (QQQ 150-day SMA → QLD),
-loss-based auto-pause, strength-weighted budgets, a 2x leverage shadow ledger, and a Freqtrade futures research kit.
+loss-based auto-pause, strength-weighted budgets, a Strategy Console (per-strategy version deploy / take-offline, version lock,
+manual-approval queue, "why no action" explanations), an evolution log, email / Telegram alerts, safe restart on code updates, a 2x leverage shadow ledger, and a Freqtrade futures research kit.
 
 Order submission is **off by default** (double lock); live-money endpoints are hard-blocked. For research and education only — not investment advice.
