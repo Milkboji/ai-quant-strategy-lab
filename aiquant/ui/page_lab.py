@@ -269,6 +269,12 @@ def ensure_frozen(n: int) -> tuple[bool, str]:
         sch = slot["draft_fields"].get("schema")
     if info.get("status") != "ok":
         return False, "策略存在待补充/错误项，请修正后再冻结：" + "；".join(info.get("errors", []))
+    cur = registry.get_version(slot["current_version_id"]) if slot["current_version_id"] else None
+    h = registry.draft_hash(n)
+    if cur and h and cur["schema_hash"] == h:
+        return True, f"与已冻结的 {cur['name']} v{cur['version_no']} 相同，无需重新保存"
+    if not registry.draft_confirmed(n):
+        return False, "请先核对下方的大白话规则复述，点「确认无误」后才能保存"
     try:
         v = registry.freeze(n, sch, nl_text=text, source="manual" if "DeepSeek" not in info.get("method", "") else "deepseek_parse")
     except registry.FreezeError as e:
@@ -391,6 +397,8 @@ def slot_card(n: int, r: dict) -> None:
                     ok, msg = do_parse(n, use_llm=True)
                 flash(f"slot{n}", "ok" if ok else "err", msg)
                 st.rerun()
+            with st.expander("📖 支持的写法（速查表）"):
+                _cheatsheet()
         with t2:
             params_form(n, draft)
         with t3:
@@ -416,8 +424,10 @@ def slot_card(n: int, r: dict) -> None:
             for w in info.get("warnings", [])[:3]:
                 st.markdown(f'<div class="aq-warn">{C.esc(w)}</div>', unsafe_allow_html=True)
             if stat != "ok":
-                for e in (info.get("errors", []) + [f"未识别：{u}" for u in info.get("unresolved", [])])[:4]:
+                for e in info.get("errors", [])[:3]:
                     st.markdown(f'<div class="aq-err">{C.esc(e)}</div>', unsafe_allow_html=True)
+                for k, u in enumerate(info.get("unresolved", [])[:4]):
+                    _unresolved_fix(n, k, u)
         if obj:
             d = describe(obj)
             st.markdown(C.kv([("策略名称", d["策略名称"]), ("入场规则", d["入场规则"]), ("出场规则", d["退出规则"]),
@@ -425,6 +435,8 @@ def slot_card(n: int, r: dict) -> None:
             with st.expander("展开更多参数"):
                 st.markdown(C.kv([(k, d[k]) for k in ("止盈规则", "移动止损", "资金配置", "指标", "参数", "主周期",
                                                      "辅助周期", "最长持仓", "研究假设")]), unsafe_allow_html=True)
+            if stat == "ok":
+                _confirm_panel(n, draft, cur)
         # 操作按钮
         b = st.columns(2)
         running = st_["job"] and st_["job"]["status"] in ("queued", "running")
@@ -809,6 +821,8 @@ def render() -> None:
             with cols[i - 1]:
                 slot_card(i, r)
     st.write("")
+    etf_lab_panel()
+    st.write("")
     comparison(r)
     st.write("")
     ai_center()
@@ -828,3 +842,162 @@ def _paper_why(n: int) -> None:
         why_block(console.explain(dep, plans.get(dep["id"]), None, console.vol_sizing()), key=f"lab{n}")
     except Exception:  # noqa: BLE001
         pass
+
+
+# ---------------------------------------------------------------------------
+# 中文输入辅助：大白话复述 + 确认、未识别片段的改写建议、支持的写法速查表
+# ---------------------------------------------------------------------------
+
+def _confirm_panel(n: int, draft: dict, cur: dict | None) -> None:
+    from ..strategy.narrate import narrate
+    h = registry.draft_hash(n)
+    same = bool(cur and h and cur["schema_hash"] == h)
+    ok = registry.draft_confirmed(n)
+    with st.container(border=True):
+        st.markdown('<div class="aq-sub"><b>规则复述（请核对）</b>：系统是这样理解你的策略的</div>', unsafe_allow_html=True)
+        for t, x in narrate(draft):
+            st.markdown(f'<div class="aq-sub" style="margin:3px 0;overflow-wrap:anywhere"><b>{C.esc(t)}</b>：{C.esc(x)}</div>',
+                        unsafe_allow_html=True)
+        if same:
+            st.markdown(C.pill(f"与已冻结版本 v{cur['version_no']} 一致", "blue"), unsafe_allow_html=True)
+        elif ok:
+            st.markdown(C.pill("已确认无误，可以保存", "green"), unsafe_allow_html=True)
+        else:
+            st.caption("和你想的一样吗？确认后才能保存版本或运行回测；不一样就改写描述后重新解析。")
+            if st.button("确认无误", key=f"confirm_{n}", type="primary", use_container_width=True):
+                from .login import effective_user
+                try:
+                    registry.confirm_draft(n, effective_user())
+                    flash(f"slot{n}", "ok", "已确认规则复述，现在可以保存版本 / 运行回测")
+                except Exception as e:  # noqa: BLE001
+                    flash(f"slot{n}", "err", str(e))
+                st.rerun()
+
+
+def _apply_suggestion(n: int, fragment: str, replacement: str) -> None:
+    """一键替换：把识别不了的片段换成建议写法，然后重新解析。"""
+    text = cur_text(n)
+    if fragment and fragment in text:
+        new = text.replace(fragment, replacement, 1)
+    else:
+        nt = parser._norm(text)
+        new = nt.replace(fragment, replacement, 1) if fragment in nt else (text.rstrip("，,。; ") + "，" + replacement)
+    set_text(n, new)
+    ok, msg = do_parse(n)
+    flash(f"slot{n}", "ok" if ok else "warn", f"已替换为「{replacement}」并重新解析：{msg}")
+
+
+def _unresolved_fix(n: int, k: int, fragment: str) -> None:
+    st.markdown(f'<div class="aq-err">未识别：{C.esc(fragment)}</div>', unsafe_allow_html=True)
+    sug = parser.suggest(fragment)
+    if not sug:
+        st.caption("没有找到相近的写法，请参考「支持的写法」改写。")
+        return
+    st.markdown('<div class="aq-sub">最接近的可识别写法（点一下替换）：</div>', unsafe_allow_html=True)
+    for j, w in enumerate(sug):
+        st.button(f"改成：{w}", key=f"sug_{n}_{k}_{j}", on_click=_apply_suggestion, args=(n, fragment, w),
+                  use_container_width=True)
+
+
+@st.cache_data(show_spinner=False)
+def _cheat_rows() -> list[dict]:
+    return parser.cheatsheet()
+
+
+def _cheatsheet() -> None:
+    st.caption("由策略白名单自动生成；可以组合使用，例如「EMA20上穿EMA60且%B大于50时买入，跌破布林中轨时卖出，固定止损3%」。")
+    st.dataframe(pd.DataFrame(_cheat_rows())[["类别", "写法", "说明"]], hide_index=True, use_container_width=True,
+                 height=320)
+
+
+# ---------------------------------------------------------------------------
+# 美股 ETF 择时（QQQ 均线 → QLD）：查看规则、版本、参数；管理员修改 → 预览 → 确认 → 冻结 → 部署确认
+# ---------------------------------------------------------------------------
+
+def etf_lab_panel() -> None:
+    from ..paper import etf_trend, etf_versions
+    from .login import effective_user, role
+    cfg = etf_trend.get_config()
+    cur = etf_versions.running()
+    admin = role() == "admin"
+    lk = etf_versions.lock_state()
+    with st.container(border=True):
+        right = C.pill(f"运行中：v{cur['version_no']}", "green") + (" " + C.pill("已锁定", "blue") if lk else "")
+        C.section(f"美股 ETF 择时：{cfg['signal_symbol']} 均线 → {cfg['trade_symbol']}", right=right)
+        cols = st.columns([1.3, 1])
+        with cols[0]:
+            st.markdown(f'<div class="aq-sub"><b>当前规则（{C.esc(etf_versions.label(cur))}）</b></div>', unsafe_allow_html=True)
+            for t, x in etf_versions.narrate(int(cur["sma"]), float(cur["band"])):
+                st.markdown(f'<div class="aq-sub" style="margin:3px 0"><b>{C.esc(t)}</b>：{C.esc(x)}</div>', unsafe_allow_html=True)
+            if lk:
+                st.caption(f"手动部署后锁定至 {(datetime.fromisoformat(lk['until']) + timedelta(hours=8)):%m-%d %H:%M} 北京时间："
+                           "期间 ETF 挑战者胜出只进入策略总台的待确认队列")
+        with cols[1]:
+            vs = etf_versions.versions()
+            st.markdown('<div class="aq-sub"><b>版本历史</b></div>', unsafe_allow_html=True)
+            st.dataframe(pd.DataFrame([{"版本": f"v{v['version_no']}", "均线（日）": v["sma"], "缓冲带": f"±{float(v['band']):.0%}",
+                                        "来源": {"current": "登记时运行", "manual": "管理员修改", "challenger": "自动进化"}.get(v["source"], v["source"]),
+                                        "运行中": "✓" if v["id"] == cur["id"] else "",
+                                        "创建": str(v["created_at"])[:10]} for v in vs]),
+                         hide_index=True, use_container_width=True, height=min(38 * (len(vs) + 1) + 4, 220))
+        st.markdown('<div class="aq-sub"><b>修改参数</b>（只有管理员可以修改；修改后要预览、确认、冻结成新版本，再确认部署）</div>',
+                    unsafe_allow_html=True)
+        c = st.columns(3)
+        sma = c[0].number_input("均线周期（日）", min_value=etf_versions.SMA_RANGE[0], max_value=etf_versions.SMA_RANGE[1],
+                                value=int(cur["sma"]), step=5, key="etf_sma", disabled=not admin)
+        band_pct = c[1].number_input("缓冲带（%）", min_value=0.0, max_value=10.0, value=float(cur["band"]) * 100, step=0.5,
+                                     key="etf_band", disabled=not admin)
+        band = round(band_pct / 100, 4)
+        changed = int(sma) != int(cur["sma"]) or abs(band - float(cur["band"])) > 1e-9
+        if changed:
+            st.markdown('<div class="aq-sub" style="margin-top:6px"><b>新规则复述（请核对）</b></div>', unsafe_allow_html=True)
+            for t, x in etf_versions.narrate(int(sma), band):
+                st.markdown(f'<div class="aq-sub" style="margin:3px 0"><b>{C.esc(t)}</b>：{C.esc(x)}</div>', unsafe_allow_html=True)
+            pv = _etf_preview(int(sma), band)
+            if pv.get("error"):
+                st.caption(pv["error"])
+            else:
+                st.dataframe(pd.DataFrame([{"区间": p["name"],
+                                            f"新参数 年化 / 回撤": f"{p['new']['cagr']:+.1f}% / {p['new']['dd']:.1f}%",
+                                            f"当前 年化 / 回撤": f"{p['cur']['cagr']:+.1f}% / {p['cur']['dd']:.1f}%",
+                                            "新 / 当前 交易次数": f"{p['new']['switches']} / {p['cur']['switches']}"}
+                                           for p in pv["periods"]]), hide_index=True, use_container_width=True)
+                st.caption("回测：收盘出信号、次日开盘调仓、单边 0.05% 成本；历史表现不代表未来。")
+            ok = st.checkbox("确认无误：规则复述和我想的一样", key="etf_ok", disabled=not admin)
+            if st.button("冻结为新版本", key="etf_freeze", type="primary", disabled=not admin):
+                try:
+                    v = etf_versions.freeze(int(sma), band, confirmed=ok, actor=effective_user(), role=role())
+                    st.session_state["etf_pick"] = v["id"]
+                    flash("etf", "ok", f"已冻结 {etf_versions.label(v)}，下一步请确认部署")
+                except Exception as e:  # noqa: BLE001
+                    flash("etf", "err", str(e))
+                st.rerun()
+        others = [v for v in vs if v["id"] != cur["id"]]
+        if others:
+            ids = [v["id"] for v in others]
+            pick = st.session_state.get("etf_pick")
+            d = st.columns([2, 1.2, 1])
+            vid = d[0].selectbox("部署版本", ids, index=ids.index(pick) if pick in ids else 0, key="etf_dep_v",
+                                 format_func=lambda i: etf_versions.label(next(v for v in others if v["id"] == i)),
+                                 disabled=not admin)
+            conf = d[1].checkbox("确认部署（下一次每日检查起生效）", key="etf_dep_ok", disabled=not admin)
+            if d[2].button("部署此版本", key="etf_deploy", disabled=not admin, use_container_width=True):
+                try:
+                    res = etf_versions.deploy(int(vid), confirmed=conf, actor=effective_user(), role=role())
+                    flash("etf", "ok", res["message"])
+                    st.session_state.pop("etf_pick", None)
+                except Exception as e:  # noqa: BLE001
+                    flash("etf", "err", str(e))
+                st.rerun()
+        if not admin:
+            st.caption("你可以查看规则、版本和参数；修改和部署需要管理员账号。")
+        show_flash("etf")
+
+
+@st.cache_data(ttl=600, show_spinner=False, max_entries=16)
+def _etf_preview(sma: int, band: float) -> dict:
+    from ..paper import etf_versions
+    try:
+        return etf_versions.preview(sma, band)
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"预览失败：{e}"}

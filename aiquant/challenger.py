@@ -461,7 +461,14 @@ def etf_round(run_id: int | None = None) -> dict:
 def _etf_block() -> str | None:
     """美股 ETF 没有单独的部署，只受全局「晋级需人工确认」约束。"""
     from . import console
-    return "已开启「晋级需人工确认」" if console.promotion_config().get("require_confirm") else None
+    if console.promotion_config().get("require_confirm"):
+        return "已开启「晋级需人工确认」"
+    from .paper import etf_versions
+    lk = etf_versions.lock_state()
+    if lk:
+        bj = (datetime.fromisoformat(lk["until"]) + timedelta(hours=8)).strftime("%m-%d %H:%M")
+        return f"美股 ETF 版本已锁定至 {bj}（北京时间）"
+    return None
 
 
 def evaluate_etf(now: datetime | None = None) -> list[str]:
@@ -492,6 +499,7 @@ def evaluate_etf(now: datetime | None = None) -> list[str]:
                 continue
             if fc["verdict"] == "pass":
                 db.set_setting("etf_trend_config", dict(db.get_setting("etf_trend_config") or {}, sma=cand["sma"], band=cand["band"]))
+                _etf_version(cand, f"挑战者 #{ch['id']} 晋级")
                 _close(ch, "promoted", "快速检验通过，晋级上线：" + fc["reason"])
                 _event(None, "INFO", f"[ETF趋势] 自动进化：挑战者 #{ch['id']} 快速晋级，参数改为 {cand['sma']} 日均线 ±{cand['band']:.0%} — {fc['reason']}")
                 out.append(f"ETF #{ch['id']} 快速晋级")
@@ -518,6 +526,7 @@ def evaluate_etf(now: datetime | None = None) -> list[str]:
             out.append(f"ETF #{ch['id']} 等待确认")
         elif k["ret"] >= c["ret"] - TOL_RET and k["dd"] >= c["dd"] - TOL_DD:
             db.set_setting("etf_trend_config", dict(db.get_setting("etf_trend_config") or {}, sma=cand["sma"], band=cand["band"]))
+            _etf_version(cand, f"挑战者 #{ch['id']} 晋级")
             _close(ch, "promoted", "晋级上线：" + why)
             _event(None, "INFO", f"[ETF趋势] 自动进化：挑战者 #{ch['id']} 晋级，参数改为 {cand['sma']} 日均线 ±{cand['band']:.0%} — {why}")
             out.append(f"ETF #{ch['id']} 晋级")
@@ -563,3 +572,13 @@ def evaluate_all(now: datetime | None = None) -> list[str]:
         log.exception("evaluate_etf failed")
     db.set_setting("challenger_last_eval", {"at": db.now_iso(), "actions": out})
     return out
+
+
+def _etf_version(cand: dict, note: str) -> None:
+    """ETF 参数变了：登记为一个 ETF 版本（策略实验室里能看到版本历史）。"""
+    try:
+        from .paper import etf_versions
+        v = etf_versions.ensure_version(int(cand["sma"]), float(cand["band"]), "challenger", note)
+        db.ex("UPDATE etf_versions SET deployed_at=? WHERE id=?", (db.now_iso(), v["id"]))
+    except Exception:  # noqa: BLE001
+        log.exception("etf version record failed")

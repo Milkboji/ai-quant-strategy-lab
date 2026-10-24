@@ -69,8 +69,52 @@ def _cond(l, op, r, mult=1.0):
 MA_TOKEN = re.compile(r"(EMA|SMA)\s*\(?\s*(\d+)\s*\)?")
 
 
+CMP = r"(大于|高于|>|超过|小于|低于|<|跌破|上穿|下穿)"
+
+
+def _cmp_op(w: str) -> str:
+    return {"上穿": "cross_above", "下穿": "cross_below"}.get(w) or ("<" if w in ("小于", "低于", "<", "跌破") else ">")
+
+
+def _bb_params(s: str) -> tuple[int, float]:
+    m = re.search(r"\(\s*(\d+)\s*,\s*" + NUM + r"\s*\)", s)
+    return (int(m.group(1)), float(m.group(2))) if m else (20, 2.0)
+
+
+def _match_bb_extra(s: str, b: _Builder, aux: bool) -> list[dict] | None:
+    """布林 %B / 带宽 / 带宽分位 / 收口，以及 N 周期涨幅（ROC）。"""
+    per, sd = _bb_params(s)
+    m = re.search(r"(?:%B|百分比B|布林位置)\s*(?:\(\s*\d+\s*,\s*" + NUM + r"\s*\))?\s*" + CMP + r"\s*" + NUM, s)
+    if m:
+        iid = b.ind("BB_PCTB", {"period": per, "std": sd}, aux)
+        return [_cond(iid, _cmp_op(m.group(2)), float(m.group(3)))]
+    m = re.search(r"带宽分位\s*(?:\(\s*(\d+)\s*\))?\s*" + CMP + r"\s*" + NUM, s)
+    if m:
+        lb = int(m.group(1)) if m.group(1) else 120
+        iid = b.ind("BB_WIDTH_RANK", {"period": per, "std": sd, "lookback": lb}, aux)
+        return [_cond(iid, _cmp_op(m.group(2)), float(m.group(3)))]
+    m = re.search(r"带宽\s*(?:\(\s*\d+\s*,\s*" + NUM + r"\s*\))?\s*" + CMP + r"\s*" + NUM + r"\s*%?", s)
+    if m and "布林" in s:
+        iid = b.ind("BB_WIDTH", {"period": per, "std": sd}, aux)
+        return [_cond(iid, _cmp_op(m.group(2)), float(m.group(3)))]
+    if "布林" in s and "收口" in s:
+        m = re.search(r"收口\s*\(\s*(\d+)\s*\)", s)
+        recent = int(m.group(1)) if m else 5
+        iid = b.ind("BB_SQUEEZE", {"period": per, "std": sd, "lookback": 120, "recent": recent}, aux)
+        return [_cond(iid, "<=", 15.0)]
+    m = re.search(r"(\d+)\s*(?:根|个|周期|日)?\s*(?:涨幅|涨跌幅|变化率|ROC)\s*" + CMP + r"\s*(-?\d+(?:\.\d+)?)\s*%?", s) or \
+        re.search(r"ROC\s*\(\s*(\d+)\s*\)\s*" + CMP + r"\s*(-?\d+(?:\.\d+)?)\s*%?", s)
+    if m:
+        iid = b.ind("ROC", {"period": int(m.group(1))}, aux)
+        return [_cond(iid, _cmp_op(m.group(2)), float(m.group(3)))]
+    return None
+
+
 def _match_sub(s: str, b: _Builder, aux: bool, warnings: list[str]) -> list[dict] | None:
     price = "aux.close" if aux else "close"
+    extra = _match_bb_extra(s, b, aux)
+    if extra:
+        return extra
     # MACD 金叉/死叉
     if "MACD" in s:
         m = re.search(r"MACD\s*\(?\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)?", s)
@@ -302,3 +346,126 @@ def parse(text: str, default_name: str = "自定义策略") -> ParseResult:
     if unresolved:
         errors.append("存在无法识别的规则片段，请改写或在参数设置中补充后再冻结。")
     return ParseResult(obj.model_dump(), status, warnings, unresolved, errors)
+
+
+# ---------------------------------------------------------------------------
+# 「支持的写法」速查表（从指标白名单生成）与“最接近的可识别写法”建议
+# ---------------------------------------------------------------------------
+
+# 每种白名单指标的中文写法示例：(示例, 说明)。速查表按 INDICATOR_TYPES 逐个生成；没有写法的指标会标注“仅参数设置”。
+SYNTAX: dict[str, list[tuple[str, str]]] = {
+    "EMA": [("EMA20上穿EMA60时买入", "两条指数均线金叉 / 死叉（下穿）"), ("收盘价站上EMA50", "价格在均线之上")],
+    "SMA": [("SMA10上穿SMA30时买入", "两条简单均线交叉；也可写“20日均线”"), ("收盘价跌破20日均线时卖出", "价格跌破均线")],
+    "RSI": [("RSI(14)小于30时买入", "超卖；也可写“大于70”“上穿50”")],
+    "BB_UPPER": [("收盘价突破布林上轨(20,2)时买入", "括号里是周期和标准差倍数，可省略（默认 20,2）")],
+    "BB_MID": [("收盘价跌破布林中轨时卖出", "常用作趋势策略的离场条件")],
+    "BB_LOWER": [("最低价触及布林下轨时买入", "“触及”= 当根最低价碰到下轨")],
+    "BB_PCTB": [("%B大于50", "价格在布林带里的位置：0 = 下轨，100 = 上轨")],
+    "BB_WIDTH": [("布林带宽小于5", "带宽 = (上轨 − 下轨) ÷ 中轨 × 100")],
+    "BB_WIDTH_RANK": [("带宽分位小于15", "带宽在最近 120 根里的百分位；“带宽分位(200)小于10”可改回看根数")],
+    "BB_SQUEEZE": [("布林带收口时买入", "最近 5 根里带宽分位最低值 ≤ 15（刚收口）；“收口(10)”可改最近根数")],
+    "DONCHIAN_HIGH": [("突破前20根K线最高价时买入", "唐奇安通道突破；也可写“20日新高”")],
+    "DONCHIAN_LOW": [("跌破前10根K线最低价时卖出", "跌破前 N 根最低价")],
+    "ROC": [("10周期涨幅大于2%", "N 根 K 线的涨跌幅；也可写“ROC(10)大于2”")],
+    "VOL_SMA": [("成交量大于1.5倍20周期平均成交量", "放量确认")],
+    "MACD": [("MACD金叉时买入", "MACD 上穿信号线；“MACD(12,26,9)死叉时卖出”")],
+    "MACD_SIGNAL": [("MACD死叉时卖出", "与 MACD 一起使用（金叉 / 死叉）")],
+}
+GENERAL_SYNTAX = [
+    ("周期", "用4小时K线", "信号周期：5分钟 / 15分钟 / 30分钟 / 1小时 / 4小时 / 日线"),
+    ("周期", "日线收盘价站上SMA50", "写两个周期时，较大的那个作为辅助周期，用来看大方向"),
+    ("止损", "固定止损2%", "买入后亏损达到 2% 卖出"),
+    ("止盈", "止盈8%", "盈利达到 8% 卖出"),
+    ("移动止损", "盈利3%后启动移动止损，回撤1.5%离场", "先保护利润，再让利润奔跑"),
+    ("仓位", "仓位50%", "每次使用可用资金的比例（只做多，不加杠杆）"),
+    ("最长持仓", "持仓超过48根K线平仓", "到时间就卖出"),
+    ("组合条件", "EMA20上穿EMA60且RSI(14)大于50时买入", "“且”= 同时满足；“或”= 任一满足"),
+    ("离场", "反向交叉时平仓", "沿用上面的交叉条件，反方向时卖出"),
+]
+
+
+def cheatsheet() -> list[dict]:
+    """速查表：先列通用写法，再按白名单逐个指标列出写法示例。"""
+    from .schema import INDICATOR_CN, INDICATOR_TYPES
+    rows = [{"类别": c, "写法": w, "说明": d, "指标": ""} for c, w, d in GENERAL_SYNTAX]
+    for t in INDICATOR_TYPES:
+        ex = SYNTAX.get(t)
+        if not ex:
+            rows.append({"类别": INDICATOR_CN.get(t, t), "写法": "（暂无中文写法）",
+                         "说明": "可在「参数设置」或 DeepSeek 解析中使用", "指标": t})
+            continue
+        for w, d in ex:
+            rows.append({"类别": INDICATOR_CN.get(t, t), "写法": w, "说明": d, "指标": t})
+    return rows
+
+
+def _recognized(fragment: str) -> bool:
+    try:
+        return _match_sub(_norm(fragment), _Builder(), False, []) is not None
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def suggest(fragment: str, k: int = 3) -> list[str]:
+    """给一段识别不了的文字，返回最多 k 条“最接近的可识别写法”（每条都保证解析器能识别）。"""
+    import difflib
+    f = _norm(fragment or "")
+    nums = [x for x in re.findall(NUM, f)]
+    n1 = nums[0] if nums else None
+    n2 = nums[1] if len(nums) > 1 else None
+    role = ""
+    if re.search(EXIT_WORDS, f):
+        role = "卖出"
+    elif re.search(ENTRY_WORDS, f):
+        role = "买入"
+    cands: list[str] = []
+    up = bool(re.search(UP_WORDS + "|突破|站上|上方|之上|大于|高于", f))
+    down = bool(re.search(DOWN_WORDS + "|跌破|下方|之下|小于|低于", f))
+    if "MACD" in f:
+        cands.append("MACD死叉" if ("死叉" in f or "绿柱" in f or down) else "MACD金叉")
+    if re.search(r"均线|EMA|SMA|(?<![A-Z])MA(?!CD)|均价", f):
+        a, c = (n1 or "20"), (n2 or "60")
+        if n2 or re.search(UP_WORDS + "|" + DOWN_WORDS, f):
+            cands += [f"EMA{a}{'下穿' if down and not up else '上穿'}EMA{c}"]
+        cands += [f"收盘价{'跌破' if down and not up else '站上'}SMA{a}", f"EMA{a}上穿EMA{c}"]
+    if "RSI" in f or "超买" in f or "超卖" in f or "强弱" in f:
+        v = n2 or (n1 if n1 and float(n1) > 5 else None)
+        if "超买" in f:
+            cands.append("RSI(14)大于70")
+        cands += [f"RSI(14){'大于' if up and not down else '小于'}{v or 30}", "RSI(14)上穿50"]
+    if re.search(r"布林|BOLL|上轨|下轨|中轨|中线|%B|带宽|收口", f, re.I):
+        if "%B" in f or "位置" in f:
+            cands.append(f"%B{'小于' if down and not up else '大于'}{n1 or 50}")
+        if "分位" in f:
+            cands.append(f"带宽分位小于{n1 or 15}")
+        elif "带宽" in f:
+            cands.append(f"布林带宽{'大于' if up and not down else '小于'}{n1 or 5}")
+        if "收口" in f or "收窄" in f:
+            cands.append("布林带收口")
+        band = "下轨" if "下轨" in f else "上轨" if "上轨" in f else "中轨"
+        cands.append(f"收盘价{'跌破' if (down and not up) or band == '下轨' else '突破'}布林{band}")
+    if "MACD" in f or "金叉" in f or "死叉" in f:
+        cands.append("MACD死叉" if ("死叉" in f or down) else "MACD金叉")
+    if re.search(r"新高|高点|最高|新低|低点|最低|通道", f):
+        low = re.search(r"新低|低点|最低", f)
+        cands.append(f"{'跌破' if low else '突破'}前{n1 or 20}根K线{'最低价' if low else '最高价'}")
+    if re.search(r"成交量|放量|量能|volume", f, re.I):
+        cands.append(f"成交量大于{n1 if n1 and float(n1) < 10 else 1.5}倍20周期平均成交量")
+    if re.search(r"涨幅|涨跌幅|动量|变化率|ROC|涨了|上涨", f, re.I):
+        cands.append(f"{n2 or 10}周期涨幅大于{n1 or 2}%")
+    examples = [w for ex in SYNTAX.values() for w, _ in ex]
+    cores = [re.sub(r"时(买入|卖出|平仓)$", "", w) for w in examples]
+    cands += difflib.get_close_matches(f, cores, n=6, cutoff=0.0)
+    out: list[str] = []
+    for c in cands:
+        c = re.sub(r"时(买入|卖出|平仓)$", "", c)
+        if role == "买入" and not down and re.search(r"跌破|下穿|死叉|小于", c) and not re.search(r"RSI|%B|带宽", c):
+            continue          # 方向和原文相反的写法不推荐
+        if role == "卖出" and not up and re.search(r"突破|站上|上穿|金叉", c):
+            continue
+        full = f"{c}时{role}" if role else c
+        if full not in out and _recognized(c):
+            out.append(full)
+        if len(out) >= k:
+            break
+    return out

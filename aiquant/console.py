@@ -607,6 +607,7 @@ def approve(ch_id: int, *, actor: str | None, role: str | None) -> dict:
             audit(actor, role, "批准晋级", "etf", "美股 ETF 择时", None, None, None, "已作废", "现役参数已变化")
             raise ValueError("现役参数已变化，这个挑战者已作废")
         db.set_setting("etf_trend_config", dict(db.get_setting("etf_trend_config") or {}, sma=cand["sma"], band=cand["band"]))
+        _etf_version(cand, f"挑战者 #{ch['id']} 经批准晋级")
         challenger._close(ch, "promoted", f"{actor or '用户'} 批准晋级：{ch['reason'] or ''}", trigger="人工批准", actor=actor)
         pr.event(None, "INFO", f"[ETF趋势] {actor or '用户'} 批准挑战者 #{ch['id']}，参数改为 {cand['sma']} 日均线 ±{cand['band']:.0%}")
         audit(actor, role, "批准晋级", "etf", "美股 ETF 择时", None, None, None, "已晋级",
@@ -849,3 +850,13 @@ def plans_for(broker: str = "alpaca_paper") -> dict[int, dict]:
     except Exception:  # noqa: BLE001
         log.exception("plan budgets failed")
         return {}
+
+
+def _etf_version(cand: dict, note: str) -> None:
+    """ETF 参数变了：登记为一个 ETF 版本（策略实验室里能看到版本历史）。"""
+    try:
+        from .paper import etf_versions
+        v = etf_versions.ensure_version(int(cand["sma"]), float(cand["band"]), "challenger", note)
+        db.ex("UPDATE etf_versions SET deployed_at=? WHERE id=?", (db.now_iso(), v["id"]))
+    except Exception:  # noqa: BLE001
+        log.exception("etf version record failed")

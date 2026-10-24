@@ -48,6 +48,32 @@ def save_draft(slot_no: int, *, text: str | None = None, draft_schema: dict | No
     db.ex(f"UPDATE slots SET {', '.join(sets)} WHERE slot_no=?", vals)
 
 
+def draft_hash(slot_no: int) -> str | None:
+    """草稿规则的哈希（与冻结时一致）；草稿不合法时为 None。"""
+    sch = get_slot(slot_no)["draft_fields"].get("schema")
+    obj, errs = validate(sch or {})
+    return schema_hash(obj) if obj else None
+
+
+def confirm_draft(slot_no: int, actor: str | None = None) -> str:
+    """用户核对过大白话复述、点了「确认无误」：记下当时草稿的哈希。草稿一改，确认自动失效。"""
+    h = draft_hash(slot_no)
+    if h is None:
+        raise FreezeError("草稿规则不完整，不能确认")
+    s = get_slot(slot_no)
+    fields = s["draft_fields"]
+    fields["confirm"] = {"hash": h, "by": actor or "用户", "at": db.now_iso()}
+    db.ex("UPDATE slots SET draft_fields_json=?, updated_at=? WHERE slot_no=?",
+          (json.dumps(fields, ensure_ascii=False), db.now_iso(), slot_no))
+    return h
+
+
+def draft_confirmed(slot_no: int) -> bool:
+    h = draft_hash(slot_no)
+    c = get_slot(slot_no)["draft_fields"].get("confirm") or {}
+    return bool(h and c.get("hash") == h)
+
+
 def get_version(vid: int | None) -> dict | None:
     if vid is None:
         return None
