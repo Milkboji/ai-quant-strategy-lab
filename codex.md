@@ -142,3 +142,10 @@ tests/                     pytest 单元/集成测试 + e2e_browser.py（Playwri
 - 2026-10-21 快速进化：data/history/{BTCUSD,ETHUSD}_5m.csv.gz（scripts/fetch_crypto_history.py，2021 起，独立于主缓存）。
   挑战者登记后先做快速检验（challenger.fast_check_btc：训练窗口之前的 BTC 年度分段 + ETH 全部年度分段；ETF 用 SPY→SSO 三段 Calmar），
   通过 → 立即晋级部署；明显更差 → 立即淘汰；证据不足 → 前向模拟。前向满 1/3 时间且成交≥3：领先≥2pt 提前晋级，落后≥3pt 提前淘汰。
+## 发布流程（2026-10-24 起的固定要求）
+
+每轮优化完成、全部测试通过后：
+1. 私有仓库 `Milkboji/ai-quant-lab`：提交并推送到 `main`（含 docs 文档）。
+2. 公开仓库 `Milkboji/ai-quant-strategy-lab`：同步代码改动并推送；保持 `PAPER_ORDER_SUBMISSION_UNLOCKED = False`，
+   不放入含本机路径 / 私有域名的文档（docs 下的报告、进度、使用说明）、`.env`、`config/secrets.local`、数据和备份。
+3. 把改动文件同步到运行电脑的项目文件夹并更新 `BUILD_INFO.json`，由管理员在页面上「安全重启」生效。
