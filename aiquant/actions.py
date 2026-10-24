@@ -233,3 +233,15 @@ def export_zip() -> bytes:
                                                                     "schema_hash", "created_at", "schema")}
                                                  for v in vers], ensure_ascii=False, indent=2))
     return buf.getvalue()
+
+
+def validation_quota(lineage_id: str) -> dict:
+    """本谱系验证集检验剩余次数（已用 + 进行中 都占名额）。"""
+    sp = research.get_split()
+    start = md.to_utc(sp["val_start"])
+    used = research.validation_runs_used(lineage_id)
+    pending = db.q1("SELECT COUNT(*) AS n FROM jobs j JOIN strategy_versions v ON v.id=j.version_id "
+                    "WHERE j.status IN ('queued','running') AND v.lineage_id=? AND j.params_json LIKE ?",
+                    (lineage_id, f'%"start": "{start.isoformat()}"%'))["n"]
+    limit = research.VALIDATION_RUN_LIMIT
+    return {"used": used, "pending": pending, "limit": limit, "remaining": max(0, limit - used - pending)}

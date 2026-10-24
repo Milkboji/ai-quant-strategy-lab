@@ -419,6 +419,10 @@ class PaperRunner:
                 if self._last_stale != sig_ts:
                     self._note("WARN", out["reason"])
                     self._last_stale = sig_ts
+                    # 记下最近一次“信号过期未追单”，策略总台 / 模拟盘页面展示
+                    db.set_setting(f"stale_signal::{self.did}", {"signal_bar": sig_ts, "age_min": int(age.total_seconds() // 60),
+                                                                 "limit_min": int(ENTRY_MAX_DELAY.total_seconds() // 60),
+                                                                 "at": pd.Timestamp(now).isoformat(), "reason": out["reason"]})
                 return out
             # 交易节奏：冷却 / 连亏刹车 / 每日上限 → 跳过本次入场；波动率定仓 → 缩小仓位
             try:

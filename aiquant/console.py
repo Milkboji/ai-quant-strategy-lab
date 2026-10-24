@@ -224,6 +224,8 @@ def rows(broker: str = "alpaca_paper", price: float | None = None) -> list[dict]
         had.add(k)
         if d["status"] in ACTIVE:
             active[k] = d          # 同一策略取最新
+    plans = plans_for(broker)
+    vol = vol_sizing()
     budgets = {k: float(d["config"].get("budget_usd") or 0) for k, d in active.items()
                if d["status"] in ("running", "paused_entries")}
     total_budget = sum(budgets.values())
@@ -261,6 +263,7 @@ def rows(broker: str = "alpaca_paper", price: float | None = None) -> list[dict]
             "budget": b if dep else 0.0, "weight_pct": (b / total_budget * 100) if dep and total_budget else None,
             "budget_reason": (dep or {}).get("config", {}).get("budget_reason") if dep else None,
             "signal_tf": (dep or {}).get("config", {}).get("signal_tf") if dep else None,
+            "why": explain(dep, plans.get(dep["id"]) if dep else None, price, vol) if dep else None,
         })
     return out
 
@@ -650,3 +653,199 @@ def reject(ch_id: int, reason: str, *, actor: str | None, role: str | None) -> d
     audit(actor, role, "拒绝晋级", _dep_key(dep) if dep else ("etf" if ch["kind"] == "etf" else None), ch["label"],
           ch["deployment_id"], ch["champion_version_id"], None, "已淘汰", f"挑战者 #{ch['id']}：{reason}")
     return {"result": "已淘汰", "message": f"挑战者 #{ch['id']} 已淘汰"}
+
+
+# ---------------------------------------------------------------------------
+# “策略为什么没有动作”：冷却 / 长期体检暂停 / 信号过期 / 资金权重公式 / 波动率定仓
+# ---------------------------------------------------------------------------
+
+_vol_cache: dict = {}
+
+
+def _bj(iso) -> str:
+    import pandas as pd
+    return (pd.Timestamp(iso).tz_convert("UTC") + pd.Timedelta(hours=8)).strftime("%m-%d %H:%M")
+
+
+def _dur(td) -> str:
+    mins = int(td.total_seconds() // 60)
+    d, h, m = mins // 1440, (mins % 1440) // 60, mins % 60
+    return (f"{d} 天 " if d else "") + (f"{h} 小时 " if h or d else "") + f"{m} 分"
+
+
+def vol_sizing(df5=None) -> dict | None:
+    """波动率定仓：仓位系数 = 目标年化波动率 ÷ 近 N 日年化波动率，限制在 [最低系数, 100%]。与回测 / 模拟盘同一套规则。"""
+    import math
+    import time
+    import numpy as np
+    import pandas as pd
+    from . import rhythm
+    rh = rhythm.current()
+    if rh is None or not rh.vol_target_pct:
+        return None
+    if df5 is None:
+        hit = _vol_cache.get("v")
+        if hit and time.time() - hit[0] < 600:
+            return hit[1]
+        try:
+            from .data import market_data as md
+            m = md.load_master()
+            df5 = m[m["ts"] >= m["ts"].max() - pd.Timedelta(days=rh.vol_lookback_days * 3 + 5)]
+        except Exception:  # noqa: BLE001
+            return None
+    if df5 is None or df5.empty:
+        return None
+    day = df5.assign(ts=pd.to_datetime(df5["ts"], utc=True)).set_index("ts")["close"].resample("1D").last().dropna()
+    now = pd.Timestamp.now(tz="UTC").floor("D")
+    day = day[day.index < now]                       # 只用已收盘日线（与 daily_context 一致）
+    r = np.log(day).diff().dropna().tail(rh.vol_lookback_days)
+    if len(r) < max(5, rh.vol_lookback_days // 2):
+        return None
+    vol = float(r.std() * math.sqrt(365) * 100)
+    raw = rh.vol_target_pct / vol if vol > 0 else 1.0
+    mult = min(max(raw, rh.vol_min_mult), 1.0)
+    out = {"vol": round(vol, 2), "target": rh.vol_target_pct, "lookback": rh.vol_lookback_days, "raw": round(raw, 4),
+           "mult": round(mult, 4), "min": rh.vol_min_mult, "days": len(r),
+           "clipped": "min" if raw < rh.vol_min_mult else ("max" if raw > 1.0 else None)}
+    _vol_cache["v"] = (time.time(), out)
+    return out
+
+
+def weight_text(p: dict | None) -> str | None:
+    if not p or not p.get("detail"):
+        return None
+    d = p["detail"]
+    m = d.get("method")
+    if m == "long_pause":
+        return "长期体检暂停：额度 0（释放给长期有优势的策略）"
+    if m == "paused_floor":
+        return f"暂停新开仓：只保留最低额度（账户权益的 {d['floor_pct']:g}%）"
+    share = f"；占全部运行策略权重的 {p['share_pct']:.1f}%" if p.get("share_pct") is not None else ""
+    if m == "long":
+        head = (f"权重 = 2 × 长期年均收益 ÷ max(年均回撤, 1) = 2 × {d['mean_ret']:+.1f}% ÷ {max(d['mean_dd'], 1.0):.1f}% "
+                f"= {d['raw']:.2f}")
+        basis = f"（近 {d['n_years']} 年，盈利 {d['pos_years']} 年）"
+    else:
+        if d.get("raw") is None:
+            return f"训练集收益 {d.get('ret') if d.get('ret') is not None else '--'}%，不为正 → 取最低权重 {d['wmin']:g}" + share
+        head = f"权重 = 训练集收益 ÷ max(|回撤|, 1) = {d['ret']:+.1f}% ÷ {max(abs(d['dd'] or 0), 1.0):.1f}% = {d['raw']:.2f}"
+        basis = "（还没有长周期结果，暂用一年训练集）"
+    c = d.get("clipped")
+    if c == "negative":
+        tail = f" → 长期年均收益为负，取最低权重 {d['wmin']:g}"
+    elif c == "max":
+        tail = f" → 超过上限，截断为 {d['wmax']:g}"
+    elif c == "min":
+        tail = f" → 低于下限，抬到 {d['wmin']:g}"
+    else:
+        tail = f"（在 {d['wmin']:g}~{d['wmax']:g} 之间，未截断）"
+    return head + tail + basis + share
+
+
+def explain(dep: dict | None, plan: dict | None = None, price: float | None = None, vol: dict | None = None) -> dict:
+    """解释这个部署当前为什么没有动作。返回 {"headline": 一句话, "items": [(标题, 说明)], "calc": [(标题, 公式)]}。"""
+    import pandas as pd
+    from . import rhythm
+    if not dep:
+        return {"headline": "", "items": [], "calc": []}
+    now = pd.Timestamp.now(tz="UTC")
+    cfg = dep["config"]
+    items, calc, heads = [], [], []
+    if cfg.get("pending_offline"):
+        heads.append("等待空仓后下线：不再开新仓")
+    # 长期体检 / 自动暂停
+    ap = cfg.get("auto_pause")
+    lm = None
+    try:
+        lm = rhythm.long_metrics(dep)
+    except Exception:  # noqa: BLE001
+        lm = None
+    rc = rhythm.get_config()
+    if dep["status"] == "paused_entries":
+        if ap and ap.get("kind") == "long" and lm:
+            bad = []
+            if lm["mean_ret"] < 0:
+                bad.append(f"近 {lm['n_years']} 年年均收益 {lm['mean_ret']:+.1f}%（为负）")
+            if lm["pos_years"] < int(rc["long_min_pos_years"]):
+                bad.append(f"盈利年份 {lm['pos_years']}/{lm['n_years']}（少于 {rc['long_min_pos_years']} 年）")
+            txt = "，".join(bad) or f"近 {lm['n_years']} 年年均收益 {lm['mean_ret']:+.1f}%，盈利 {lm['pos_years']}/{lm['n_years']} 年"
+            items.append(("长期体检暂停", f"{txt}；年均回撤 {lm['mean_dd']:.1f}%。规则：年均收益为负且盈利年份少于 "
+                                       f"{rc['long_min_pos_years']} 年 → 暂停新开仓，额度释放；达标后自动恢复"))
+            heads.append("长期体检暂停新开仓")
+        elif ap:
+            items.append(("自动暂停", ap.get("reason") or "长期亏损"))
+            heads.append("自动暂停新开仓")
+        elif not cfg.get("pending_offline"):
+            items.append(("暂停新开仓", "手动暂停或持仓对账保护；已有持仓仍按规则卖出"))
+            heads.append("暂停新开仓")
+    elif lm:
+        items.append(("长期体检", f"{'达标' if lm.get('ok') else '不达标'}：近 {lm['n_years']} 年年均收益 {lm['mean_ret']:+.1f}%，"
+                                f"盈利 {lm['pos_years']}/{lm['n_years']} 年，年均回撤 {lm['mean_dd']:.1f}%"))
+    # 冷却 / 连亏
+    st_ = db.get_setting(f"rhythm_state::{dep['id']}") or {}
+    bu = pd.Timestamp(st_["block_until"]) if st_.get("block_until") else None
+    streak = int(st_.get("streak") or 0)
+    rh = rhythm.current()
+    if bu is not None and bu > now:
+        why = st_.get("block_why") or "冷却"
+        cause = "止损" if "止损" in why else ("连亏 " + why.split("连亏")[1].split("刹车")[0].strip() if "连亏" in why else why)
+        items.append(("冷却中", f"原因：{cause}（{why}）；剩余 {_dur(bu - now)}，到 {_bj(bu)} 北京时间为止不开新仓"))
+        heads.append(f"冷却中（{cause}），还剩 {_dur(bu - now)}")
+    elif rh is not None and rh.loss_streak_n:
+        items.append(("连亏计数", f"当前连亏 {streak} 笔（满 {rh.loss_streak_n} 笔暂停 {rh.loss_streak_pause_hours:g} 小时）"))
+    # 信号过期
+    stale = db.get_setting(f"stale_signal::{dep['id']}")
+    if stale and stale.get("at") and now - pd.Timestamp(stale["at"]) < pd.Timedelta(days=7):
+        items.append(("入场信号过期未追单", f"信号K线收盘 {_bj(stale['signal_bar'])} 北京时间，{_bj(stale['at'])} 才检查到，"
+                                        f"已过 {stale['age_min']} 分钟（超过 {stale['limit_min']} 分钟上限），放弃这次入场，"
+                                        "不在远离信号的价格追单"))
+        if now - pd.Timestamp(stale["at"]) < pd.Timedelta(hours=24):
+            heads.append(f"最近一次入场信号过期未追单（{_bj(stale['signal_bar'])}）")
+    # 最近一次判断
+    last = db.get_setting(f"paper_loop::{dep['id']}") or {}
+    if last.get("reason"):
+        items.append(("最近一次判断", f"{_bj(last['at']) if last.get('at') else '--'}：{last.get('reason')}"))
+    if not heads:
+        if last.get("action") == "blocked":
+            heads.append(last.get("reason") or "被保护规则阻止")
+        elif last.get("reason"):
+            heads.append(last["reason"])
+        else:
+            heads.append("等待下一次 K 线收盘检查")
+    # 计算明细：资金权重 + 波动率定仓 + 当前仓位
+    wt = weight_text(plan)
+    if wt:
+        calc.append(("资金权重", wt))
+    budget = float(cfg.get("budget_usd") or 0)
+    if vol:
+        cl = {"min": f"，低于下限，取 {vol['min']:.0%}", "max": "，超过 100%，取 100%"}.get(vol["clipped"], "")
+        calc.append(("波动率定仓", f"仓位系数 = 目标年化波动率 {vol['target']:g}% ÷ 近 {vol['lookback']} 日年化波动率 {vol['vol']:.1f}% "
+                                f"= {vol['raw']:.2f}{cl} → 下一笔买入使用额度的 {vol['mult']:.0%}"
+                                + (f"（约 {budget * 0.99 * vol['mult']:,.0f} USD）" if budget else "")))
+    qty = _ledger_qty(dep["id"])
+    if budget and price:
+        calc.append(("当前仓位比例", f"持仓 {qty:.6f} BTC × {price:,.0f} = {qty * price:,.0f} USD ÷ 额度 {budget:,.0f} USD "
+                                 f"= {qty * price / budget:.0%}"))
+    elif budget:
+        calc.append(("当前仓位比例", f"持仓 {qty:.6f} BTC（额度 {budget:,.0f} USD）"))
+    return {"headline": "；".join(heads), "items": items, "calc": calc}
+
+
+def plans_for(broker: str = "alpaca_paper") -> dict[int, dict]:
+    """当前全部运行 / 暂停部署的权重计划（只用于解释公式；实际额度以部署配置为准）。"""
+    from . import evolve
+    deps = [d for d in _deployments(broker) if d["status"] in ("running", "paused_entries")]
+    if broker == "alpaca_paper":
+        deps = [d for d in deps if not d["is_test"]]
+    if not deps:
+        return {}
+    snap = None
+    try:
+        snap = db.q1("SELECT equity FROM account_snapshots ORDER BY ts DESC LIMIT 1")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        return evolve.plan_budgets(float(snap["equity"]) if snap else 100_000.0, deps)
+    except Exception:  # noqa: BLE001
+        log.exception("plan budgets failed")
+        return {}

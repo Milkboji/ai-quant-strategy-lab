@@ -138,6 +138,8 @@ def _card(r: dict, actor: str, rl: str, focus: bool) -> None:
                               ("额度", C.usd(r["budget"]) if dep else "--")]), unsafe_allow_html=True)
         with cols[3]:
             _actions(r, actor, rl)
+        if r.get("why"):
+            why_block(r["why"], key=r["key"])
         if r["mismatch"] and r["diff"]:
             with st.expander(f"规则差异：模拟盘 {_vlabel(run)} → 实验室 {_vlabel(lab)}（{len(r['diff'])} 项）",
                              expanded=focus):
@@ -301,3 +303,20 @@ def _queue_panel(actor: str, rl: str) -> None:
                     except Exception as e:  # noqa: BLE001
                         flash("console", "err", str(e))
                     st.rerun()
+
+
+def why_block(w: dict, key: str = "") -> None:
+    """“为什么没有动作”：一句话结论 + 原因明细 + 计算明细（资金权重、波动率定仓、当前仓位）。"""
+    if not w:
+        return
+    st.markdown(f'<div class="aq-sub" style="margin-top:4px"><b>为什么没有动作：</b>{C.esc(w["headline"])}</div>',
+                unsafe_allow_html=True)
+    with st.expander("原因与计算明细"):
+        for t, x in w["items"]:
+            st.markdown(f'<div class="aq-sub" style="margin:3px 0;overflow-wrap:anywhere"><b>{C.esc(t)}</b>：{C.esc(x)}</div>',
+                        unsafe_allow_html=True)
+        if w["calc"]:
+            st.markdown('<div class="aq-sub" style="margin-top:6px"><b>计算明细</b></div>', unsafe_allow_html=True)
+            for t, x in w["calc"]:
+                st.markdown(f'<div class="aq-sub" style="margin:3px 0;overflow-wrap:anywhere">• <b>{C.esc(t)}</b>：{C.esc(x)}</div>',
+                            unsafe_allow_html=True)

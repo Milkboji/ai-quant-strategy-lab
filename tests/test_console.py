@@ -445,3 +445,97 @@ def test_evolution_log_backfill_is_idempotent(clean):
     evolog.backfill()
     evolog.backfill()
     assert len(evolog.rows(2000, include_test=True)) == n0
+
+
+# ---------------------------------------------------------------------------
+# “为什么没有动作”与验证集剩余次数
+# ---------------------------------------------------------------------------
+
+def _running_dep(slot: int, name: str) -> tuple[int, dict]:
+    v = _version(slot, name, new_lineage=True)
+    did = console.deploy_version(f"slot:{slot}", v["id"], actor="tester", role="trader", broker="mock")["deployment_id"]
+    return did, v
+
+
+def test_explain_cooldown_shows_cause_and_remaining(clean):
+    import pandas as pd
+    did, _ = _running_dep(5, "解释测试A")
+    until = pd.Timestamp.now(tz="UTC") + pd.Timedelta(hours=41, minutes=30)
+    db.set_setting(f"rhythm_state::{did}", {"block_until": until.isoformat(), "block_why": "连亏 3 笔刹车", "streak": 0})
+    w = console.explain(pr.get_deployment(did))
+    assert "冷却中（连亏 3 笔）" in w["headline"] and "还剩 1 天 17 小时" in w["headline"]
+    item = dict(w["items"])["冷却中"]
+    assert "剩余 1 天 17 小时" in item and "北京时间" in item
+    db.set_setting(f"rhythm_state::{did}", {"block_until": until.isoformat(), "block_why": "止损后冷却", "streak": 1})
+    assert "冷却中（止损）" in console.explain(pr.get_deployment(did))["headline"]
+    db.set_setting(f"rhythm_state::{did}", {"streak": 2})
+    w = console.explain(pr.get_deployment(did))
+    assert "冷却中" not in w["headline"] and "当前连亏 2 笔" in dict(w["items"])["连亏计数"]
+
+
+def test_explain_long_pause_shows_numbers(clean):
+    from aiquant import rhythm
+    did, v = _running_dep(5, "解释测试B")
+    dep = pr.get_deployment(did)
+    tf = int(dep["config"]["signal_tf"])
+    db.set_setting(rhythm._long_key(v["id"], tf, None), {"rules": rhythm.rules_hash(), "mean_ret": -3.2, "mean_dd": 12.5,
+                                                         "pos_years": 2, "n_years": 6, "ok": False, "years": []})
+    cfg = dep["config"]
+    cfg["auto_pause"] = {"kind": "long", "reason": "长周期体检不达标", "version_id": v["id"], "at": db.now_iso()}
+    db.ex("UPDATE paper_deployments SET config_json=?, status='paused_entries' WHERE id=?",
+          (json.dumps(cfg, ensure_ascii=False), did))
+    w = console.explain(pr.get_deployment(did))
+    txt = dict(w["items"])["长期体检暂停"]
+    assert "近 6 年年均收益 -3.2%（为负）" in txt and "盈利年份 2/6（少于 3 年）" in txt and "12.5%" in txt
+    assert "长期体检暂停新开仓" in w["headline"]
+
+
+def test_explain_stale_signal_and_weight_and_sizing(clean):
+    import numpy as np
+    import pandas as pd
+    did, _ = _running_dep(5, "解释测试C")
+    now = pd.Timestamp.now(tz="UTC")
+    db.set_setting(f"stale_signal::{did}", {"signal_bar": (now - pd.Timedelta(minutes=50)).isoformat(), "age_min": 50,
+                                            "limit_min": 15, "at": now.isoformat(), "reason": "入场信号已过期"})
+    plan = {"weight": 2.0, "share_pct": 40.0, "detail": {"method": "long", "mean_ret": 30.0, "mean_dd": 5.0, "raw": 12.0,
+                                                         "clipped": "max", "wmin": 0.25, "wmax": 2.0, "n_years": 6, "pos_years": 5}}
+    idx = pd.date_range(now.floor("D") - pd.Timedelta(days=40), now.floor("D"), freq="5min", tz="UTC", inclusive="left")
+    rng = np.random.default_rng(3)
+    close = 50000 * np.exp(np.cumsum(rng.normal(0, 0.004, len(idx))))
+    vol = console.vol_sizing(pd.DataFrame({"ts": idx, "close": close}))
+    assert vol and abs(vol["raw"] - vol["target"] / vol["vol"]) < 1e-3
+    assert vol["mult"] == round(min(max(vol["raw"], vol["min"]), 1.0), 4)
+    db.ex("UPDATE paper_deployments SET config_json=json_set(config_json,'$.budget_usd',10000) WHERE id=?", (did,))
+    w = console.explain(pr.get_deployment(did), plan, 50000.0, vol)
+    st_ = dict(w["items"])["入场信号过期未追单"]
+    assert "50 分钟" in st_ and "15 分钟" in st_ and "最近一次入场信号过期未追单" in w["headline"]
+    calc = dict(w["calc"])
+    assert "2 × +30.0% ÷ 5.0% = 12.00" in calc["资金权重"] and "截断为 2" in calc["资金权重"] and "40.0%" in calc["资金权重"]
+    assert f"{vol['vol']:.1f}%" in calc["波动率定仓"] and "近 20 日" in calc["波动率定仓"]
+    assert "÷ 额度 10,000 USD" in calc["当前仓位比例"]
+    assert "抬到 0.25" in console.weight_text({"share_pct": 5.0, "detail": dict(plan["detail"], raw=0.1, clipped="min")})
+    assert "未截断" in console.weight_text({"share_pct": 5.0, "detail": dict(plan["detail"], raw=1.2, clipped=None)})
+    assert "取最低权重 0.25" in console.weight_text({"detail": dict(plan["detail"], mean_ret=-1.0, clipped="negative")})
+
+
+def test_plan_budgets_returns_formula_details(monkeypatch):
+    deps = [{"id": 1, "status": "running", "config": {}}, {"id": 2, "status": "running", "config": {}},
+            {"id": 3, "status": "paused_entries", "config": {"auto_pause": {"kind": "long"}}}]
+    lms = {1: {"mean_ret": 30.0, "mean_dd": 5.0, "n_years": 6, "pos_years": 5},
+           2: {"mean_ret": 4.0, "mean_dd": 10.0, "n_years": 6, "pos_years": 4}}
+    monkeypatch.setattr(evolve, "_long_check", lambda d: lms.get(d["id"]))
+    p = evolve.plan_budgets(100_000.0, deps)
+    assert p[1]["detail"]["clipped"] == "max" and p[1]["weight"] == 2.0
+    assert p[2]["detail"]["clipped"] is None and abs(p[2]["detail"]["raw"] - 0.8) < 1e-9
+    assert abs(p[1]["share_pct"] + p[2]["share_pct"] - 100) < 0.05
+    assert p[3]["detail"]["method"] == "long_pause" and p[3]["budget"] == 0
+
+
+def test_validation_quota_counts_used_runs(clean):
+    from aiquant import actions
+    v = _version(5, "检验次数测试", new_lineage=True)
+    q = actions.validation_quota(v["lineage_id"])
+    assert q["remaining"] == 3 and q["limit"] == 3
+    db.ex("INSERT INTO holdout_touches(version_id,split,window_start,window_end,touched_at) VALUES(?,?,?,?,?)",
+          (v["id"], "validation", "a", "b", db.now_iso()))
+    assert actions.validation_quota(v["lineage_id"])["remaining"] == 2

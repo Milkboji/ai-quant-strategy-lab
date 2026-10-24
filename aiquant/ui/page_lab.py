@@ -474,6 +474,7 @@ def slot_card(n: int, r: dict) -> None:
                 else:
                     flash(f"slot{n}", "err", "暂不能部署：" + "；".join(f"{nm}（{dt}）" for nm, p, dt in checks if not p))
             st.rerun()
+        _paper_why(n)
         # 任务状态
         j = st_["job"]
         if j and j["status"] in ("queued", "running"):
@@ -811,3 +812,19 @@ def render() -> None:
     comparison(r)
     st.write("")
     ai_center()
+
+
+def _paper_why(n: int) -> None:
+    """该策略位在模拟盘运行时：显示运行版本和“为什么没有动作”（与策略总台同一套解释）。"""
+    try:
+        from .. import console
+        dep = console.active_deployment(f"slot:{n}")
+        if not dep:
+            return
+        from .page_console import why_block
+        v = registry.get_version(dep["version_id"])
+        st.markdown(f'<div class="aq-sub">模拟盘运行：{C.esc(registry.label(v))}</div>', unsafe_allow_html=True)
+        plans = console.plans_for()
+        why_block(console.explain(dep, plans.get(dep["id"]), None, console.vol_sizing()), key=f"lab{n}")
+    except Exception:  # noqa: BLE001
+        pass

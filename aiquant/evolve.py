@@ -860,6 +860,7 @@ def _train_metrics(dep: dict) -> dict | None:
 
 
 def plan_budgets(equity: float, deps: list[dict], cfgv: dict | None = None) -> dict[int, dict]:
+    """按实力分配额度。每个部署返回 budget / weight / why，以及 detail（公式代入的数值，供页面解释）和 share_pct。"""
     c = cfgv or get_config()
     other = 0.0
     try:   # 美股 ETF 趋势策略占用的资金比例，从 BTC 策略可分配资金中扣除
@@ -872,38 +873,49 @@ def plan_budgets(equity: float, deps: list[dict], cfgv: dict | None = None) -> d
     paused = [d for d in deps if d["status"] == "paused_entries"]
     running = [d for d in deps if d["status"] == "running"]
     floor = equity * float(c["paused_floor_pct"]) / 100
+    wmin, wmax = float(c["weight_min"]), float(c["weight_max"])
     plan: dict[int, dict] = {}
     n_floor = 0
     for d in paused:
         if ((d.get("config") or {}).get("auto_pause") or {}).get("kind") == "long":
-            plan[d["id"]] = {"budget": 0, "weight": None, "why": "长周期体检暂停：额度释放给长期有优势的策略"}
+            plan[d["id"]] = {"budget": 0, "weight": None, "why": "长周期体检暂停：额度释放给长期有优势的策略",
+                             "detail": {"method": "long_pause"}, "share_pct": None}
             continue
         n_floor += 1
-        plan[d["id"]] = {"budget": int(floor // 100 * 100), "weight": None, "why": "暂停中，保留最低额度"}
+        plan[d["id"]] = {"budget": int(floor // 100 * 100), "weight": None, "why": "暂停中，保留最低额度",
+                         "detail": {"method": "paused_floor", "floor_pct": float(c["paused_floor_pct"])}, "share_pct": None}
     left = max(0.0, total - floor * n_floor)
     w = {}
     for d in running:
         lm = _long_check(d)
         if lm is not None:
             raw = 2 * lm["mean_ret"] / max(lm["mean_dd"], 1.0)
+            det = {"method": "long", "mean_ret": lm["mean_ret"], "mean_dd": lm["mean_dd"], "n_years": lm["n_years"],
+                   "pos_years": lm["pos_years"], "raw": round(raw, 4), "wmin": wmin, "wmax": wmax}
             if lm["mean_ret"] <= 0:
-                w[d["id"]] = (float(c["weight_min"]), f"长周期年均收益 {lm['mean_ret']:+.1f}%，最低权重")
+                det.update(weight=wmin, clipped="negative")
+                w[d["id"]] = (wmin, f"长周期年均收益 {lm['mean_ret']:+.1f}%，最低权重", det)
             else:
-                w[d["id"]] = (min(max(raw, float(c["weight_min"])), float(c["weight_max"])),
-                              f"长周期 {lm['n_years']} 年：年均收益 {lm['mean_ret']:+.1f}% / 年均回撤 {lm['mean_dd']:.1f}%，"
-                              f"盈利 {lm['pos_years']} 年 → 权重 {raw:.2f}")
+                wt = min(max(raw, wmin), wmax)
+                det.update(weight=wt, clipped="max" if raw > wmax else ("min" if raw < wmin else None))
+                w[d["id"]] = (wt, f"长周期 {lm['n_years']} 年：年均收益 {lm['mean_ret']:+.1f}% / 年均回撤 {lm['mean_dd']:.1f}%，"
+                                  f"盈利 {lm['pos_years']} 年 → 权重 {raw:.2f}", det)
             continue
         m = _train_metrics(d) or {}
         ret, dd = m.get("return_pct"), m.get("max_dd_pct")
+        det = {"method": "train", "ret": ret, "dd": dd, "wmin": wmin, "wmax": wmax}
         if ret is None or ret <= 0:
-            w[d["id"]] = (float(c["weight_min"]), f"训练集收益 {ret if ret is not None else '--'}%，最低权重")
+            det.update(weight=wmin, clipped="negative", raw=None)
+            w[d["id"]] = (wmin, f"训练集收益 {ret if ret is not None else '--'}%，最低权重", det)
         else:
             raw = ret / max(abs(dd or 0), 1.0)
-            w[d["id"]] = (min(max(raw, float(c["weight_min"])), float(c["weight_max"])),
-                          f"训练集收益 {ret:+.1f}% / 回撤 {dd:.1f}% = {raw:.2f}")
+            wt = min(max(raw, wmin), wmax)
+            det.update(raw=round(raw, 4), weight=wt, clipped="max" if raw > wmax else ("min" if raw < wmin else None))
+            w[d["id"]] = (wt, f"训练集收益 {ret:+.1f}% / 回撤 {dd:.1f}% = {raw:.2f}", det)
     tw = sum(x[0] for x in w.values()) or 1.0
-    for did, (wt, why) in w.items():
-        plan[did] = {"budget": int(left * wt / tw // 100 * 100), "weight": round(wt, 2), "why": why}
+    for did, (wt, why, det) in w.items():
+        plan[did] = {"budget": int(left * wt / tw // 100 * 100), "weight": round(wt, 2), "why": why, "detail": det,
+                     "share_pct": round(wt / tw * 100, 2), "total_weight": round(tw, 4)}
     return plan
 
 

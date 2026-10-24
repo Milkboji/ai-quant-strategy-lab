@@ -109,9 +109,13 @@ def render() -> None:
             if st.button("在训练窗口回测该版本", key="v_train", type="primary", use_container_width=True):
                 jid, msg = actions.submit_backtest(slot_no, version_id=sel)
                 flash("ver", "ok" if jid else "err", msg); st.rerun()
-            if st.button("验证集检验（有限次数）", key="v_val", use_container_width=True):
+            vq = actions.validation_quota(v["lineage_id"])
+            vc = st.columns([2, 1])
+            if vc[0].button("验证集检验（有限次数）", key="v_val", use_container_width=True, disabled=vq["remaining"] <= 0):
                 jid, msg = actions.submit_backtest(slot_no, version_id=sel, kind="validation")
                 flash("ver", "ok" if jid else "err", msg); st.rerun()
+            vc[1].markdown(f'<div class="aq-sub" style="margin-top:8px">本谱系剩余检验次数 <b>{vq["remaining"]}/{vq["limit"]}</b>'
+                           + (f'（{vq["pending"]} 个进行中）' if vq["pending"] else "") + "</div>", unsafe_allow_html=True)
             if st.button("运行独立最终测试（每版本一次）", key="warn_final", use_container_width=True,
                          disabled=not tst["ok"], help=None if tst["ok"] else tst["label"]):
                 jid, msg = actions.submit_backtest(slot_no, version_id=sel, kind="final_test")

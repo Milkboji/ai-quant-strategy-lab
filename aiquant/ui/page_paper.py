@@ -70,6 +70,15 @@ def portfolio_live() -> None:
     c[2].metric("Paper 账户权益", f"{acct.equity:,.2f}" if acct else "--")
     c[3].metric("账户 BTC 持仓", f"{(pos or {}).get('qty', 0):.6f}" if acct else "--")
     c[4].metric("自动循环心跳", (str(hb)[11:19] + " UTC") if hb else "--", help="每 60 秒检查一次全部策略")
+    whys = {}
+    try:   # “为什么没有动作”：与策略总台同一套解释
+        from .. import console
+        plans, vol = console.plans_for(), console.vol_sizing()
+        for r in rows:
+            if r["raw_status"] in ("running", "paused_entries"):
+                whys[r["id"]] = console.explain(pr.get_deployment(r["id"]), plans.get(r["id"]), price, vol)
+    except Exception:  # noqa: BLE001
+        whys = {}
     if rows:
         tbl = []
         for r in rows:
@@ -80,12 +89,20 @@ def portfolio_live() -> None:
                         "资金额度 USD": r["budget"], "持仓 BTC": round(r["qty"], 6),
                         "盈亏 USD（含浮动）": round(pnl, 2) if r["filled"] else 0.0,
                         "成交笔数": r["filled"], "最近判断（UTC）": (r["last_at"] or "")[11:19],
-                        "动作": act, "原因": r["last_reason"] or "--"})
+                        "动作": act, "原因": r["last_reason"] or "--",
+                        "为什么没有动作": (whys.get(r["id"]) or {}).get("headline") or "--"})
         st.dataframe(pd.DataFrame(tbl), hide_index=True, use_container_width=True,
                      column_config={"资金额度 USD": st.column_config.NumberColumn(format="%,.0f"),
                                     "盈亏 USD（含浮动）": st.column_config.NumberColumn(format="%+,.2f")})
         st.caption("『观望』表示程序已检查过、条件不满足所以没下单；每个策略只在自己的K线收盘、条件满足时才会买卖。"
                    "日线策略可能几天才交易一次，15 分钟策略一般几小时内会有动作。")
+        if whys:
+            from .page_console import why_block
+            with st.expander("每个策略为什么没有动作（冷却、体检、信号过期、资金权重和仓位的计算）"):
+                for r in rows:
+                    if r["id"] in whys:
+                        st.markdown(f"**#{r['id']} {C.esc(r['label'])}**")
+                        why_block(whys[r["id"]], key=f"pp{r['id']}")
     else:
         st.info("还没有模拟盘部署。")
     ords = _broker_orders(int(datetime.now().timestamp() // 15))

@@ -208,3 +208,5 @@ def test_stale_entry_signal_is_skipped(live, monkeypatch):
     r = run.step(df, end + timedelta(minutes=5))
     assert r["action"] == "none" and "已过期" in r["reason"], r
     assert not any(m == "POST" for m, u in fake.calls)
+    st = db.get_setting(f"stale_signal::{did}")          # 记下最近一次过期信号，供页面解释“为什么没有动作”
+    assert st and st["age_min"] >= 40 and st["limit_min"] == 15 and "已过期" in st["reason"]
