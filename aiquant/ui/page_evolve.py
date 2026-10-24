@@ -33,7 +33,8 @@ def render() -> None:
         '成交太少的候选直接淘汰。只有比当前版本高出至少 1 分才进入下一步。</li>'
         '<li><b>留出检验</b>：在候选从没“见过”的数据上和当前版本比较（优先用最新行情，不够时用验证集，每条策略最多 3 次）。'
         '候选必须有成交，收益不比当前差、回撤不明显更深。独立测试集永远不参与。</li>'
-        '<li><b>自动替换</b>：通过后冻结为新版本；模拟盘在<b>空仓时</b>切换，有持仓时等卖出后再切换。每一步都写入日志。</li>'
+        '<li><b>自动替换</b>：通过后冻结为新版本；模拟盘在<b>空仓时</b>切换，有持仓时等卖出后再切换。每一步都写入日志。'
+        '策略被锁定（手动部署后默认锁定 7 天）或开启了「晋级需人工确认」时，不自动替换，改为进入策略总台的待确认队列。</li>'
         '<li><b>挑战者模拟运行</b>：历史留出数据不够下结论时，候选不会被丢掉，而是作为“挑战者”从登记时刻起在实时行情上与现役版本并行运行，'
         '每小时评估一次；跑满最短天数且不差于现役 → 自动晋级并部署到模拟盘；明显更差 → 淘汰。美股 ETF 择时的参数也用同样方式进化。</li>'
         '</ol>'
@@ -49,8 +50,9 @@ def render() -> None:
         opts = [1, 3, 7, 14, 30]
         iv = c[1].selectbox("间隔", opts, index=opts.index(int(cfg["interval_days"])) if int(cfg["interval_days"]) in opts else 2,
                             format_func=lambda d: f"每 {d} 天", key="ev_iv")
-        ap = c[2].toggle("通过检验后自动替换", value=bool(cfg["auto_apply"]), key="ev_ap",
-                         help="关闭后只给出建议（待确认），不改动模拟盘")
+        from .. import console
+        rc = c[2].toggle("晋级需人工确认", value=bool(console.promotion_config()["require_confirm"]), key="ev_rc",
+                         help="开启后，所有通过检验的新版本和胜出的挑战者都进入策略总台的待确认队列，由你批准或拒绝")
         ds = c[3].toggle("加入 DeepSeek 候选", value=bool(cfg["use_deepseek"]), key="ev_ds",
                          help="DeepSeek 只读取训练集摘要，提出 1 个候选，同样要通过全部检验")
         c2 = st.columns([1.2, 1, 1, 2])
@@ -63,7 +65,13 @@ def render() -> None:
         c2[3].markdown('<div class="aq-sub" style="margin-top:28px">任一条件满足即暂停新开仓。你也可以在模拟盘页面手动恢复，'
                        '手动恢复的同一版本不会再被自动暂停。</div>', unsafe_allow_html=True)
         if c[4].button("保存设置", key="ev_save", use_container_width=True):
-            evolve.set_config(enabled=en, interval_days=int(iv), auto_apply=ap, use_deepseek=ds,
+            from .login import effective_user, role
+            try:
+                console.set_promotion_config(actor=effective_user(), role=role(), require_confirm=rc)
+            except Exception as e:  # noqa: BLE001
+                flash("evolve", "err", str(e))
+                st.rerun()
+            evolve.set_config(enabled=en, interval_days=int(iv), use_deepseek=ds,
                               pause_losers=pl, pause_train_loss_pct=float(tl), pause_live_loss_pct=float(ll))
             flash("evolve", "success", "设置已保存")
             st.rerun()
@@ -192,7 +200,7 @@ def rhythm_panel() -> None:
             st.dataframe(pd.DataFrame(tbl), hide_index=True, use_container_width=True)
 
 
-STATUS_CN = {"running": "🟣 模拟运行中", "promoted": "🟢 已晋级上线", "rejected": "⚪ 已淘汰", "expired": "⚪ 已作废",
+STATUS_CN = {"running": "🟣 模拟运行中", "awaiting": "🟡 胜出，等待确认", "promoted": "🟢 已晋级上线", "rejected": "⚪ 已淘汰", "expired": "⚪ 已作废",
              "replaced": "⚪ 被更好的替换"}
 
 

@@ -236,7 +236,7 @@ def evaluate_btc(now: datetime | None = None, source: str | None = None) -> list
                 tj["fast"] = {"verdict": fc["verdict"], "reason": fc["reason"], "btc": fc["btc"], "eth": fc["eth"]}
                 db.ex("UPDATE evolve_challengers SET train_json=? WHERE id=?", (json.dumps(tj, ensure_ascii=False), ch["id"]))
             if fc["verdict"] == "pass":
-                out.append(_promote_btc(ch, dep, champ, cand, None, rr, "快速检验通过：" + fc["reason"]))
+                out.append(_win_btc(ch, dep, champ, cand, None, rr, "快速检验通过：" + fc["reason"]))
                 continue
             if fc["verdict"] == "fail":
                 _close(ch, "rejected", "快速检验明显更差，淘汰：" + fc["reason"])
@@ -273,7 +273,7 @@ def evaluate_btc(now: datetime | None = None, source: str | None = None) -> list
                 why = (f"提前决策（前向 {days:.1f} 天，{km['trades']} 笔）：挑战者 {km['net_return_pct']:+.2f}% / 回撤 {km['max_drawdown_pct']:.1f}%，"
                        f"现役 {cm['net_return_pct']:+.2f}% / 回撤 {cm['max_drawdown_pct']:.1f}%")
                 if lead >= EARLY_LEAD and km["max_drawdown_pct"] >= cm["max_drawdown_pct"] - TOL_DD:
-                    out.append(_promote_btc(ch, dep, champ, cand, k, rr, why))
+                    out.append(_win_btc(ch, dep, champ, cand, k, rr, why))
                 elif lead <= -EARLY_LAG:
                     _close(ch, "rejected", "前向明显落后，提前淘汰：" + why)
                     _event(dep["id"], "INFO", f"自动进化：挑战者 #{ch['id']} 提前淘汰 — {why}", bool(ch["is_test"]))
@@ -283,7 +283,7 @@ def evaluate_btc(now: datetime | None = None, source: str | None = None) -> list
         why = (f"前向 {days:.0f} 天：挑战者 {km['net_return_pct']:+.2f}% / 回撤 {km['max_drawdown_pct']:.1f}% / {km['trades']} 笔，"
                f"现役 {cm['net_return_pct']:+.2f}% / 回撤 {cm['max_drawdown_pct']:.1f}% / {cm['trades']} 笔")
         if better and km["trades"] >= 1:
-            out.append(_promote_btc(ch, dep, champ, cand, k, rr, why))
+            out.append(_win_btc(ch, dep, champ, cand, k, rr, why))
         elif not better:
             _close(ch, "rejected", "前向表现不如现役，淘汰：" + why)
             _event(dep["id"], "INFO", f"自动进化：挑战者 #{ch['id']} 淘汰 — {why}", bool(ch["is_test"]))
@@ -292,6 +292,40 @@ def evaluate_btc(now: datetime | None = None, source: str | None = None) -> list
             _close(ch, "expired", "运行很久仍没有成交，无法证明更好：" + why)
             out.append(f"#{ch['id']} 过期")
     return out
+
+
+def _await(ch: dict, why: str, block: str) -> None:
+    """挑战者胜出但不能自动晋级（版本锁定 / 晋级需人工确认）：进入待确认队列。"""
+    db.ex("UPDATE evolve_challengers SET status='awaiting', decided_at=?, reason=? WHERE id=?",
+          (db.now_iso(), f"挑战者胜出，等待确认（{block}）：{why}"[:480], ch["id"]))
+
+
+def _win_btc(ch, dep, champ, cand, fwd_eval, rr, why) -> str:
+    from . import console
+    block = console.promotion_block(dep)
+    if block:
+        _await(ch, why, block)
+        _event(dep["id"], "INFO", f"自动进化：挑战者 #{ch['id']} 胜出，等待确认（{block}）— {why}", bool(ch["is_test"]))
+        return f"#{ch['id']} 胜出，等待确认"
+    return _promote_btc(ch, dep, champ, cand, fwd_eval, rr, why)
+
+
+def queue_btc(dep: dict, champion: dict, cand_schema: dict, change: str, train_brief: dict, why: str, block: str,
+              is_test: bool) -> int:
+    """进化直接通过全部检验、但不能自动晋级时：作为“已胜出的挑战者”放进待确认队列（同一部署只留最新一条）。"""
+    ensure_tables()
+    for r in db.q("SELECT id FROM evolve_challengers WHERE kind='btc' AND deployment_id=? AND status='awaiting'",
+                  (dep["id"],)):
+        db.ex("UPDATE evolve_challengers SET status='replaced', decided_at=?, reason=? WHERE id=?",
+              (db.now_iso(), "被更新的待确认结果替换", r["id"]))
+    label = json.loads(dep["config_json"]).get("label") or f"#{dep['id']}"
+    cid = db.ex("INSERT INTO evolve_challengers(kind,deployment_id,label,champion_version_id,candidate_json,change,"
+                "train_json,registered_at,status,decided_at,reason,is_test) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("btc", dep["id"], label, champion["id"], json.dumps(cand_schema, ensure_ascii=False), change,
+                 json.dumps(train_brief, ensure_ascii=False), db.now_iso(), "awaiting", db.now_iso(),
+                 f"挑战者胜出，等待确认（{block}）：{why}"[:480], 1 if is_test else 0))
+    _event(dep["id"], "INFO", f"自动进化：候选 #{cid} 通过全部检验，等待确认（{block}）— {change}", is_test)
+    return cid
 
 
 def _close(ch: dict, status: str, reason: str, new_vid: int | None = None) -> None:
@@ -396,6 +430,12 @@ def etf_round(run_id: int | None = None) -> dict:
     return rec
 
 
+def _etf_block() -> str | None:
+    """美股 ETF 没有单独的部署，只受全局「晋级需人工确认」约束。"""
+    from . import console
+    return "已开启「晋级需人工确认」" if console.promotion_config().get("require_confirm") else None
+
+
 def evaluate_etf(now: datetime | None = None) -> list[str]:
     from .paper import etf_trend as et
     out = []
@@ -417,6 +457,11 @@ def evaluate_etf(now: datetime | None = None) -> list[str]:
             fc = fast_check_etf(champ, cand)
             tj["fast"] = fc
             db.ex("UPDATE evolve_challengers SET train_json=? WHERE id=?", (json.dumps(tj, ensure_ascii=False), ch["id"]))
+            if fc["verdict"] == "pass" and _etf_block():
+                _await(ch, "快速检验通过：" + fc["reason"], _etf_block())
+                _event(None, "INFO", f"[ETF趋势] 自动进化：挑战者 #{ch['id']} 胜出，等待确认 — {fc['reason']}")
+                out.append(f"ETF #{ch['id']} 等待确认")
+                continue
             if fc["verdict"] == "pass":
                 db.set_setting("etf_trend_config", dict(db.get_setting("etf_trend_config") or {}, sma=cand["sma"], band=cand["band"]))
                 _close(ch, "promoted", "快速检验通过，晋级上线：" + fc["reason"])
@@ -439,7 +484,11 @@ def evaluate_etf(now: datetime | None = None) -> list[str]:
         if k["days"] < ETF_MIN_DAYS:
             continue
         why = f"前向 {k['days']} 个交易日：挑战者 {k['ret']:+.2f}% / 回撤 {k['dd']:.1f}%，现役 {c['ret']:+.2f}% / 回撤 {c['dd']:.1f}%"
-        if k["ret"] >= c["ret"] - TOL_RET and k["dd"] >= c["dd"] - TOL_DD:
+        if k["ret"] >= c["ret"] - TOL_RET and k["dd"] >= c["dd"] - TOL_DD and _etf_block():
+            _await(ch, why, _etf_block())
+            _event(None, "INFO", f"[ETF趋势] 自动进化：挑战者 #{ch['id']} 胜出，等待确认 — {why}")
+            out.append(f"ETF #{ch['id']} 等待确认")
+        elif k["ret"] >= c["ret"] - TOL_RET and k["dd"] >= c["dd"] - TOL_DD:
             db.set_setting("etf_trend_config", dict(db.get_setting("etf_trend_config") or {}, sma=cand["sma"], band=cand["band"]))
             _close(ch, "promoted", "晋级上线：" + why)
             _event(None, "INFO", f"[ETF趋势] 自动进化：挑战者 #{ch['id']} 晋级，参数改为 {cand['sma']} 日均线 ±{cand['band']:.0%} — {why}")

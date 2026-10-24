@@ -396,9 +396,15 @@ def evolve_one(dep: dict, cfgv: dict, r: dict, train: tuple[datetime, datetime],
         if ho["kind"] == "验证集":   # 验证集查看也计入谱系限额
             _record_validation_touch(cur, ho)
         return rec
-    # ---- 晋级 ----
-    if not cfgv.get("auto_apply", True):
-        rec["decision"], rec["reason"] = "待人工确认", "通过全部检验，自动替换已关闭：" + ho["reason"]
+    # ---- 晋级（版本锁定 / 晋级需人工确认时进入待确认队列）----
+    from . import console
+    block = console.promotion_block(dep if "config" in dep else dict(dep, config=json.loads(dep["config_json"])))
+    if block:
+        from . import challenger
+        cid = challenger.queue_btc(dep, cur, best_sch, best_why, rec["best"], "通过全部检验：" + ho["reason"], block,
+                                   bool(dep["is_test"]))
+        rec["decision"] = "待人工确认"
+        rec["reason"] = f"候选 #{cid} 通过全部检验，等待确认（{block}）：" + ho["reason"]
         return rec
     nv = registry.freeze(cur["slot_no"], best_sch, nl_text=cur["nl_text"], source="auto_evolve",
                          change_summary=f"[自动进化#{run_id}] {best_why}"[:500], parent_id=cur["id"],

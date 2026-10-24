@@ -53,7 +53,9 @@ def clean(cs_env):
           "AND status IN ('configured','running','paused_entries')")
     for k in [f"slot:{i}" for i in range(1, 6)]:
         db.set_setting(f"console_offline::{k}", None)
+    db.set_setting("promotion_config", {"require_confirm": False, "manual_lock_days": 7})
     yield
+    db.set_setting("promotion_config", {"require_confirm": False, "manual_lock_days": 7})
 
 
 def test_manual_save_does_not_replace_running_version(clean):
@@ -204,3 +206,147 @@ def test_console_page_is_read_only_for_viewers(clean):
     assert any("策略总台" in m.value for m in at.markdown)
     btns = [b for b in at.button if b.label in ("部署此版本", "下线", "一键部署全部")]
     assert btns and all(b.disabled for b in btns)
+
+
+# ---------------------------------------------------------------------------
+# 锁定版本 / 晋级需人工确认 / 待确认队列
+# ---------------------------------------------------------------------------
+
+def _challenger(did: int, champ: dict, **change) -> dict:
+    from aiquant import challenger
+    raw = db.q1("SELECT * FROM paper_deployments WHERE id=?", (did,))
+    cand = dict(champ["schema"], **change)
+    cid = challenger.register_btc(raw, champ, cand, "测试改动", {"score": 99.0, "return_pct": 5.0}, True)
+    return db.q1("SELECT * FROM evolve_challengers WHERE id=?", (cid,))
+
+
+def _win(ch: dict, did: int) -> str:
+    from aiquant import challenger
+    dep = pr.get_deployment(did)
+    champ = registry.get_version(dep["version_id"])
+    rr = dict(research.get_research(), source="test")
+    return challenger._win_btc(ch, dep, champ, json.loads(ch["candidate_json"]), None, rr, "测试：前向胜出")
+
+
+def _status_of(cid: int) -> dict:
+    return db.q1("SELECT * FROM evolve_challengers WHERE id=?", (cid,))
+
+
+def test_manual_deploy_locks_and_challenger_waits_for_approval(clean):
+    v1 = _version(5, "锁定测试A", new_lineage=True)
+    res = console.deploy_version("slot:5", v1["id"], actor="tester", role="trader", broker="mock")
+    did = res["deployment_id"]
+    assert "锁定 7 天" in res["message"]
+    lk = console.lock_state(pr.get_deployment(did))
+    assert lk and lk["kind"] == "manual_deploy" and lk["until"]
+    assert "锁定至" in console.promotion_block(pr.get_deployment(did))
+    ch = _challenger(did, v1, stop_loss_pct=5.0)
+    assert "等待确认" in _win(ch, did)
+    st = _status_of(ch["id"])
+    assert st["status"] == "awaiting" and "挑战者胜出，等待确认" in st["reason"]
+    assert pr.get_deployment(did)["version_id"] == v1["id"]          # 没有自动晋级
+    r = _row("slot:5")
+    assert r["lock"] and r["awaiting"]["id"] == ch["id"]
+    assert any(a["id"] == ch["id"] for a in console.awaiting())
+    out = console.approve(ch["id"], actor="boss", role="admin")      # 批准 → 正常晋级流程（空仓立即切换）
+    assert out["result"] == "已晋级"
+    st = _status_of(ch["id"])
+    assert st["status"] == "promoted" and st["new_version_id"]
+    assert pr.get_deployment(did)["version_id"] == st["new_version_id"]
+    assert "批准晋级" in [x["action"] for x in console.audit_log(key="slot:5")]
+
+
+def test_unlocked_strategy_keeps_auto_promotion(clean):
+    console.set_promotion_config(actor="boss", role="admin", manual_lock_days=0)
+    v1 = _version(5, "锁定测试B", new_lineage=True)
+    did = console.deploy_version("slot:5", v1["id"], actor="tester", role="trader", broker="mock")["deployment_id"]
+    assert console.lock_state(pr.get_deployment(did)) is None and console.promotion_block(pr.get_deployment(did)) is None
+    ch = _challenger(did, v1, stop_loss_pct=6.0)
+    _win(ch, did)
+    st = _status_of(ch["id"])
+    assert st["status"] == "promoted"
+    assert pr.get_deployment(did)["version_id"] == st["new_version_id"]
+
+
+def test_global_confirm_queues_and_reject_records_reason(clean):
+    console.set_promotion_config(actor="boss", role="admin", require_confirm=True, manual_lock_days=0)
+    assert console.promotion_config()["require_confirm"] is True
+    assert evolve.get_config()["auto_apply"] is False                # 与进化页旧开关保持一致
+    v1 = _version(5, "锁定测试C", new_lineage=True)
+    did = console.deploy_version("slot:5", v1["id"], actor="tester", role="trader", broker="mock")["deployment_id"]
+    assert console.promotion_block(pr.get_deployment(did)) == "已开启「晋级需人工确认」"
+    ch = _challenger(did, v1, stop_loss_pct=7.0)
+    _win(ch, did)
+    assert _status_of(ch["id"])["status"] == "awaiting"
+    with pytest.raises(ValueError):
+        console.reject(ch["id"], "  ", actor="boss", role="admin")
+    console.reject(ch["id"], "回撤太大", actor="boss", role="trader")
+    st = _status_of(ch["id"])
+    assert st["status"] == "rejected" and "回撤太大" in st["reason"]
+    assert pr.get_deployment(did)["version_id"] == v1["id"]
+    log = [x for x in console.audit_log(key="slot:5") if x["action"] == "拒绝晋级"]
+    assert log and "回撤太大" in log[0]["detail"]
+    console.set_promotion_config(actor="boss", role="admin", require_confirm=False)
+    assert evolve.get_config()["auto_apply"] is True
+
+
+def test_lock_toggle_and_permissions(clean):
+    console.set_promotion_config(actor="boss", role="admin", manual_lock_days=0)
+    v1 = _version(5, "锁定测试D", new_lineage=True)
+    did = console.deploy_version("slot:5", v1["id"], actor="tester", role="trader", broker="mock")["deployment_id"]
+    console.set_lock("slot:5", True, actor="tester", role="trader", broker="mock")
+    lk = console.lock_state(pr.get_deployment(did))
+    assert lk["kind"] == "manual" and lk["until"] is None
+    assert console.promotion_block(pr.get_deployment(did)) == "版本已手动锁定"
+    console.set_lock("slot:5", False, actor="tester", role="trader", broker="mock")
+    assert console.lock_state(pr.get_deployment(did)) is None
+    ch = _challenger(did, v1, stop_loss_pct=8.0)
+    db.ex("UPDATE evolve_challengers SET status='awaiting' WHERE id=?", (ch["id"],))
+    for fn in (lambda: console.set_lock("slot:5", True, actor="g", role="viewer", broker="mock"),
+               lambda: console.approve(ch["id"], actor="g", role="viewer"),
+               lambda: console.reject(ch["id"], "x", actor="g", role="viewer"),
+               lambda: console.set_promotion_config(actor="g", role="viewer", require_confirm=True)):
+        with pytest.raises(console.ConsolePermissionError):
+            fn()
+    assert _status_of(ch["id"])["status"] == "awaiting"
+    acts = [x["action"] for x in console.audit_log(key="slot:5")]
+    assert "锁定版本" in acts and "解除锁定" in acts
+
+
+def test_expired_lock_and_manual_deploy_voids_awaiting(clean):
+    v1 = _version(5, "锁定测试E", new_lineage=True)
+    did = console.deploy_version("slot:5", v1["id"], actor="tester", role="trader", broker="mock")["deployment_id"]
+    d = pr.get_deployment(did)
+    d["config"]["version_lock"]["until"] = "2020-01-01T00:00:00+00:00"   # 锁已过期 → 恢复自动晋级
+    db.ex("UPDATE paper_deployments SET config_json=? WHERE id=?", (json.dumps(d["config"], ensure_ascii=False), did))
+    assert console.lock_state(pr.get_deployment(did)) is None
+    ch = _challenger(did, v1, stop_loss_pct=9.0)
+    db.ex("UPDATE evolve_challengers SET status='awaiting' WHERE id=?", (ch["id"],))
+    v2 = _version(5, "锁定测试E", take_profit_pct=12.0)
+    console.deploy_version("slot:5", v2["id"], actor="tester", role="trader", broker="mock")
+    assert _status_of(ch["id"])["status"] == "expired"
+    with pytest.raises(ValueError):
+        console.approve(ch["id"], actor="boss", role="admin")
+
+
+def test_queue_btc_keeps_latest_and_etf_approval(clean):
+    from aiquant import challenger
+    from aiquant.paper import etf_trend
+    v1 = _version(5, "锁定测试F", new_lineage=True)
+    did = console.deploy_version("slot:5", v1["id"], actor="tester", role="trader", broker="mock")["deployment_id"]
+    raw = db.q1("SELECT * FROM paper_deployments WHERE id=?", (did,))
+    a = challenger.queue_btc(raw, v1, dict(v1["schema"], stop_loss_pct=4.0), "改动1", {"score": 1}, "通过", "锁定", True)
+    b = challenger.queue_btc(raw, v1, dict(v1["schema"], stop_loss_pct=5.0), "改动2", {"score": 2}, "通过", "锁定", True)
+    assert _status_of(a)["status"] == "replaced" and _status_of(b)["status"] == "awaiting"
+    cfg = etf_trend.get_config()
+    cid = db.ex("INSERT INTO evolve_challengers(kind,deployment_id,label,champion_params,candidate_json,change,train_json,"
+                "registered_at,status,decided_at,reason,is_test) VALUES('etf',NULL,'ETF',?,?,?,?,?,?,?,?,1)",
+                (json.dumps({"sma": int(cfg["sma"]), "band": float(cfg["band"])}),
+                 json.dumps({"sma": int(cfg["sma"]) + 10, "band": float(cfg["band"])}), "均线+10", "{}",
+                 db.now_iso(), "awaiting", db.now_iso(), "挑战者胜出，等待确认"))
+    try:
+        console.approve(cid, actor="boss", role="admin")
+        assert etf_trend.get_config()["sma"] == int(cfg["sma"]) + 10
+        assert _status_of(cid)["status"] == "promoted"
+    finally:
+        db.set_setting("etf_trend_config", dict(db.get_setting("etf_trend_config") or {}, sma=cfg["sma"], band=cfg["band"]))

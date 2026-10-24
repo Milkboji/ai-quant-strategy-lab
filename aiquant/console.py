@@ -185,6 +185,16 @@ def _challenger_for(did: int | None) -> dict | None:
             "challenger": ev.get("challenger"), "champion": ev.get("champion")}
 
 
+def _awaiting_for(did: int | None) -> dict | None:
+    if not did:
+        return None
+    from . import challenger
+    challenger.ensure_tables()
+    r = db.q1("SELECT id, change, reason, decided_at FROM evolve_challengers WHERE kind='btc' AND deployment_id=? "
+              "AND status='awaiting' ORDER BY id DESC LIMIT 1", (did,))
+    return dict(r) if r else None
+
+
 def _status(lab: dict | None, dep: dict | None, offline: bool, had_dep: bool, include_test: bool) -> str:
     from . import research
     if dep:
@@ -245,6 +255,8 @@ def rows(broker: str = "alpaca_paper", price: float | None = None) -> list[dict]
             "pending_offline": bool(dep and dep["config"].get("pending_offline")),
             "offline": offline,
             "challenger": _challenger_for(dep["id"] if dep else None),
+            "awaiting": _awaiting_for(dep["id"] if dep else None),
+            "lock": lock_state(dep), "block": promotion_block(dep) if dep else None,
             "qty": qty, "value": qty * price if price else None,
             "budget": b if dep else 0.0, "weight_pct": (b / total_budget * 100) if dep and total_budget else None,
             "budget_reason": (dep or {}).get("config", {}).get("budget_reason") if dep else None,
@@ -334,6 +346,14 @@ def deploy_version(key: str, version_id: int, *, actor: str | None, role: str | 
             res = {"result": "已切换" if switched else "等待空仓后切换", "deployment_id": dep["id"],
                    "message": (f"已切换到 {registry.label(v)}" if switched
                                else f"{registry.label(v)} 将在该策略空仓且没有未完成订单时切换")}
+        if old_vid != v["id"]:
+            n = _expire_awaiting(dep["id"], "用户手动部署了其他版本，待确认的挑战者作废")
+            if n:
+                notes.append(f"作废 {n} 个待确认挑战者")
+        lk = lock_after_manual_deploy(dep["id"], actor)
+        if lk:
+            notes.append(f"锁定 {lk['days']:g} 天")
+            res["message"] += f"；已锁定 {lk['days']:g} 天，期间自动进化不会替换"
         audit(actor, role, "部署此版本", key, v["name"], dep["id"], old_vid, v["id"], res["result"],
               "；".join(notes))
         return res
@@ -358,8 +378,11 @@ def deploy_version(key: str, version_id: int, *, actor: str | None, role: str | 
             log.exception("rebalance after deploy failed")
     res = {"result": "已启动", "deployment_id": did,
            "message": f"已部署并启动 {registry.label(v)}（部署 #{did}）" + ("，已重新加入组合" if was_offline else "")}
+    lk = lock_after_manual_deploy(did, actor)
+    if lk:
+        res["message"] += f"；已锁定 {lk['days']:g} 天，期间自动进化不会替换"
     audit(actor, role, "部署此版本", key, v["name"], did, None, v["id"], res["result"],
-          "重新上线" if was_offline else "")
+          "；".join(x for x in ("重新上线" if was_offline else "", f"锁定 {lk['days']:g} 天" if lk else "") if x))
     return res
 
 
@@ -427,3 +450,202 @@ def apply_pending_offline() -> int:
               "已下线", f"由 {by} 发起")
         n += 1
     return n
+
+
+# ---------------------------------------------------------------------------
+# 晋级规则：锁定版本 / 晋级需人工确认 / 待确认队列
+#
+# 优先级（从高到低）：
+#   1. 用户的手动操作（部署此版本、批准 / 拒绝）随时有效；
+#   2. 手动部署后该策略自动锁定 N 天（promotion_config.manual_lock_days，默认 7，0 = 不锁）；
+#      用户也可以手动打开 / 关闭「锁定版本」（手动锁定不设到期时间）；
+#   3. 锁定中，或开启了全局「晋级需人工确认」：进化照常生成候选、跑挑战者前向测试，
+#      但胜出者不自动晋级，只进入待确认队列（evolve_challengers.status = 'awaiting'）；
+#   4. 否则维持原有自动晋级。任何切换都只在该策略空仓且没有未完成订单时生效。
+# ---------------------------------------------------------------------------
+
+PROMO_DEFAULTS = {"require_confirm": False, "manual_lock_days": 7}
+
+
+def promotion_config() -> dict:
+    c = dict(PROMO_DEFAULTS)
+    saved = db.get_setting("promotion_config") or {}
+    if "require_confirm" not in saved:   # 兼容旧设置：进化页「通过检验后自动替换」关闭 = 需要人工确认
+        from . import evolve
+        c["require_confirm"] = not bool(evolve.get_config().get("auto_apply", True))
+    c.update(saved)
+    return c
+
+
+def set_promotion_config(*, actor: str | None, role: str | None, require_confirm: bool | None = None,
+                         manual_lock_days: float | None = None) -> dict:
+    from . import evolve
+    require_role(role)
+    c = promotion_config()
+    before = dict(c)
+    if require_confirm is not None:
+        c["require_confirm"] = bool(require_confirm)
+        evolve.set_config(auto_apply=not bool(require_confirm))   # 保持旧开关一致
+    if manual_lock_days is not None:
+        if not 0 <= float(manual_lock_days) <= 365:
+            raise ValueError("锁定天数需在 0~365 之间")
+        c["manual_lock_days"] = float(manual_lock_days)
+    db.set_setting("promotion_config", c)
+    if c != before:
+        audit(actor, role, "修改晋级规则", None, None, None, None, None, "已保存",
+              f"晋级需人工确认：{'开' if c['require_confirm'] else '关'}；手动部署后锁定 {c['manual_lock_days']:g} 天")
+    return c
+
+
+def lock_state(dep: dict | None) -> dict | None:
+    """有效的版本锁：{"until": iso|None, "kind": manual_deploy|manual, "by", "at"}；过期或没有时返回 None。"""
+    if not dep:
+        return None
+    lk = (dep.get("config") or {}).get("version_lock")
+    if not lk:
+        return None
+    if lk.get("until"):
+        import pandas as pd
+        if pd.Timestamp(lk["until"]) <= pd.Timestamp.now(tz="UTC"):
+            return None
+    return lk
+
+
+def promotion_block(dep: dict | None) -> str | None:
+    """这个部署的挑战者 / 进化结果现在能否自动晋级：能 → None；不能 → 原因（进入待确认队列）。"""
+    if promotion_config().get("require_confirm"):
+        return "已开启「晋级需人工确认」"
+    lk = lock_state(dep)
+    if lk:
+        if lk.get("until"):
+            import pandas as pd
+            bj = (pd.Timestamp(lk["until"]) + pd.Timedelta(hours=8)).strftime("%m-%d %H:%M")
+            return f"版本已锁定至 {bj}（北京时间）"
+        return "版本已手动锁定"
+    return None
+
+
+def _set_lock(dep: dict, lock: dict | None) -> None:
+    from .paper import runner as pr
+    d = pr.get_deployment(dep["id"])
+    cfg = d["config"]
+    if lock:
+        cfg["version_lock"] = lock
+    else:
+        cfg.pop("version_lock", None)
+    _save_cfg(d["id"], cfg)
+
+
+def set_lock(key: str, on: bool, *, actor: str | None, role: str | None, broker: str = "alpaca_paper") -> dict:
+    """手动打开 / 关闭「锁定版本」。打开 = 不设到期时间；关闭 = 清除任何锁（包括手动部署后的自动锁定）。"""
+    from .paper import runner as pr
+    require_role(role)
+    dep = active_deployment(key, broker)
+    if not dep:
+        raise ValueError("该策略没有运行中的部署，无法锁定")
+    if on:
+        _set_lock(dep, {"until": None, "kind": "manual", "by": actor or "用户", "at": db.now_iso()})
+        pr.event(dep["id"], "INFO", f"策略总台：{actor or '用户'} 锁定版本，自动进化不会自动替换", bool(dep["is_test"]))
+        audit(actor, role, "锁定版本", key, dep["config"].get("label"), dep["id"], dep["version_id"], None, "已锁定")
+        return {"result": "已锁定", "message": "已锁定：挑战者胜出后会进入待确认队列"}
+    _set_lock(dep, None)
+    pr.event(dep["id"], "INFO", f"策略总台：{actor or '用户'} 解除版本锁定", bool(dep["is_test"]))
+    audit(actor, role, "解除锁定", key, dep["config"].get("label"), dep["id"], dep["version_id"], None, "已解除")
+    return {"result": "已解除", "message": "已解除锁定：恢复自动晋级规则"}
+
+
+def lock_after_manual_deploy(did: int, actor: str | None) -> dict | None:
+    days = float(promotion_config().get("manual_lock_days") or 0)
+    if days <= 0:
+        return None
+    from datetime import datetime, timedelta, timezone
+    until = (datetime.now(timezone.utc) + timedelta(days=days)).replace(microsecond=0).isoformat()
+    lock = {"until": until, "kind": "manual_deploy", "by": actor or "用户", "at": db.now_iso(), "days": days}
+    _set_lock({"id": did}, lock)
+    return lock
+
+
+def awaiting(limit: int = 50) -> list[dict]:
+    """待确认队列（BTC 挑战者 / 进化结果 + 美股 ETF 参数）。"""
+    from . import challenger
+    challenger.ensure_tables()
+    rows = db.q("SELECT * FROM evolve_challengers WHERE status='awaiting' ORDER BY id DESC LIMIT ?", (limit,))
+    for r in rows:
+        for k in ("candidate_json", "train_json", "last_eval_json", "champion_params"):
+            r[k[:-5] if k.endswith("_json") else k] = json.loads(r[k]) if r.get(k) else None
+    return rows
+
+
+def _expire_awaiting(did: int, reason: str) -> int:
+    from . import challenger
+    challenger.ensure_tables()
+    rows = db.q("SELECT id FROM evolve_challengers WHERE kind='btc' AND deployment_id=? AND status='awaiting'", (did,))
+    for r in rows:
+        db.ex("UPDATE evolve_challengers SET status='expired', decided_at=?, reason=? WHERE id=?",
+              (db.now_iso(), reason[:480], r["id"]))
+    return len(rows)
+
+
+def approve(ch_id: int, *, actor: str | None, role: str | None) -> dict:
+    """批准待确认的晋级：BTC → 冻结新版本并登记切换（空仓才生效）；ETF → 改用新参数。"""
+    from . import challenger, research
+    from .paper import etf_trend
+    from .paper import runner as pr
+    from .strategy import registry
+    require_role(role)
+    ch = db.q1("SELECT * FROM evolve_challengers WHERE id=?", (int(ch_id),))
+    if not ch or ch["status"] != "awaiting":
+        raise ValueError("这条记录不在待确认队列中")
+    if ch["kind"] == "etf":
+        champ, cand = json.loads(ch["champion_params"]), json.loads(ch["candidate_json"])
+        cfg = etf_trend.get_config()
+        if int(cfg["sma"]) != champ["sma"] or abs(float(cfg["band"]) - champ["band"]) > 1e-9:
+            challenger._close(ch, "expired", "现役参数已变化，待确认的挑战者作废")
+            audit(actor, role, "批准晋级", "etf", "美股 ETF 择时", None, None, None, "已作废", "现役参数已变化")
+            raise ValueError("现役参数已变化，这个挑战者已作废")
+        db.set_setting("etf_trend_config", dict(db.get_setting("etf_trend_config") or {}, sma=cand["sma"], band=cand["band"]))
+        challenger._close(ch, "promoted", f"{actor or '用户'} 批准晋级：{ch['reason'] or ''}")
+        pr.event(None, "INFO", f"[ETF趋势] {actor or '用户'} 批准挑战者 #{ch['id']}，参数改为 {cand['sma']} 日均线 ±{cand['band']:.0%}")
+        audit(actor, role, "批准晋级", "etf", "美股 ETF 择时", None, None, None, "已晋级",
+              f"#{ch['id']}：{champ['sma']}/{champ['band']} → {cand['sma']}/{cand['band']}")
+        return {"result": "已晋级", "message": f"美股 ETF 参数已改为 {cand['sma']} 日均线 ±{cand['band']:.0%}"}
+    dep = pr.get_deployment(ch["deployment_id"])
+    key = _dep_key(dep) if dep else None
+    if not dep or dep["status"] not in ("running", "paused_entries"):
+        challenger._close(ch, "expired", "部署已停止，待确认的挑战者作废")
+        audit(actor, role, "批准晋级", key, ch["label"], ch["deployment_id"], None, None, "已作废", "部署已停止")
+        raise ValueError("该策略已停止，这个挑战者已作废")
+    if dep["version_id"] != ch["champion_version_id"]:
+        challenger._close(ch, "expired", "现役版本已变化，待确认的挑战者作废")
+        audit(actor, role, "批准晋级", key, ch["label"], dep["id"], dep["version_id"], None, "已作废", "现役版本已变化")
+        raise ValueError("现役版本已经变化，这个挑战者已作废")
+    champ = registry.get_version(dep["version_id"])
+    cand = json.loads(ch["candidate_json"])
+    rr = dict(research.get_research(), source="test") if ch["is_test"] else research.get_research()
+    msg = challenger._promote_btc(ch, dep, champ, cand, None, rr, f"{actor or '用户'} 批准（{ch['reason'] or ''}）"[:400])
+    now = pr.get_deployment(dep["id"])
+    new_vid = db.q1("SELECT new_version_id FROM evolve_challengers WHERE id=?", (ch["id"],))["new_version_id"]
+    switched = now["version_id"] == new_vid
+    res = {"result": "已晋级" if switched else "已批准，等待空仓后切换",
+           "message": msg + ("" if switched else "；该策略空仓且没有未完成订单时切换")}
+    audit(actor, role, "批准晋级", key, champ["name"], dep["id"], champ["id"], new_vid, res["result"], f"挑战者 #{ch['id']}")
+    return res
+
+
+def reject(ch_id: int, reason: str, *, actor: str | None, role: str | None) -> dict:
+    from . import challenger
+    from .paper import runner as pr
+    require_role(role)
+    reason = (reason or "").strip()
+    if not reason:
+        raise ValueError("请填写拒绝原因")
+    ch = db.q1("SELECT * FROM evolve_challengers WHERE id=?", (int(ch_id),))
+    if not ch or ch["status"] != "awaiting":
+        raise ValueError("这条记录不在待确认队列中")
+    challenger._close(ch, "rejected", f"{actor or '用户'} 拒绝：{reason}")
+    dep = pr.get_deployment(ch["deployment_id"]) if ch["deployment_id"] else None
+    pr.event(ch["deployment_id"], "INFO", f"{actor or '用户'} 拒绝挑战者 #{ch['id']}：{reason}"[:480],
+             bool(ch["is_test"]))
+    audit(actor, role, "拒绝晋级", _dep_key(dep) if dep else ("etf" if ch["kind"] == "etf" else None), ch["label"],
+          ch["deployment_id"], ch["champion_version_id"], None, "已淘汰", f"挑战者 #{ch['id']}：{reason}")
+    return {"result": "已淘汰", "message": f"挑战者 #{ch['id']} 已淘汰"}

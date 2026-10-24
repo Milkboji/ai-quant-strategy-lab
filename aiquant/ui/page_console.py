@@ -41,20 +41,19 @@ def _price() -> float | None:
 def render() -> None:
     from .login import effective_user, role
     rows = console.rows(price=_price())
-    st.markdown('<div class="aq-title">策略总台</div>'
-                '<div class="aq-sub">每个策略一行：实验室最新版本与模拟盘运行版本是否一致、挑战者进度、持仓和资金权重。'
-                '<b>手动保存的新版本不会替换运行中的版本，需要在这里确认部署</b>；换版本和下线都只在该策略空仓、'
-                '没有未完成订单时生效，否则先等待空仓。</div>', unsafe_allow_html=True)
+    st.markdown('<div class="aq-title">策略总台</div>', unsafe_allow_html=True)
+    _rules_panel(effective_user(), role())
     show_flash("console")
     n_run = sum(1 for r in rows if r["status"] in ("运行中", "暂停中"))
     n_mis = sum(1 for r in rows if r["mismatch"])
     n_ch = sum(1 for r in rows if r["challenger"])
-    n_pend = sum(1 for r in rows if r["pending"] or r["pending_offline"])
+    n_pend = len(console.awaiting())
     cells = [("策略总数", f"{len(rows)}", ""), ("模拟盘运行中", f"{n_run}", ""),
-             ("版本不一致", f"{n_mis}", "color:#EA8A0C" if n_mis else ""), ("挑战者 / 待生效", f"{n_ch} / {n_pend}", "")]
+             ("版本不一致", f"{n_mis}", "color:#EA8A0C" if n_mis else ""), ("挑战者 / 待确认", f"{n_ch} / {n_pend}", "color:#7C3AED" if n_pend else "")]
     st.markdown('<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px;margin:6px 0 10px">'
                 + "".join(f'<div class="aq-m"><div class="l">{C.esc(l)}</div><div class="n" style="font-size:22px;{s}">'
                           f'{C.esc(v)}</div></div>' for l, v, s in cells) + "</div>", unsafe_allow_html=True)
+    _queue_panel(effective_user(), role())
     _deploy_all_bar(effective_user(), role())
     focus = st.session_state.pop("console_focus", None)
     for r in rows:
@@ -87,6 +86,10 @@ def _card(r: dict, actor: str, rl: str, focus: bool) -> None:
             pills += " " + C.pill("等待空仓后切换", "purple")
         if r["pending_offline"]:
             pills += " " + C.pill("等待空仓后下线", "orange")
+        if r["lock"]:
+            pills += " " + C.pill("已锁定", "blue")
+        if r["awaiting"]:
+            pills += " " + C.pill("挑战者胜出，等待确认", "purple")
         if focus:
             pills += " " + C.pill("刚从实验室跳转", "blue")
         st.markdown(f'<div class="aq-slothead"><div><span class="aq-slotname">{C.esc(r["name"])}</span> '
@@ -122,8 +125,12 @@ def _card(r: dict, actor: str, rl: str, focus: bool) -> None:
                 cv, mv = ch.get("challenger") or {}, ch.get("champion") or {}
                 if cv and mv:
                     st.caption(f"前向收益：挑战者 {cv.get('return_pct', 0):+.2f}% · 现役 {mv.get('return_pct', 0):+.2f}%")
-            else:
+            elif not r["awaiting"]:
                 st.markdown(C.kv([("挑战者", "无")]), unsafe_allow_html=True)
+            if r["awaiting"]:
+                a = r["awaiting"]
+                st.markdown(f'<div class="aq-sub" style="color:#6D28D9">挑战者 #{a["id"]} 胜出，等待确认：'
+                            f'{C.esc(a["change"] or "")}。请在上方「待确认」里批准或拒绝。</div>', unsafe_allow_html=True)
         with cols[2]:
             st.markdown(C.kv([("持仓", f"{r['qty']:.6f} BTC" if dep else "--"),
                               ("市值", C.usd(r["value"]) if dep and r["value"] is not None else "--"),
@@ -138,8 +145,30 @@ def _card(r: dict, actor: str, rl: str, focus: bool) -> None:
                                            for k, a, b in r["diff"]]), hide_index=True, use_container_width=True)
 
 
+def _lock_toggle(r: dict, actor: str, rl: str) -> None:
+    key, lk = r["key"], r["lock"]
+    if lk and lk.get("until"):
+        why = ("手动部署后自动锁定" if lk.get("kind") == "manual_deploy" else "已锁定") + f"，至 {_bj(lk['until'])}"
+    elif lk:
+        why = f"{lk.get('by') or ''} 手动锁定，不会自动到期"
+    else:
+        why = "未锁定：挑战者胜出后按规则自动晋级" if not r["block"] else f"未锁定（{r['block']}）"
+    on = st.toggle("锁定版本", value=bool(lk), key=f"cs_lock_{key}", help="锁定后，自动进化仍会生成并前向测试挑战者，"
+                   "但胜出后不会自动替换，只进入待确认队列")
+    st.caption(why)
+    if on != bool(lk):
+        try:
+            res = console.set_lock(key, on, actor=actor, role=rl)
+            flash("console", "ok", f"{r['name']}：{res['message']}")
+        except Exception as e:  # noqa: BLE001
+            flash("console", "err", f"{r['name']}：{e}")
+        st.rerun()
+
+
 def _actions(r: dict, actor: str, rl: str) -> None:
     key = r["key"]
+    if r["deployment"]:
+        _lock_toggle(r, actor, rl)
     vs = console.versions_of(key)
     if not vs:
         st.caption("还没有可部署的版本")
@@ -199,3 +228,76 @@ def _audit_panel() -> None:
                                     "结果": x["result"], "说明": x["detail"] or ""} for x in log]),
                      hide_index=True, use_container_width=True)
         st.caption(f"更新时间 {datetime.now(BJ):%m-%d %H:%M} 北京时间")
+
+
+def _rules_panel(actor: str, rl: str) -> None:
+    pc = console.promotion_config()
+    days = float(pc["manual_lock_days"])
+    rc = bool(pc["require_confirm"])
+    lock_txt = (f"你手动部署某个版本后，这个策略会自动锁定 <b>{days:g} 天</b>" if days > 0
+                else "手动部署后不自动锁定（锁定天数设为 0）")
+    rules = [
+        "<b>你说了算</b>：实验室保存新版本不会替换模拟盘正在跑的版本，只有你在这里点「部署此版本」才会换。",
+        f"<b>手动部署优先</b>：{lock_txt}，期间自动进化不会把它换掉。你也可以随时打开或关闭每个策略的「锁定版本」。",
+        "<b>锁定时</b>：自动进化照常找更好的版本、照常让挑战者在实时行情上跑前向测试；但挑战者赢了也不会自动上线，"
+        "只标记为「挑战者胜出，等待确认」，由你批准或拒绝。",
+        "<b>没锁定时</b>：维持原来的规则，挑战者通过检验后自动晋级。" + " " +
+        ("<b>当前已开启「晋级需人工确认」：所有策略（包括美股 ETF）的晋级都要你确认。</b>" if rc
+         else "如果开启「晋级需人工确认」，所有策略（包括美股 ETF）的晋级都要你确认。"),
+        "<b>批准 / 拒绝</b>：批准后按正常流程上线；拒绝的挑战者会被淘汰并记下原因。现役版本换过之后，旧的待确认挑战者自动作废。",
+        "<b>何时生效</b>：任何换版本（手动部署、批准晋级、自动晋级）和下线，都只在这个策略空仓、没有未完成订单时生效，"
+        "否则先等待空仓。",
+    ]
+    with st.container(border=True):
+        C.section("晋级与部署规则", purple=True,
+                  right=C.pill("晋级需人工确认：开" if rc else "自动晋级（锁定的策略除外）", "purple" if rc else "gray"))
+        st.markdown('<ol class="aq-sub" style="margin:2px 0 6px 18px;padding:0;line-height:1.75">'
+                    + "".join(f"<li>{x}</li>" for x in rules) + "</ol>", unsafe_allow_html=True)
+        c = st.columns([1.2, 1, 0.8, 2])
+        new_rc = c[0].toggle("晋级需人工确认", value=rc, key="cs_rc")
+        new_days = c[1].number_input("手动部署后锁定天数", min_value=0, max_value=365, value=int(round(days)), step=1,
+                                     key="cs_days", help="0 = 手动部署后不自动锁定")
+        if c[2].button("保存规则", key="cs_rules_save", use_container_width=True):
+            try:
+                console.set_promotion_config(actor=actor, role=rl, require_confirm=new_rc, manual_lock_days=new_days)
+                flash("console", "ok", "规则已保存")
+            except Exception as e:  # noqa: BLE001
+                flash("console", "err", str(e))
+            st.rerun()
+        c[3].caption("「晋级需人工确认」与策略进化页的同名开关是同一个设置。")
+
+
+def _queue_panel(actor: str, rl: str) -> None:
+    q = console.awaiting()
+    if not q:
+        return
+    with st.container(border=True):
+        C.section(f"待确认：{len(q)} 个胜出的挑战者", purple=True)
+        for ch in q:
+            cols = st.columns([3, 1.6])
+            ev = ch.get("last_eval") or {}
+            cv, mv = ev.get("challenger") or {}, ev.get("champion") or {}
+            extra = (f"前向：挑战者 {cv.get('return_pct', 0):+.2f}% · 现役 {mv.get('return_pct', 0):+.2f}%"
+                     if cv and mv else "")
+            name = "美股 ETF 择时" if ch["kind"] == "etf" else (ch["label"] or f"部署 #{ch['deployment_id']}")
+            cols[0].markdown(f'<div><b>#{ch["id"]} · {C.esc(name)}</b> <span class="aq-meta">{_bj(ch["decided_at"])}</span></div>'
+                             f'<div class="aq-sub">改动：{C.esc(ch["change"] or "--")}</div>'
+                             f'<div class="aq-sub">{C.esc(ch["reason"] or "")}</div>'
+                             + (f'<div class="aq-sub">{C.esc(extra)}</div>' if extra else ""), unsafe_allow_html=True)
+            with cols[1]:
+                b = st.columns(2)
+                if b[0].button("批准", key=f"cs_ap_{ch['id']}", type="primary", use_container_width=True):
+                    try:
+                        res = console.approve(ch["id"], actor=actor, role=rl)
+                        flash("console", "ok", res["message"])
+                    except Exception as e:  # noqa: BLE001
+                        flash("console", "err", str(e))
+                    st.rerun()
+                reason = st.text_input("拒绝原因", key=f"cs_rr_{ch['id']}", placeholder="例如：回撤太大")
+                if b[1].button("拒绝", key=f"cs_rj_{ch['id']}", use_container_width=True):
+                    try:
+                        res = console.reject(ch["id"], reason, actor=actor, role=rl)
+                        flash("console", "ok", res["message"])
+                    except Exception as e:  # noqa: BLE001
+                        flash("console", "err", str(e))
+                    st.rerun()
