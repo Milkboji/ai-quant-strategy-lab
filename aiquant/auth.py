@@ -40,13 +40,13 @@ LOCAL_USER = "本机"
 ROLES = {"admin": "管理员", "trader": "交易员", "viewer": "观察员"}
 ROLE_DESC = {"admin": "全部功能，可管理用户和系统设置",
              "trader": "全部交易与研究功能，不能管理用户和系统设置",
-             "viewer": "只读：总览、看盘、布林带、模拟盘与进化记录"}
+             "viewer": "只读：总览、策略总台、看盘、布林带、模拟盘与进化记录"}
 # 每个角色可见的页面（与 app.py 中的页面 key 对应）
 ROLE_PAGES = {
-    "admin": {"home", "live", "boll", "paper", "evolve", "lab", "versions", "history", "data", "settings",
+    "admin": {"home", "console", "live", "boll", "paper", "evolve", "lab", "versions", "history", "data", "settings",
               "account", "users"},
-    "trader": {"home", "live", "boll", "paper", "evolve", "lab", "versions", "history", "data", "account"},
-    "viewer": {"home", "live", "boll", "paper", "evolve", "account"},   # 观察员：页面只读（按钮全部禁用）
+    "trader": {"home", "console", "live", "boll", "paper", "evolve", "lab", "versions", "history", "data", "account"},
+    "viewer": {"home", "console", "live", "boll", "paper", "evolve", "account"},   # 观察员：页面只读（按钮全部禁用）
 }
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_.\-一-鿿]{2,32}$")
 

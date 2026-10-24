@@ -19,6 +19,7 @@ i18n.init_from_request()  # ?lang=en / Cookie / 浏览器语言
 from aiquant.ui import style, common  # noqa: E402
 from aiquant.ui import page_lab, page_paper, page_versions, page_history, page_data, page_settings  # noqa: E402
 from aiquant.ui import page_live, page_evolve, page_home, page_bollinger, page_account, page_users  # noqa: E402
+from aiquant.ui import page_console  # noqa: E402
 
 actions.init()
 style.inject()
@@ -29,6 +30,7 @@ if not login.gate():   # 外网访问必须登录（本机默认免登录）
 
 pages = {
     "home": st.Page(page_home.render, title="总览", icon="🏠", url_path="home", default=True),
+    "console": st.Page(page_console.render, title="策略总台", icon="🎛️", url_path="console"),
     "live": st.Page(page_live.render, title="实时看盘", icon="📈", url_path="live"),
     "boll": st.Page(page_bollinger.render, title="布林带", icon="📊", url_path="bollinger"),
     "paper": st.Page(page_paper.render, title="模拟盘交易", icon="💹", url_path="paper"),
@@ -47,7 +49,7 @@ st.session_state["_pages"] = pages
 from aiquant import auth  # noqa: E402
 allowed = auth.ROLE_PAGES[login.role()]
 groups = {
-    "": ("home", "live", "boll", "paper", "evolve"),
+    "": ("home", "console", "live", "boll", "paper", "evolve"),
     "研究与设置": ("lab", "versions", "history", "data", "settings"),
     "账号": ("account", "users"),
 }

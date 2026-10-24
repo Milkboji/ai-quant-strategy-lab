@@ -59,6 +59,12 @@ def tick(now: datetime | None = None) -> list[dict]:
             deps = _active()
     except Exception:  # noqa: BLE001
         log.error("evolve switch error: %s", traceback.format_exc())
+    try:   # 策略总台：待下线的策略空仓后停止
+        from .. import console
+        if console.apply_pending_offline():
+            deps = _active()
+    except Exception:  # noqa: BLE001
+        log.error("console offline error: %s", traceback.format_exc())
     for d in deps:
         try:
             run = _runners.get(d["id"])

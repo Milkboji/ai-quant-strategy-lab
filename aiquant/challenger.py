@@ -318,7 +318,8 @@ def _promote_btc(ch, dep, champ, cand, fwd_eval, rr, why) -> str:
         db.set_setting(f"preset_current::{champ['name']}", nv["id"])
     _close(ch, "promoted", "前向表现不差于现役，晋级上线：" + why, nv["id"])
     tf = int(cand.get("signal_tf") or 15)
-    evolve.schedule_switch(dep["id"], nv["id"], tf, cand.get("aux_tf"), f"挑战者#{ch['id']}晋级：{why}")
+    evolve.schedule_switch(dep["id"], nv["id"], tf, cand.get("aux_tf"), f"挑战者#{ch['id']}晋级：{why}",
+                           trigger="challenger")
     return f"#{ch['id']} 晋级 → {registry.label(nv)}"
 
 

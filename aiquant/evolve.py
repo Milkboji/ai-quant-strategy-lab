@@ -443,17 +443,22 @@ def _record_validation_touch(cur: dict, ho: dict) -> None:
 # 模拟盘切换（空仓时立即切换；有持仓时等平仓）
 # ---------------------------------------------------------------------------
 
-def schedule_switch(did: int, vid: int, tf: int, aux: int | None, reason: str) -> None:
+def schedule_switch(did: int, vid: int, tf: int, aux: int | None, reason: str,
+                    trigger: str = "evolve", actor: str | None = None) -> None:
+    """登记待切换版本（自动进化 / 挑战者晋级 / 策略总台手动部署共用）：空仓且无未完成订单时才生效。"""
     from .paper import runner as pr
     d = db.q1("SELECT * FROM paper_deployments WHERE id=?", (did,))
     cfg = json.loads(d["config_json"])
     cfg["pending_switch"] = {"version_id": vid, "signal_tf": tf, "aux_tf": aux, "reason": reason,
-                             "at": db.now_iso()}
+                             "at": db.now_iso(), "trigger": trigger, "actor": actor}
     db.ex("UPDATE paper_deployments SET config_json=?, updated_at=? WHERE id=?",
           (json.dumps(cfg, ensure_ascii=False), db.now_iso(), did))
     v = registry.get_version(vid)
-    pr.event(did, "INFO", f"自动进化：新版本 {registry.label(v)} 已通过检验，等待空仓时切换（{reason}）"[:480],
-             bool(d["is_test"]))
+    if trigger == "manual":
+        msg = f"手动部署：{registry.label(v)} 已确认，等待空仓且无未完成订单时切换（{reason}）"
+    else:
+        msg = f"自动进化：新版本 {registry.label(v)} 已通过检验，等待空仓时切换（{reason}）"
+    pr.event(did, "INFO", msg[:480], bool(d["is_test"]))
     apply_pending(did)
 
 
@@ -498,11 +503,21 @@ def apply_pending(did: int) -> bool:
     elif lbl:
         tf_cn = {15: "15分钟", 30: "30分钟", 60: "1小时", 240: "4小时", 1440: "日线"}.get(p["signal_tf"], "")
         cfg["label"] = f"{new['name']} v{new['version_no']}（{tf_cn}）"
-    cfg.setdefault("evolve_history", []).append({"from": old["id"], "to": new["id"], "at": db.now_iso()})
+    trig = p.get("trigger") or "evolve"
+    cfg.setdefault("evolve_history", []).append({"from": old["id"], "to": new["id"], "at": db.now_iso(),
+                                                 "trigger": trig})
     db.ex("UPDATE paper_deployments SET version_id=?, config_json=?, updated_at=? WHERE id=?",
           (new["id"], json.dumps(cfg, ensure_ascii=False), db.now_iso(), did))
-    pr.event(did, "INFO", f"自动进化：已切换 {registry.label(old)} → {registry.label(new)}，"
+    head = "手动部署" if trig == "manual" else "自动进化"
+    pr.event(did, "INFO", f"{head}：已切换 {registry.label(old)} → {registry.label(new)}，"
                           f"K线周期 {p['signal_tf']} 分钟", bool(d["is_test"]))
+    try:   # 结构化切换记录（策略总台审计）
+        from . import console
+        console.audit(p.get("actor") or "系统", "", "切换生效", console.key_of_version(new) or cfg.get("strategy_key"),
+                      new["name"], did, old["id"], new["id"], "已切换",
+                      f"{console.TRIGGER_CN.get(trig, trig)}：{p.get('reason') or ''}")
+    except Exception:  # noqa: BLE001
+        log.exception("switch audit failed")
     return True
 
 
@@ -533,6 +548,7 @@ def run(job: dict, stage, should_stop) -> int:
         db.set_setting("evolve_last_run", {"at": db.now_iso(), "run_id": rid, "status": "running"})
     deps = db.q("SELECT * FROM paper_deployments WHERE status IN ('running','paused_entries') AND is_test=? "
                 "ORDER BY id", (is_test,))
+    deps = [d for d in deps if not json.loads(d["config_json"] or "{}").get("pending_offline")]   # 待下线的不再进化
     r = research.get_research()
     if is_test:
         r = dict(r, source="test")
@@ -735,6 +751,8 @@ def health_check(price: float | None = None) -> list[str]:
     for d in db.q("SELECT id FROM paper_deployments WHERE status IN ('running','paused_entries')"):
         dep = pr.get_deployment(d["id"])
         cfg = dep["config"]
+        if cfg.get("pending_offline"):   # 策略总台已下线、等待空仓：不自动恢复 / 暂停
+            continue
         ap = cfg.get("auto_pause")
         # 用户手动恢复了被自动暂停的策略：记住这个版本，不再反复暂停
         if dep["status"] == "running" and ap:

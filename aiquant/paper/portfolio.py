@@ -37,17 +37,25 @@ def preset_version(key: str) -> dict:
                            new_lineage=True, set_current=False)
 
 
-def targets() -> list[dict]:
+def targets(include_offline: bool = False) -> list[dict]:
+    """组合目标：每个策略位的实验室当前版本 + 3 个实时预设。在策略总台下线的策略默认不在其中。"""
+    from .. import console
     out = []
     for slot in registry.all_slots():
         if slot["current_version_id"]:
             v = registry.get_version(slot["current_version_id"])
-            out.append({"version": v, "label": f"策略位{slot['slot_no']}·{v['name']} v{v['version_no']}"})
-    for key in sim.PRESETS:
-        v = preset_version(key)
+            key = f"slot:{slot['slot_no']}"
+            if not include_offline and console.is_offline(key):
+                continue
+            out.append({"version": v, "key": key, "label": f"策略位{slot['slot_no']}·{v['name']} v{v['version_no']}"})
+    for pk in sim.PRESETS:
+        v = preset_version(pk)
+        key = f"preset:{v['name']}"
+        if not include_offline and console.is_offline(key):
+            continue
         tf = int(v["schema"].get("signal_tf") or PRESET_TF_MIN)
         tf_cn = {15: "15分钟", 30: "30分钟", 60: "1小时", 240: "4小时", 1440: "日线"}.get(tf, f"{tf}分钟")
-        out.append({"version": v, "label": f"{v['name']}（{tf_cn}）" if v["version_no"] == 1
+        out.append({"version": v, "key": key, "label": f"{v['name']}（{tf_cn}）" if v["version_no"] == 1
                     else f"{v['name']} v{v['version_no']}（{tf_cn}）"})
     return out
 
@@ -71,17 +79,48 @@ def submit_missing_backtests() -> list[str]:
     return msgs
 
 
-def deploy_all(reserve_pct: float = 4.0) -> list[str]:
-    """为全部目标策略创建/更新 Alpaca Paper 部署并启动。返回逐条结果。"""
+def deploy_all(reserve_pct: float = 4.0, *, actor: str | None = None, role: str | None = "admin") -> list[str]:
+    """为全部目标策略创建部署并启动；已有部署的策略只更新资金额度。返回逐条结果。
+
+    默认行为：实验室手动保存的新版本不会替换运行中的版本 —— 已在运行的策略保持原版本、原标签、原K线周期，
+    结果里提示到「策略总台」确认部署。在总台下线的策略不会被重新部署。
+    """
+    from .. import console
+    console.require_role(role)
     acct = AlpacaPaperAdapter().account()
     if acct is None:
         raise RuntimeError("无法读取 Alpaca Paper 账户")
     ts = targets()
+    if not ts:
+        return ["没有需要部署的策略（全部已在策略总台下线）"]
     budget = int(acct.equity * (1 - reserve_pct / 100) / len(ts) // 100 * 100)
     out = []
     # 先把现有运行中的部署更新为带额度的组合成员，避免额度校验冲突
     for t in ts:
         v = t["version"]
+        # 同一策略（含自动进化产生的新版本、待切换版本）只保留一个部署
+        ex = console.active_deployment(t["key"])
+        if ex is None:
+            ex = db.q1("SELECT d.* FROM paper_deployments d JOIN strategy_versions sv ON sv.id=d.version_id "
+                       "WHERE d.broker='alpaca_paper' AND sv.lineage_id=? "
+                       "AND d.status IN ('configured','running','paused_entries') ORDER BY d.id DESC LIMIT 1",
+                       (v["lineage_id"],))
+            if ex:
+                ex = pr.get_deployment(ex["id"])
+        if ex:
+            cfg = ex["config"]
+            cfg.update({"budget_usd": budget, "alloc_pct": 100, "portfolio": True, "strategy_key": t["key"]})
+            cfg.setdefault("stop_mode", "keep")
+            db.ex("UPDATE paper_deployments SET config_json=?, updated_at=? WHERE id=?",
+                  (json.dumps(cfg, ensure_ascii=False), db.now_iso(), ex["id"]))
+            did = ex["id"]
+            pr.event(did, "INFO", f"加入策略组合，资金额度 {budget:,} USD")
+            if ex["version_id"] != v["id"]:
+                run = registry.get_version(ex["version_id"])
+                out.append(f"ℹ {t['label']}：实验室有新版本，运行中的仍是 {registry.label(run)}，"
+                           f"未自动替换（请在策略总台确认部署）")
+            t["did"] = did
+            continue
         ok, checks = pr.deploy_gate(v["id"])
         if not ok:
             out.append(f"✗ {t['label']}：门禁未通过（" + "；".join(f"{n}" for n, p, _ in checks if not p) + "）")
@@ -89,22 +128,9 @@ def deploy_all(reserve_pct: float = 4.0) -> list[str]:
         b = (research.latest_backtest_for_version(v["id"], kind_split="训练集")
              or research.latest_backtest_for_version(v["id"]))
         cfg = {"label": t["label"], "budget_usd": budget, "alloc_pct": 100, "signal_tf": b["signal_tf"],
-               "aux_tf": b["aux_tf"], "portfolio": True, "stop_mode": "keep"}
-        # 同一谱系（含自动进化产生的新版本、待切换版本）只保留一个部署
-        ex = db.q1("SELECT d.* FROM paper_deployments d JOIN strategy_versions sv ON sv.id=d.version_id "
-                   "WHERE d.broker='alpaca_paper' AND sv.lineage_id=? "
-                   "AND d.status IN ('configured','running','paused_entries') ORDER BY d.id DESC LIMIT 1",
-                   (v["lineage_id"],))
-        if ex:
-            old = json.loads(ex["config_json"])
-            old.update(cfg)
-            db.ex("UPDATE paper_deployments SET config_json=?, updated_at=? WHERE id=?",
-                  (json.dumps(old, ensure_ascii=False), db.now_iso(), ex["id"]))
-            did = ex["id"]
-            pr.event(did, "INFO", f"加入策略组合，资金额度 {budget:,} USD")
-        else:
-            did = pr.save_deployment(v["id"], cfg, "alpaca_paper")
-        t["did"] = did
+               "aux_tf": b["aux_tf"], "portfolio": True, "stop_mode": "keep", "strategy_key": t["key"]}
+        t["did"] = pr.save_deployment(v["id"], cfg, "alpaca_paper")
+        t["new"] = True
     for t in ts:
         if "did" not in t:
             continue
@@ -115,8 +141,12 @@ def deploy_all(reserve_pct: float = 4.0) -> list[str]:
         try:
             pr.start(t["did"])
             out.append(f"✓ {t['label']}：已启动（部署 #{t['did']}，额度 {budget:,} USD）")
+            console.audit(actor, role, "一键部署", t["key"], t["version"]["name"], t["did"], None, d["version_id"],
+                          "已启动")
         except Exception as e:  # noqa: BLE001
             out.append(f"✗ {t['label']}：{e}")
+            console.audit(actor, role, "一键部署", t["key"], t["version"]["name"], t["did"], None, d["version_id"],
+                          "启动失败", str(e))
     return out
 
 

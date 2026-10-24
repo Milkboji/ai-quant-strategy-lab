@@ -131,7 +131,8 @@ def test_pending_switch_waits_for_flat_position(evo_env):
     assert evolve.apply_pending(did)                 # 平仓后：切换
     d = pr.get_deployment(did)
     assert d["version_id"] == nv["id"] and "pending_switch" not in d["config"]
-    assert d["config"]["evolve_history"][-1] == {"from": old, "to": nv["id"], "at": d["config"]["evolve_history"][-1]["at"]}
+    h = d["config"]["evolve_history"][-1]
+    assert h == {"from": old, "to": nv["id"], "at": h["at"], "trigger": "evolve"}
 
 
 def test_schedule_due_logic(evo_env):

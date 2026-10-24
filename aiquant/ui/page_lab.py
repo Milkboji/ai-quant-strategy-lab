@@ -273,7 +273,8 @@ def ensure_frozen(n: int) -> tuple[bool, str]:
         v = registry.freeze(n, sch, nl_text=text, source="manual" if "DeepSeek" not in info.get("method", "") else "deepseek_parse")
     except registry.FreezeError as e:
         return False, f"校验失败：{e}"
-    return True, f"已冻结 {v['name']} v{v['version_no']}（{v['schema_hash'][:10]}）"
+    return True, (f"已冻结 {v['name']} v{v['version_no']}（{v['schema_hash'][:10]}）。"
+                  "模拟盘运行中的版本不会自动替换，需要在策略总台确认部署")
 
 
 def _on_text_change(n: int):
@@ -466,9 +467,10 @@ def slot_card(n: int, r: dict) -> None:
                 flash(f"slot{n}", "err", "无法部署：尚未冻结策略版本")
             else:
                 ok, checks = paper_runner.deploy_gate(cur["id"])
-                if ok:
-                    st.session_state["deploy_version"] = cur["id"]
-                    st.switch_page(st.session_state["_pages"]["paper"])
+                if ok:   # 在策略总台确认部署（运行中的版本不会被自动替换）
+                    st.session_state["console_focus"] = f"slot:{n}"
+                    st.session_state["console_pick::slot:" + str(n)] = cur["id"]
+                    st.switch_page(st.session_state["_pages"]["console"])
                 else:
                     flash(f"slot{n}", "err", "暂不能部署：" + "；".join(f"{nm}（{dt}）" for nm, p, dt in checks if not p))
             st.rerun()

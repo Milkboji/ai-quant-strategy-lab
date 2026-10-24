@@ -122,12 +122,14 @@ def portfolio_panel() -> None:
             st.rerun()
         if c[1].button("② 一键部署并启动全部策略", key="pf_go", type="primary", use_container_width=True):
             try:
-                res = pf.deploy_all()
+                from .login import effective_user, role
+                res = pf.deploy_all(actor=effective_user(), role=role())
                 flash("paper", "ok", " ｜ ".join(res))
             except Exception as e:  # noqa: BLE001
                 flash("paper", "err", str(e))
             st.rerun()
-        c[2].caption("资金额度按策略实力自动分配（每轮进化后调整）。已在运行的策略会被并入组合，不会重复部署。")
+        c[2].caption("资金额度按策略实力自动分配（每轮进化后调整）。已在运行的策略会被并入组合，不会重复部署，"
+                     "也不会被替换成实验室的新版本；单个策略的部署、换版本、下线请到「策略总台」。")
         portfolio_live()
     etf_panel()
     leverage_panel()
