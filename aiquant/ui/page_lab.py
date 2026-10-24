@@ -28,7 +28,7 @@ def _chart_data(bt_id: int):
     b = research.get_backtest(bt_id)
     try:
         return research.chart_data(b)
-    except (FileNotFoundError, OSError, ValueError):   # 数据快照文件缺失或损坏：不画图，页面其余部分照常显示
+    except Exception:   # noqa: BLE001  数据快照文件缺失、损坏或哈希不符：不画图，页面其余部分照常显示
         import pandas as pd
         return pd.DataFrame(), pd.DataFrame()
 
