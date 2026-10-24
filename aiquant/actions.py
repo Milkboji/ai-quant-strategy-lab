@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import logging
 import json
 import zipfile
 
@@ -41,6 +42,12 @@ def init() -> None:
             t = TEMPLATES[DEFAULT_SLOT_TEMPLATES[slot["slot_no"]]]
             registry.save_draft(slot["slot_no"], text=t["text"])
     jobs.ensure_worker()
+    try:   # 记录当前运行的代码版本；完成安全重启的收尾（恢复策略、记录“已更新到 commit xxx”）
+        from . import build, safe_restart
+        build.record_running()
+        safe_restart.on_startup()
+    except Exception:  # noqa: BLE001
+        logging.getLogger("aiquant").exception("build/safe restart startup failed")
     from .paper import service as paper_service
     paper_service.ensure_loop()
     from .live import sim as live_sim

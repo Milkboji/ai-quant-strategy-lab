@@ -50,6 +50,57 @@ def header() -> None:
         with b:
             switcher()
             logout_button()
+    update_banner()
+
+
+def update_banner() -> None:
+    """全站顶部：磁盘上有新代码待生效 / 安全重启进行中。管理员可发起安全重启。"""
+    try:
+        from .. import build, safe_restart
+        pu, sr = build.pending_update(), safe_restart.state()
+    except Exception:  # noqa: BLE001
+        return
+    if not pu and not sr:
+        return
+    from .login import effective_user, role
+    admin = role() == "admin"
+    if sr and sr.get("phase") in ("waiting", "restarting"):
+        if sr["phase"] == "waiting":
+            txt = (f"安全重启进行中：已暂停 {len(sr.get('paused') or [])} 个策略的新开仓，等待未完成订单结束"
+                   f"（现在 {sr.get('open_orders', 0)} 个，最长等待 {sr.get('max_wait_min', 30):g} 分钟），之后备份数据库并重启。"
+                   "守护进程每分钟检查一次。")
+        else:
+            txt = f"安全重启中：{sr.get('note') or ''}；系统正在重启，约 1 分钟后恢复，请稍后刷新页面。"
+        c = st.columns([5, 1], vertical_alignment="center")
+        c[0].markdown(f'<div class="aq-warn">🔄 {esc(txt)}</div>', unsafe_allow_html=True)
+        if admin and sr["phase"] == "waiting" and c[1].button("取消安全重启", key="sr_cancel", use_container_width=True):
+            try:
+                safe_restart.cancel(actor=effective_user(), role=role())
+            except Exception as e:  # noqa: BLE001
+                st.toast(str(e))
+            st.rerun()
+        return
+    cnt = pu.get("count")
+    head = f"有更新待生效（{cnt} 个提交）" if cnt else "有更新待生效"
+    txt = (f"{head}：磁盘上的新版本 {pu.get('disk_short')}（{pu.get('disk_subject') or ''}），"
+           f"当前运行 {pu.get('running_short') or '未知版本'}。重启后生效。")
+    c = st.columns([5, 1], vertical_alignment="center")
+    c[0].markdown(f'<div class="aq-warn">⬆️ {esc(txt)}</div>', unsafe_allow_html=True)
+    if admin:
+        with c[1].popover("安全重启", use_container_width=True):
+            cfg = safe_restart.get_config()
+            st.markdown("**安全重启会依次：**\n1. 暂停所有策略的新开仓（持仓保留，照常按规则卖出）\n"
+                        "2. 等所有未完成订单结束\n3. 备份数据库\n4. 停止并重新启动系统（外网约中断 1 分钟）\n"
+                        "5. 恢复新开仓，并在动态里记录“已更新到 commit …”")
+            mw = st.number_input("最长等待未完成订单（分钟）", min_value=1, max_value=240,
+                                 value=int(cfg["max_wait_min"]), step=5, key="sr_wait",
+                                 help="超过这个时间仍有未完成订单，也会继续重启；重启后系统会自动对账")
+            if st.button("确认安全重启", key="sr_go", type="primary", use_container_width=True):
+                try:
+                    safe_restart.request(actor=effective_user(), role=role(), max_wait_min=float(mw))
+                except Exception as e:  # noqa: BLE001
+                    st.toast(str(e))
+                st.rerun()
 
 
 def job_signature() -> str:

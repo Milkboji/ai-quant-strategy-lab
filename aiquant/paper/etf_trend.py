@@ -173,6 +173,12 @@ def sync_orders() -> None:
 # ---------------------------------------------------------------------------
 
 def step(now: datetime | None = None) -> dict:
+    try:   # 安全重启进行中：不下新单
+        from .. import safe_restart
+        if safe_restart.active():
+            return {"skipped": "安全重启进行中，暂停下新单"}
+    except Exception:  # noqa: BLE001
+        pass
     cfg = get_config()
     if not cfg["enabled"] or not http.paper_orders_unlocked():
         return {}

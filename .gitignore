@@ -21,3 +21,4 @@ config/tunnel.json
 config/cloudflared.yml
 tools/cloudflared.exe
 config/auth.json.bak
+BUILD_INFO.json

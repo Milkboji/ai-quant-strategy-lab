@@ -314,6 +314,35 @@ def stop_tunnel() -> None:
     CF_PID.unlink(missing_ok=True)
 
 
+def _update_tick() -> bool:
+    """比较磁盘与运行中的代码版本；安全重启条件满足时启动 stop + start 并让本守护进程退出。返回是否已交给重启。"""
+    try:
+        from aiquant import build, safe_restart
+        pu = build.check_pending()
+        if pu and pu.get("disk_commit") != (_cf_state.get("last_pending") or ""):
+            _cf_state["last_pending"] = pu["disk_commit"]
+            _wlog(f"发现待生效的更新：运行 {pu.get('running_short') or '?'} → 磁盘 {pu['disk_short']}（{pu.get('count')} 个提交）")
+        if safe_restart.tick() == "restart":
+            _wlog("安全重启：未完成订单已处理、数据库已备份，执行 stop + start")
+            _spawn([sys.executable, str(Path(__file__).resolve()), "restart"], cwd=str(ROOT),
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+    except Exception as e:  # noqa: BLE001
+        _wlog(f"版本检查 / 安全重启出错：{type(e).__name__}: {e}")
+    return False
+
+
+def restart() -> int:
+    """安全重启的最后一步：stop + start（不打开浏览器）。由守护进程在条件满足后调用。"""
+    _wlog("执行重启：stop")
+    stop()
+    time.sleep(2)
+    _wlog("执行重启：start")
+    rc = start(open_browser=False)
+    _wlog(f"重启完成（返回码 {rc}）")
+    return rc
+
+
 def watch() -> int:
     """守护进程：服务无响应、进程退出或内存过高时自动重启（模拟盘会在重启后自动对账恢复）。"""
     WPID.write_text(str(os.getpid()))
@@ -329,6 +358,8 @@ def watch() -> int:
             check_tunnel()
         except Exception as e:  # noqa: BLE001
             _wlog(f"外网通道启动/检测失败：{e}")
+        if _update_tick():
+            return 0
         pid = _pid()
         mem = _mem_mb(_app_pid() or _port_pid() or pid)
         if time.time() - last_mem_log >= 600:
@@ -513,4 +544,4 @@ def status() -> int:
 if __name__ == "__main__":
     a = sys.argv[1] if len(sys.argv) > 1 else "status"
     sys.exit({"start": start, "stop": stop, "status": status, "watch": watch, "ensure": ensure,
-              "open": open_ui}[a]())
+              "open": open_ui, "restart": restart}[a]())
