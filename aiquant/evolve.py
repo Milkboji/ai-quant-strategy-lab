@@ -408,7 +408,7 @@ def evolve_one(dep: dict, cfgv: dict, r: dict, train: tuple[datetime, datetime],
         return rec
     nv = registry.freeze(cur["slot_no"], best_sch, nl_text=cur["nl_text"], source="auto_evolve",
                          change_summary=f"[自动进化#{run_id}] {best_why}"[:500], parent_id=cur["id"],
-                         set_current=registry.slot_points_to(cur["slot_no"], cur["id"]))
+                         set_current=False)   # 进化只改运行版本；策略位指针由用户在实验室确认后才切换
     research.store_backtest(job_id=None, version=nv, slot_no=cur["slot_no"], ds=train_ds, start=start, end=end,
                             tf=best_eval["tf"], aux=best_eval["aux"], split="训练集", cfg=best_eval["cfg"],
                             res=best_eval["res"])
@@ -442,12 +442,12 @@ def _etf_brief(m: dict | None) -> dict | None:
         return None
     return {"score": m.get("calmar"), "return_pct": m.get("cagr"), "max_dd_pct": m.get("dd"), "trades": m.get("switches"),
             "segments": [], "positive_segments": None, "tf": 1440,
-            "change": f"{m.get('sma')} 日均线 ±{float(m.get('band', 0)):.0%}（挑选期年化，2016-2024）"}
+            "change": f"{m.get('sma')} 日均线 ±{float(m.get('band', 0)):.0%}（训练期年化）"}
 
 
 def _record_validation_touch(cur: dict, ho: dict) -> None:
-    db.ex("INSERT INTO holdout_touches(version_id,split,window_start,window_end,backtest_id,touched_at)"
-          " VALUES(?,?,?,?,?,?)", (cur["id"], "validation", ho["start"], ho["end"], None, db.now_iso()))
+    from . import holdout
+    holdout.record(cur["lineage_id"], cur["id"], ho["start"], ho["end"])
 
 
 # ---------------------------------------------------------------------------

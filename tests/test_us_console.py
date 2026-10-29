@@ -156,35 +156,78 @@ def test_budget_pct_edit_and_actual_exposure(etf, monkeypatch):
     assert abs(b - 100_000 * (1 - (float(cfgv["reserve_pct"]) + 35) / 100)) < 200   # 按实际占用扣除
 
 
-def test_etf_holdout_and_validation_quota(etf, monkeypatch):
+def test_etf_holdout_uses_unified_split_and_counts(etf, monkeypatch):
     import numpy as np
     import pandas as pd
-    idx = pd.bdate_range("2016-01-04", "2025-12-31")
+
+    from aiquant import holdout
+    idx = pd.bdate_range("2016-01-04", "2026-10-28")
     rng = np.random.default_rng(5)
     px = 100 * np.cumprod(1 + rng.normal(0.0006, 0.012, len(idx)))
     df = pd.DataFrame({"sig_close": px, "open": px, "close": px}, index=idx)
-    monkeypatch.setattr(challenger, "_etf_data", lambda: df)
-    db.set_setting("etf_split", None)
-    db.ex("DELETE FROM holdout_touches WHERE split='etf_validation'")
-    sp = challenger.etf_split()
-    assert sp["validation"] == ["2025-01-01", "2025-12-31"]
+    lin = challenger.etf_lineage()
+    db.ex("DELETE FROM holdout_touches WHERE lineage_key=?", (lin,))
+    db.set_setting("lineage_exposure", {})                                # 未暴露的谱系：正常使用新分区
     cur = {"sma": 150, "band": 0.02}
-    for i in range(challenger.ETF_VALIDATION_LIMIT):
+    for _ in range(holdout.LIMIT):
         ho = challenger.etf_holdout(df, cur, {"sma": 120, "band": 0.01})
-        assert ho["kind"] == "验证集"
+        assert ho["kind"] == "验证集" and ho["start"] == "2025-07-31" and ho["end"] == "2026-06-22"
+        assert ho["split_version"] == 1
         challenger._etf_touch(ho)
+    assert holdout.used(lin) == holdout.LIMIT
     ho = challenger.etf_holdout(df, cur, {"sma": 120, "band": 0.01})
-    assert ho["kind"] is None and "用完" in ho["reason"]                       # 次数用完 → 转为挑战者
-    db.set_setting("etf_split", dict(sp, validation=["2025-01-01", "2025-06-30"]))
-    ho = challenger.etf_holdout(df, cur, {"sma": 150, "band": 0.02})
-    assert ho["kind"] == "前向新数据" and ho["passed"]                          # 前向数据满 60 个交易日可用
-    db.set_setting("etf_split", None)
-    db.ex("DELETE FROM holdout_touches WHERE split='etf_validation'")
+    assert ho["kind"] is None and "用完" in ho["reason"]                   # 次数用完 → 转为挑战者
+    # 测试期结束后满 60 个交易日 → 前向新数据
+    idx2 = pd.bdate_range("2016-01-04", "2027-02-26")
+    df2 = pd.DataFrame({"sig_close": 100.0, "open": 100.0, "close": 100.0}, index=idx2)
+    assert challenger.etf_holdout(df2, cur, cur)["kind"] == "前向新数据"
+    # 已暴露的谱系：只用上线日之后的前向数据
+    db.set_setting("lineage_exposure", None)
+    assert holdout.exposure(lin)
+    ho = challenger.etf_holdout(df, cur, {"sma": 120, "band": 0.01})
+    assert ho["kind"] is None and ho["exposed"] and "已暴露" in ho["reason"]
+    ho = challenger.etf_holdout(df2, cur, cur)
+    assert ho["kind"] == "上线后前向数据" and ho["start"] > "2026-10-21"
+    db.ex("DELETE FROM holdout_touches WHERE lineage_key=?", (lin,))
+
+
+def test_merge_etf_counts_union(env):
+    from aiquant import holdout
+    holdout.ensure()
+    db.set_setting("holdout_merge_report", None)
+    lin = "etf:QQQ->QLD"
+    db.ex("DELETE FROM holdout_touches WHERE lineage_key=? OR split='etf_validation'", (lin,))
+    ins = ("INSERT INTO holdout_touches(version_id,split,window_start,window_end,backtest_id,touched_at,lineage_key) "
+           "VALUES(?,?,?,?,?,?,?)")
+    db.ex(ins, (1, "etf_validation", "2025-01-01", "2025-12-31", None, "2026-10-25T01:00:00", None))
+    db.ex(ins, (1, "etf_validation", "2025-01-01", "2026-03-31", None, "2026-10-26T01:00:00", None))
+    db.ex(ins, (1, "validation", "2025-01-01", "2025-12-31", None, "2026-10-25T01:00:30", lin))   # 同一次检验
+    rep = holdout.merge_etf_counts(lin)
+    assert rep["etf_validation_before"] == 2 and rep["validation_before"] == 1 and rep["after"] == 2
+    assert not db.q("SELECT id FROM holdout_touches WHERE split='etf_validation'")
+    assert holdout.merge_etf_counts(lin) == rep                              # 幂等
+    db.ex("DELETE FROM holdout_touches WHERE lineage_key=?", (lin,))
+    db.set_setting("holdout_merge_report", None)
+
+
+def test_old_split_challenger_is_annotated(etf):
+    from aiquant import holdout
+    c = etf_trend.get_config()
+    cid = db.ex("INSERT INTO evolve_challengers(kind,label,champion_params,candidate_json,change,train_json,registered_at,"
+                "status) VALUES('etf','ETF',?,?,?,?,?, 'running')",
+                (json.dumps({"sma": int(c["sma"]), "band": float(c["band"])}), json.dumps({"sma": 170, "band": 0.02}),
+                 "均线 150→170 日", json.dumps({"calmar": 1.0}), "2026-10-21T13:22:43+00:00"))
+    holdout.migrate()
+    tj = json.loads(db.q1("SELECT train_json FROM evolve_challengers WHERE id=?", (cid,))["train_json"])
+    assert tj["split_version"] == 0 and "旧分区" in tj["split_note"]
+    assert db.q1("SELECT status FROM evolve_challengers WHERE id=?", (cid,))["status"] == "running"   # 不中断
+    db.ex("UPDATE evolve_challengers SET status='expired' WHERE id=?", (cid,))
 
 
 def test_etf_round_promotes_through_holdout_or_queues(etf, monkeypatch):
     monkeypatch.setattr(challenger, "etf_holdout", lambda df, cur, cand: {
-        "kind": "前向新数据", "start": "2026-01-01", "end": "2026-10-01", "passed": True, "reason": "测试通过"})
+        "kind": "前向新数据", "start": "2026-01-01", "end": "2026-10-01", "passed": True, "reason": "测试通过",
+        "split_version": 1})
     import numpy as np
     import pandas as pd
     idx = pd.bdate_range("2016-01-04", "2025-12-31")
@@ -224,3 +267,51 @@ def test_etf_forward_early_decision(etf, monkeypatch):
     out = challenger.evaluate_etf()
     assert any("淘汰" in x for x in out)                                     # 25 个交易日就明显落后 → 提前淘汰
     assert db.q1("SELECT status FROM evolve_challengers WHERE id=?", (cid,))["status"] == "rejected"
+
+
+def test_idle_etf_budget_lent_to_btc_and_reclaimed(etf, monkeypatch):
+    """美股空仓时 BTC 最多临时使用一半额度；美股发出买入信号时收回：BTC 暂停新开仓，现金够了美股买入，额度归还；全程审计。"""
+    import pandas as pd
+
+    from aiquant import evolve
+    from aiquant.paper import runner as pr
+    from datetime import datetime, timezone
+    db.set_setting("etf_lend", None)
+    db.ex("DELETE FROM etf_orders")
+    monkeypatch.setattr(etf_trend.http, "paper_orders_unlocked", lambda: True)
+    monkeypatch.setattr(etf_trend, "_clock", lambda: {"is_open": True})
+    monkeypatch.setattr(etf_trend, "update_daily_csv", lambda *a, **k: {})
+    monkeypatch.setattr(etf_trend, "_position", lambda sym: {"qty": 0.0, "market_value": 0, "avg_entry_price": 0,
+                                                            "unrealized_pl": 0})
+    days = pd.bdate_range("2026-01-01", periods=200).date
+    down = pd.DataFrame({"date": days, "close": [200 - i * 0.2 for i in range(200)]})
+    up = pd.DataFrame({"date": days, "close": [100 + i * 0.2 for i in range(200)]})
+    sent = []
+    monkeypatch.setattr(etf_trend, "_submit", lambda sym, side, **kw: sent.append(kw) or {})
+    # 1) 看空空仓 → 借出 50%：ETF 只占 15%
+    monkeypatch.setattr(etf_trend, "daily_bars", lambda sym, days_=420: down)
+    monkeypatch.setattr(etf_trend, "_account", lambda: {"equity": "100000", "cash": "100000"})
+    etf_trend.step(datetime(2026, 10, 20, 14, 0, tzinfo=timezone.utc))
+    assert etf_trend.lend_state()["state"] == "lent" and etf_trend.capital_share(100_000) == 15
+    assert _audit("临时借出额度")
+    # 2) 看多但现金不够（BTC 用掉了借来的额度）→ 收回：BTC 暂停新开仓，ETF 等待、当天不记已动作
+    monkeypatch.setattr(etf_trend, "daily_bars", lambda sym, days_=420: up)
+    monkeypatch.setattr(etf_trend, "_account", lambda: {"equity": "100000", "cash": "20000"})
+    st = etf_trend.step(datetime(2026, 10, 21, 14, 0, tzinfo=timezone.utc))
+    assert etf_trend.reclaim_active() and not sent and st.get("last_action_date") != "2026-10-21"
+    assert etf_trend.get_why()["code"] == "reclaim" and _audit("收回临时借出的额度")
+    assert etf_trend.capital_share(100_000) == 30
+    expl = console.explain({"id": 1, "status": "running", "config": {}, "broker": "alpaca_paper", "is_test": 0,
+                            "version_id": None})
+    assert "收回" in expl["headline"]
+    # 3) BTC 卖出后现金够了 → 同一天买入，额度归还
+    monkeypatch.setattr(etf_trend, "_account", lambda: {"equity": "100000", "cash": "60000"})
+    etf_trend.step(datetime(2026, 10, 21, 15, 0, tzinfo=timezone.utc))
+    assert sent and abs(sent[0]["notional"] - 30000) < 1
+    assert etf_trend.lend_state()["state"] == "none" and _audit("额度已归还")
+    # 借出比例可配置，0 = 不借；观察员不能改
+    with pytest.raises(PermissionError):
+        etf_versions.set_lend_pct(30, actor="g", role="viewer")
+    etf_versions.set_lend_pct(0, actor="t1", role="trader")
+    assert _audit("修改借出比例")
+    db.set_setting("etf_lend", None)

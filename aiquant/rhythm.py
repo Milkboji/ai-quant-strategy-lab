@@ -58,7 +58,25 @@ def _rules_key(market=None) -> str:
     return "rules" if market is None or getattr(market, "key", "crypto") == "crypto" else "rules_us"
 
 
-def current(market=None) -> Rhythm | None:
+def _is_us(market) -> bool:
+    return market is not None and getattr(market, "key", "crypto") != "crypto"
+
+
+US_MODES = {"shadow": "影子模式（只计算显示，不影响下单和回测）", "active": "生效"}
+
+
+def us_mode() -> str:
+    """美股节奏的生效方式。2026-10-29 起默认「影子」：训练期重做研究的结论确认前，只计算和显示，不影响下单。"""
+    m = get_config().get("us_mode") or "shadow"
+    return m if m in US_MODES else "shadow"
+
+
+def is_shadow(market=None) -> bool:
+    return _is_us(market) and us_mode() == "shadow"
+
+
+def configured(market=None) -> Rhythm | None:
+    """设置里的规则（不论影子与否）；影子模式下用它计算「如果生效会怎样」。"""
     c = get_config()
     if not c.get("enabled"):
         return None
@@ -69,9 +87,50 @@ def current(market=None) -> Rhythm | None:
     return rh if rh.active else None
 
 
+def current(market=None) -> Rhythm | None:
+    """实际执行的规则：回测、进化、模拟盘都用它。美股影子模式下返回 None（不影响任何下单和回测）。"""
+    if is_shadow(market):
+        return None
+    return configured(market)
+
+
 def rules_hash(market=None) -> str:
     c = get_config()
-    return hashlib.sha1(json.dumps([c.get("enabled"), c.get(_rules_key(market))], sort_keys=True).encode()).hexdigest()[:10]
+    parts = [c.get("enabled"), c.get(_rules_key(market))]
+    if _is_us(market):
+        parts.append(us_mode())
+    return hashlib.sha1(json.dumps(parts, sort_keys=True).encode()).hexdigest()[:10]
+
+
+def set_us_mode(mode: str, *, actor: str | None, role: str | None) -> dict:
+    """切换美股节奏 影子 / 生效（管理员、交易员），写审计。"""
+    from . import console
+    console.require_role(role)
+    if mode not in US_MODES:
+        raise ValueError("模式只能是 shadow / active")
+    old = us_mode()
+    if old == mode:
+        return {"result": "无变化", "message": f"美股节奏已是{US_MODES[mode]}"}
+    set_config(us_mode=mode, us_mode_by=actor or "用户", us_mode_at=db.now_iso())
+    console.audit(actor, role, "美股节奏模式", "rhythm_us", "美股交易节奏", None, None, None, US_MODES[mode],
+                  f"{US_MODES[old]} → {US_MODES[mode]}")
+    from .paper import runner as pr
+    pr.event(None, "INFO", f"[ETF趋势] {actor or '用户'} 把美股交易节奏改为：{US_MODES[mode]}")
+    return {"result": "已切换", "message": f"美股交易节奏：{US_MODES[mode]}"}
+
+
+def ensure_us_shadow_default() -> None:
+    """一次性：把美股节奏设为影子模式并写审计（重做研究前不影响下单）。"""
+    c = get_config()
+    if c.get("us_mode_at"):
+        return
+    set_config(us_mode="shadow", us_mode_by="系统", us_mode_at=db.now_iso())
+    try:
+        from . import console
+        console.audit("系统", "system", "美股节奏模式", "rhythm_us", "美股交易节奏", None, None, None, US_MODES["shadow"],
+                      "训练期重做研究前，美股节奏改为影子模式：只计算显示，不影响下单和回测")
+    except Exception:  # noqa: BLE001
+        log.exception("us shadow audit failed")
 
 
 # ---------------------------------------------------------------------------
@@ -103,8 +162,9 @@ def save_gate(did: int, g: Gate) -> None:
 
 def live_gate(did, now: datetime, df5: pd.DataFrame, market=None) -> tuple[str | None, float, dict]:
     """返回 (阻止原因 或 None, 仓位系数, 说明)。规则关闭时 (None, 1.0, {})。
-    did：部署 id（BTC）或 "etf"（美股 ETF 择时）；market 决定时长单位与年化口径。"""
-    rh = current(market)
+    did：部署 id（BTC）或 "etf"（美股 ETF 择时）；market 决定时长单位与年化口径。
+    美股影子模式下也照常计算（调用方决定是否真的阻止），所以这里用 configured()。"""
+    rh = configured(market)
     if rh is None:
         return None, 1.0, {}
     t = pd.Timestamp(now)
@@ -119,7 +179,7 @@ def live_gate(did, now: datetime, df5: pd.DataFrame, market=None) -> tuple[str |
 
 
 def live_on_entry(did, now: datetime, market=None) -> None:
-    rh = current(market)
+    rh = configured(market)
     if rh is None:
         return
     g = load_gate(did, rh, market)
@@ -129,8 +189,8 @@ def live_on_entry(did, now: datetime, market=None) -> None:
 
 
 def live_on_exit(did, now: datetime, reason: str, pnl: float, market=None) -> str | None:
-    """记录一次离场；返回新产生的冷却说明（用于日志）。"""
-    rh = current(market)
+    """记录一次离场；返回新产生的冷却说明（用于日志）。影子模式下照常记录，便于显示「如果生效会怎样」。"""
+    rh = configured(market)
     if rh is None:
         return None
     g = load_gate(did, rh, market)
@@ -232,7 +292,7 @@ def etf_long_metrics(compute: bool = False) -> dict | None:
     if cached and cached.get("rules") == sig and cached.get("params") == p and cached.get("hist_end") == end:
         return cached
     years = regime_bt.yearly(df, p["sma"], p["band"], max(2017, df.index[0].year + 1), df.index[-1].year,
-                             market=mk.US_EQUITY, rhythm=current(mk.US_EQUITY))
+                             market=mk.US_EQUITY, rhythm=configured(mk.US_EQUITY))
     if not years:
         return None
     mr = sum(y["ret"] for y in years) / len(years)
@@ -246,10 +306,14 @@ def etf_long_metrics(compute: bool = False) -> dict | None:
     return out
 
 
-def etf_long_paused() -> bool:
-    """长周期体检不达标且开启了「体检不达标暂停」→ 美股 ETF 不开新仓（持仓照常按信号离场）。"""
+def etf_long_paused(include_shadow: bool = False) -> bool:
+    """长周期体检不达标且开启了「体检不达标暂停」→ 美股 ETF 不开新仓（持仓照常按信号离场）。
+    影子模式下返回 False（不影响下单）；include_shadow=True 时返回「如果生效是否会暂停」。"""
+    from . import market as mk
     c = get_config()
     if not c.get("enabled") or not c.get("long_veto"):
+        return False
+    if is_shadow(mk.US_EQUITY) and not include_shadow:
         return False
     m = etf_long_metrics()
     return bool(m and not m.get("ok"))
@@ -261,7 +325,8 @@ def _etf_long_refresh() -> str | None:
     if not m:
         return None
     paused = etf_long_paused()
-    db.set_setting("etf_long_state", {"paused": paused, "at": db.now_iso()})
+    db.set_setting("etf_long_state", {"paused": paused, "would_pause": etf_long_paused(include_shadow=True),
+                                      "at": db.now_iso()})
     from .paper import runner as pr
     txt = f"年均 {m['mean_ret']:+.1f}% 回撤 {m['mean_dd']:.1f}% 盈利 {m['pos_years']}/{m['n_years']} 年"
     if paused and not before:

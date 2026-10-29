@@ -176,3 +176,24 @@ tests/                     pytest 单元/集成测试 + e2e_browser.py（Playwri
   策略总台 `console.etf_row / etf_explain`、模拟盘面板、首页卡片、每日摘要都读它。
 - 策略位指针：进化 / 挑战者晋级只在 `registry.slot_points_to(slot, 被替换版本)` 时移动指针。
 - 策略位里的美股版本（`research.version_market`）不能部署到 BTC 模拟盘；美股模拟盘目前只运行 ETF 择时（参数版本）。
+
+## 第六步后核对（2026-10-29，见 docs/第六步后核对报告.md）
+
+- 美股唯一分区：`research.US_SPLITS` / `us_split()`（v1：训练 2017-01-01~2025-07-30，验证 2025-07-31~2026-06-22，
+  测试 2026-06-23~2026-10-28），固定日期、带版本号（settings.us_split_version）；美股回测假设里记 split_version。
+  ETF 进化 `challenger.etf_select()`（训练期）、`etf_holdout()`、快速检验、实验室 ETF 预览（只训练期）全部用它。
+- 留出计次统一 `aiquant/holdout.py`：holdout_touches.lineage_key；`used(lineage)` / `record()`；BTC 谱系兼容旧记录（按 version 关联）。
+  启动 `holdout.migrate()`：etf_validation 并入 validation（去重，报告在 settings.holdout_merge_report）、写 lineage_exposure 默认值、
+  给旧分区登记的 ETF 挑战者加 split_version=0 / split_note。
+- 已暴露谱系 `holdout.exposure(lineage)`（settings.lineage_exposure，默认 etf:QQQ->QLD，forward_from 2026-10-21）：
+  验证检验不作晋级依据，留出改用 forward_from 之后的前向数据（≥60 交易日），界面显示「验证/测试数据已暴露」。
+- 美股节奏影子模式：`rhythm.us_mode()`（默认 shadow，`ensure_us_shadow_default` 写审计）、`is_shadow`、`configured`（规则本身）
+  vs `current`（实际执行，影子时美股为 None）、`set_us_mode`（管理员/交易员，审计）。live_gate / on_entry / on_exit 用 configured，
+  etf_trend 在影子模式下不阻止、只写 settings.etf_rhythm_shadow。`etf_long_paused(include_shadow)`。
+- 进化 / 挑战者晋级 `registry.freeze(..., set_current=False)`：只改运行版本；实验室 `registry.promoted_running` 提示，
+  `registry.adopt_running`（管理员/交易员，审计「实验室切换到运行版本」）。
+- 引擎回归：`tests/test_engine_regression.py` + `tests/golden/`（a72ed6a 生成）。改动 engine/* 或 regime_bt 后必须通过；
+  若有意改变结果，重新生成 golden 并在报告里逐条解释差异。
+- 美股空仓额度借用：etf_trend 配置 lend_pct（默认 50，`etf_versions.set_lend_pct`）；状态 settings.etf_lend（none/lent/reclaim）；
+  `capital_share` 借出时只扣未借部分；收回时 `runner` 拦截 BTC 新开仓（reclaim_active），ETF 现金不够时不记当天已动作；
+  每次状态切换写策略审计并 rebalance。

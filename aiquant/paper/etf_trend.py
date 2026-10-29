@@ -26,7 +26,7 @@ from ..data import alpaca, http
 ET = ZoneInfo("America/New_York")
 log = logging.getLogger("aiquant.etf")
 DEFAULTS = {"enabled": True, "signal_symbol": "QQQ", "trade_symbol": "QLD", "sma": 150, "band": 0.02,
-            "budget_pct": 30.0}
+            "budget_pct": 30.0, "lend_pct": 50.0}
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS etf_orders (
@@ -47,16 +47,47 @@ def get_config() -> dict:
     return d
 
 
+def lend_state() -> dict:
+    """美股空仓时临时借给 BTC 的额度：{"state": none | lent | reclaim, "since", "lend_pct"}。"""
+    return db.get_setting("etf_lend") or {"state": "none"}
+
+
+def reclaim_active() -> bool:
+    return lend_state().get("state") == "reclaim"
+
+
 def capital_share(equity: float | None) -> float:
     """美股 ETF 实际占用的资金比例（%），BTC 策略按实力分配时先扣除它：
     运行中取「设定比例」和「当前持仓市值 / 权益」的较大者（ETF 涨多了也不会让两边合计超过账户）；
+    空仓且已临时借出时，只扣除未借出的部分（BTC 最多临时使用这部分额度的 lend_pct%）；
     下线 / 等待下线时只扣除仍在持有的市值。"""
     cfg = get_config()
     st = db.get_setting("etf_trend_state") or {}
     held = float((st.get("position") or {}).get("market_value") or 0)
     held_pct = held / equity * 100 if equity and equity > 0 else 0.0
     target = float(cfg["budget_pct"]) if cfg.get("enabled") and not cfg.get("pending_offline") else 0.0
+    ls = lend_state()
+    if ls.get("state") == "lent":
+        target *= 1 - float(ls.get("lend_pct", cfg.get("lend_pct", 50.0))) / 100
     return round(max(target, held_pct), 4)
+
+
+def _set_lend(state: str, why: str, cfg: dict) -> None:
+    """切换借出状态：写审计、事件，并立即重新分配 BTC 额度。"""
+    from .. import console
+    old = lend_state()
+    if old.get("state") == state:
+        return
+    pct = float(cfg.get("lend_pct", 50.0))
+    db.set_setting("etf_lend", {"state": state, "since": db.now_iso(), "lend_pct": pct, "why": why})
+    action = {"lent": "临时借出额度", "reclaim": "收回临时借出的额度", "none": "额度已归还"}[state]
+    console.audit("系统", "system", action, "etf", "美股 ETF 择时", None, None, None, action, why)
+    _log("INFO", f"{action}：{why}")
+    try:
+        from .. import evolve
+        evolve.rebalance()
+    except Exception:  # noqa: BLE001
+        log.warning("rebalance after lend change failed", exc_info=True)
 
 
 def _log(level: str, msg: str) -> None:
@@ -163,7 +194,7 @@ def sync_orders() -> None:
 # ---------------------------------------------------------------------------
 
 WHY_CODES = ("safe_restart", "disabled", "locked", "no_clock", "closed", "pre_open", "data_error", "pending",
-             "bought", "topup", "sold", "hold", "flat", "small", "rejected", "rhythm", "long_pause", "pending_offline")
+             "bought", "topup", "sold", "hold", "flat", "small", "rejected", "rhythm", "long_pause", "pending_offline", "reclaim")
 OPEN_STATUSES = ("new", "accepted", "pending_new", "partially_filled")
 FINAL_STATUSES = ("filled", "canceled", "expired", "rejected", "done_for_day")
 
@@ -249,19 +280,28 @@ def _trade_daily(sym: str) -> pd.DataFrame:
 
 
 def _rhythm_gate(sym: str, now: datetime) -> tuple[str | None, float]:
-    """开仓前的统一纪律（与回测 regime_bt 相同的规则）：长周期体检、冷却 / 连亏刹车、波动率定仓。"""
+    """开仓前的统一纪律（与回测 regime_bt 相同的规则）：长周期体检、冷却 / 连亏刹车、波动率定仓。
+    美股影子模式：照常计算，但不阻止、不缩仓，只把「如果生效会怎样」记在 state.shadow 里显示。"""
     from .. import market as mk
     from .. import rhythm
-    if rhythm.etf_long_paused():
+    shadow = rhythm.is_shadow(mk.US_EQUITY)
+    block, vm = None, 1.0
+    if rhythm.etf_long_paused(include_shadow=True):
         m = rhythm.etf_long_metrics() or {}
-        return (f"长周期体检不达标（年均 {m.get('mean_ret', 0):+.1f}%，盈利 {m.get('pos_years', 0)}/{m.get('n_years', 0)} 年），"
-                "暂停新开仓"), 1.0
-    rh = rhythm.current(mk.US_EQUITY)
-    if rh is None:
+        block = (f"长周期体检不达标（年均 {m.get('mean_ret', 0):+.1f}%，盈利 {m.get('pos_years', 0)}/{m.get('n_years', 0)} 年），"
+                 "暂停新开仓")
+    else:
+        rh = rhythm.configured(mk.US_EQUITY)
+        if rh is not None:
+            df = _trade_daily(sym) if (rh.vol_target_pct or rh.regime_sma_days) else pd.DataFrame(columns=["ts", "close"])
+            b, vm, _ = rhythm.live_gate(rhythm.ETF_KEY, now, df, mk.US_EQUITY)
+            block = f"交易节奏：{b}" if b else None
+    if shadow:
+        note = (f"影子模式：如果美股节奏生效，{block}" if block else
+                (f"影子模式：如果美股节奏生效，仓位会缩到 {vm:.0%}" if vm < 1 else "影子模式：节奏规则不会阻止这次买入"))
+        db.set_setting("etf_rhythm_shadow", {"at": db.now_iso(), "block": block, "vol_mult": vm, "note": note})
         return None, 1.0
-    df = _trade_daily(sym) if (rh.vol_target_pct or rh.regime_sma_days) else pd.DataFrame(columns=["ts", "close"])
-    block, vm, _ = rhythm.live_gate(rhythm.ETF_KEY, now, df, mk.US_EQUITY)
-    return (f"交易节奏：{block}" if block else None), vm
+    return block, vm
 
 
 def _rhythm_entry(now: datetime) -> None:
@@ -274,6 +314,9 @@ def _rhythm_exit(now: datetime, pnl: float) -> None:
     from .. import market as mk
     from .. import rhythm
     msg = rhythm.live_on_exit(rhythm.ETF_KEY, now, "信号离场", pnl, mk.US_EQUITY)
+    if msg and rhythm.is_shadow(mk.US_EQUITY):
+        _log("INFO", f"影子模式（不影响下单）：如果美股节奏生效，{msg}")
+        return
     if msg:
         _log("WARN", f"交易节奏：{msg}")
         if "连亏" in msg:
@@ -352,6 +395,26 @@ def step(now: datetime | None = None) -> dict:
     band_txt = (f"（收盘 {sig['close']:.2f} 在均线缓冲带 {sig['lower']:.2f}~{sig['upper']:.2f} 内，维持原状态）"
                 if in_band else "")
     entry = st.get("entry") if isinstance(st.get("entry"), dict) else None
+    # 美股空仓时把一部分额度临时借给 BTC；发出买入信号时收回（BTC 暂停新开仓，直到现金够买）
+    flat = pos["qty"] <= 0 and not pending
+    ls = lend_state().get("state", "none")
+    lend_pct = float(cfg.get("lend_pct", 50.0))
+    if not flat and ls != "none":
+        _set_lend("none", f"已持有 {sym}，借出状态结束", cfg)
+        ls = "none"
+    elif flat and sig["regime"] == 0 and ls == "none" and lend_pct > 0 and not cfg.get("pending_offline"):
+        _set_lend("lent", f"美股空仓（看空），BTC 最多临时使用美股额度的 {lend_pct:g}%", cfg)
+        ls = "lent"
+    elif flat and sig["regime"] == 1 and ls == "lent":
+        _set_lend("reclaim", f"{cfg['signal_symbol']} 发出买入信号，收回借给 BTC 的额度；BTC 暂停新开仓直到额度归还", cfg)
+        ls = "reclaim"
+    if ls == "reclaim" and flat and sig["regime"] == 1 and cash * 0.98 < budget * 0.98:
+        set_why("reclaim", f"看多，等待 BTC 归还临时借用的额度：需要现金 {budget:,.0f} USD，目前 {cash:,.0f} USD。"
+                           "BTC 已暂停新开仓，持仓按规则卖出后归还")
+        return st       # 不记 last_action_date：现金够了当天就买
+    if ls == "reclaim" and (not flat or sig["regime"] == 0):
+        _set_lend("none", "收回结束（信号转空或已持有）", cfg)
+        ls = "none"
     action = "保持"
     side = None
     try:
@@ -377,6 +440,8 @@ def step(now: datetime | None = None) -> dict:
                         entry = {"signal_date": sig["date"], "target": round(target, 2)}
                         set_why("bought", f"看多：{why}，已下单 {action}")
                         _rhythm_entry(now)
+                        if lend_state().get("state") != "none":
+                            _set_lend("none", f"已买入 {sym}，额度归还", cfg)
                 else:
                     set_why("small", f"看多，但可用资金不足 10 USD（现金 {cash:,.2f}），暂不买入")
         elif sig["regime"] == 1 and pos["qty"] > 0:

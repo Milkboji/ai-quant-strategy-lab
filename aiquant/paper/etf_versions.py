@@ -96,19 +96,19 @@ def narrate(sma: int, band: float) -> list[tuple[str, str]]:
 
 
 def preview(sma: int, band: float) -> dict:
-    """新参数 vs 当前参数：挑选期（2016-2024）和全部数据上的回测对比。"""
+    """新参数 vs 当前参数：只在训练期（美股统一分区）上回测对比。验证期 / 测试期只能通过计次的留出检验查看，
+    这里不再提供「全部数据」预览。"""
     from .. import challenger
     sma, band = check_params(sma, band)
     df = challenger._etf_data()
     if df is None:
         return {"error": "没有找到美股日线数据（data/etf_daily），无法回测"}
     cur = etf_trend.get_config()
-    end = str(df.index[-1].date())
+    a, b = challenger.etf_select()
     out = {"periods": []}
-    for name, a, b in (("挑选期 2016-2024", "2016-01-01", "2024-12-31"), ("全部数据", str(df.index[0].date()), end)):
-        k = challenger.etf_backtest(df, sma, band, a, b)
-        c = challenger.etf_backtest(df, int(cur["sma"]), float(cur["band"]), a, b)
-        out["periods"].append({"name": name, "new": k, "cur": c})
+    k = challenger.etf_backtest(df, sma, band, a, b)
+    c = challenger.etf_backtest(df, int(cur["sma"]), float(cur["band"]), a, b)
+    out["periods"].append({"name": f"训练期 {a} ~ {b}", "new": k, "cur": c})
     return out
 
 
@@ -267,6 +267,30 @@ def set_budget_pct(pct, *, actor: str | None, role: str | None) -> dict:
     console.audit(actor, role, "修改资金比例", "etf", "美股 ETF 择时", None, None, None, "已修改", f"{old:g}% → {v:g}%")
     _rebalance()
     return {"result": "已修改", "message": f"资金比例已改为 {v:g}%，下一次买入时生效；BTC 策略额度已重新分配"}
+
+
+def set_lend_pct(pct, *, actor: str | None, role: str | None) -> dict:
+    """美股空仓时 BTC 最多可临时使用的美股额度比例（0~100%，0 = 不借出）。管理员 / 交易员，写审计。"""
+    from .. import console
+    _require(role)
+    try:
+        v = round(float(pct), 2)
+    except (TypeError, ValueError):
+        raise ValueError("借出比例必须是数字")
+    if not 0 <= v <= 100:
+        raise ValueError("借出比例需在 0%~100% 之间")
+    cfg = dict(db.get_setting("etf_trend_config") or {})
+    old = float(etf_trend.get_config().get("lend_pct", 50.0))
+    if abs(old - v) < 1e-9:
+        return {"result": "无变化", "message": f"借出比例已是 {v:g}%"}
+    cfg["lend_pct"] = v
+    db.set_setting("etf_trend_config", cfg)
+    ls = etf_trend.lend_state()
+    if ls.get("state") == "lent":
+        db.set_setting("etf_lend", dict(ls, lend_pct=v))
+    console.audit(actor, role, "修改借出比例", "etf", "美股 ETF 择时", None, None, None, "已修改", f"{old:g}% → {v:g}%")
+    _rebalance()
+    return {"result": "已修改", "message": f"美股空仓时，BTC 最多临时使用美股额度的 {v:g}%"}
 
 
 def finish_pending_offline(pos_qty: float) -> bool:

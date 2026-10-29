@@ -171,8 +171,9 @@ def rhythm_panel() -> None:
         with cols[0]:
             from .. import market as mk
             rules = ["加密货币（BTC/ETH，时长按小时、年化 √365）：" + "；".join((rh or rhythm.RULES_V1).describe())]
-            rus = rhythm.current(mk.US_EQUITY) or rhythm.RULES_US_V1
-            rules.append("美股 ETF（时长按交易日、年化 √252，节假日顺延）：" + "；".join(rus.describe(mk.US_EQUITY.unit_cn, "信号品种")))
+            rus = rhythm.configured(mk.US_EQUITY) or rhythm.RULES_US_V1
+            rules.append("美股 ETF（时长按交易日、年化 √252，节假日顺延）：" + "；".join(rus.describe(mk.US_EQUITY.unit_cn, "信号品种"))
+                         + ("（当前为影子模式：只计算显示，不影响下单和回测）" if rhythm.is_shadow(mk.US_EQUITY) else ""))
             extra = [f"自动进化不再生成 {rc['min_signal_tf']} 分钟以下的版本（0.25% 单边手续费下，短周期长期被成本吃掉）",
                      f"长周期体检（每天）：近 {rc['long_years']} 年平均年收益为负且盈利年份少于 {rc['long_min_pos_years']} 个 → 暂停新开仓并释放额度",
                      "资金额度按长周期 年均收益 / 年均回撤 分配：长期最稳的日线趋势策略拿最多"]
@@ -183,6 +184,19 @@ def rhythm_panel() -> None:
             if en != bool(rc.get("enabled")):
                 rhythm.set_config(enabled=en)
                 flash("evolve", "success", "交易节奏已" + ("开启" if en else "关闭"))
+                st.rerun()
+            from .. import market as mk
+            from .login import effective_user, role
+            um = rhythm.us_mode()
+            new_um = st.radio("美股节奏", list(rhythm.US_MODES), index=list(rhythm.US_MODES).index(um),
+                              format_func=lambda x: {"shadow": "影子（只显示）", "active": "生效"}[x], key="rh_us_mode",
+                              horizontal=True, help="影子：照常计算并显示「如果生效会怎样」，不影响下单和回测。切换写审计。")
+            if new_um != um:
+                try:
+                    res = rhythm.set_us_mode(new_um, actor=effective_user(), role=role())
+                    flash("evolve", "success", res["message"])
+                except Exception as e:  # noqa: BLE001
+                    flash("evolve", "error", str(e))
                 st.rerun()
             last = db.get_setting("rhythm_long_refreshed") or {}
             st.caption(f"长周期体检：{_bj(last.get('at')) if last.get('at') else '尚未运行'}")

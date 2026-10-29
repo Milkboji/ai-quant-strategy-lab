@@ -756,6 +756,14 @@ def explain(dep: dict | None, plan: dict | None = None, price: float | None = No
     items, calc, heads = [], [], []
     if cfg.get("pending_offline"):
         heads.append("等待空仓后下线：不再开新仓")
+    try:
+        from .paper import etf_trend
+        if dep.get("broker") == "alpaca_paper" and not dep.get("is_test") and etf_trend.reclaim_active():
+            heads.append("美股 ETF 正在收回临时借出的额度：暂停新开仓")
+            items.append(("额度收回", "美股 ETF 空仓时，它的一部分额度临时给了 BTC；现在美股发出买入信号，BTC 暂停新开仓，"
+                                     "持仓照常按规则卖出，等现金够美股买入后恢复"))
+    except Exception:  # noqa: BLE001
+        pass
     # 长期体检 / 自动暂停
     ap = cfg.get("auto_pause")
     lm = None
@@ -885,7 +893,14 @@ def etf_explain(equity: float | None = None) -> dict:
                                 + ("" if lm.get("ok") else f"（年均收益为负且盈利年份少于 {rc['long_min_pos_years']} 年 → 暂停新开仓）")))
     g = db.get_setting(f"rhythm_state::{rhythm.ETF_KEY}") or {}
     bu = pd.Timestamp(g["block_until"]) if g.get("block_until") else None
-    rh = rhythm.current(mk.US_EQUITY)
+    rh = rhythm.configured(mk.US_EQUITY)
+    if rhythm.is_shadow(mk.US_EQUITY):
+        sh = db.get_setting("etf_rhythm_shadow") or {}
+        items.append(("美股交易节奏", "影子模式：只计算显示，不影响下单和回测（训练期重做研究的结论确认前）"
+                                   + (f"；最近一次：{sh['note']}（{_bj(sh.get('at'))}）" if sh.get("note") else "")))
+        if bu is not None and bu > now:
+            items.append(("影子冷却", f"如果生效：{g.get('block_why') or '交易节奏'}，到 {_bj(bu)} 北京时间"))
+        bu = None
     if bu is not None and bu > now:
         items.append(("冷却中", f"{g.get('block_why') or '交易节奏'}；剩余 {_dur(bu - now)}，到 {_bj(bu)} 北京时间（按交易日计算，节假日顺延）"))
         if not heads or "节奏" not in heads[0]:
@@ -898,13 +913,18 @@ def etf_explain(equity: float | None = None) -> dict:
     if not cfg.get("enabled"):
         heads = ["已下线"]
     pct = float(cfg["budget_pct"])
+    ls = etf_trend.lend_state()
+    if ls.get("state") == "lent":
+        items.append(("临时借出额度", f"美股空仓，BTC 最多临时使用美股额度的 {float(ls.get('lend_pct', 50)):g}%（{_bj(ls.get('since'))} 起）"))
+    elif ls.get("state") == "reclaim":
+        items.append(("正在收回额度", f"美股发出买入信号，BTC 暂停新开仓，直到现金够买（{_bj(ls.get('since'))} 起）"))
     if equity:
         share = etf_trend.capital_share(equity)
         calc.append(("资金比例", f"固定 {pct:g}% × 账户权益 {equity:,.0f} = {equity * pct / 100:,.0f} USD（不参与 BTC 的按实力分配）"))
         calc.append(("从 BTC 额度中扣除", f"max(设定比例 {pct:g}%, 当前持仓市值占比) = {share:.1f}%"))
     else:
         calc.append(("资金比例", f"固定 {pct:g}%（不参与 BTC 的按实力分配）"))
-    if rh is not None and rh.vol_target_pct:
+    if rh is not None and rh.vol_target_pct and not rhythm.is_shadow(mk.US_EQUITY):
         calc.append(("波动率定仓", f"目标年化波动率 {rh.vol_target_pct:g}%（√252 年化）"))
     else:
         calc.append(("波动率定仓", "美股不采用（研究见交易节奏说明）：每次买入使用全部资金比例"))
@@ -935,8 +955,12 @@ def etf_row(equity: float | None = None) -> dict:
         ev = json.loads(c["last_eval_json"] or "{}")
         tj = json.loads(c["train_json"] or "{}")
         ch = {"id": c["id"], "change": c["change"], "days": ev.get("days"), "need_days": ev.get("need_days"),
-              "fast": (tj.get("fast") or {}).get("verdict"), "challenger": ev.get("challenger"), "champion": ev.get("champion")}
+              "fast": (tj.get("fast") or {}).get("verdict"), "challenger": ev.get("challenger"), "champion": ev.get("champion"),
+              "split_note": tj.get("split_note")}
     aw = next((a for a in awaiting() if a["kind"] == "etf"), None)
+    from . import holdout
+    lin = challenger.etf_lineage()
+    exp = holdout.exposure(lin)
     stt = db.get_setting("etf_trend_state") or {}
     pos = stt.get("position") or {}
     status = etf_versions.status()
@@ -953,4 +977,6 @@ def etf_row(equity: float | None = None) -> dict:
             "unrealized": float(pos.get("unrealized_pl") or 0) if pos else None,
             "budget_pct": float(cfg["budget_pct"]), "pending_offline": bool(cfg.get("pending_offline")),
             "enabled": bool(cfg.get("enabled")), "why": etf_explain(equity),
-            "trade_symbol": cfg["trade_symbol"], "signal_symbol": cfg["signal_symbol"]}
+            "trade_symbol": cfg["trade_symbol"], "signal_symbol": cfg["signal_symbol"], "lineage": lin,
+            "exposed": exp, "validation_used": holdout.used(lin), "lend_pct": float(cfg.get("lend_pct", 50.0)),
+            "lend_state": etf_trend.lend_state().get("state", "none")}

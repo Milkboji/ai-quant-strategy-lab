@@ -236,6 +236,8 @@ def _etf_card(r: dict, actor: str, rl: str, focus: bool) -> None:
             pills += " " + C.pill("已锁定", "blue")
         if r["awaiting"]:
             pills += " " + C.pill("挑战者胜出，等待确认", "purple")
+        if r.get("exposed"):
+            pills += " " + C.pill("验证/测试数据已暴露", "orange")
         if focus:
             pills += " " + C.pill("刚从实验室跳转", "blue")
         st.markdown(f'<div class="aq-slothead"><div><span class="aq-slotname">{C.esc(r["name"])}</span> '
@@ -256,6 +258,8 @@ def _etf_card(r: dict, actor: str, rl: str, focus: bool) -> None:
                 fast = {"pass": "通过", "fail": "更差", "inconclusive": "证据不足，转前向"}.get(ch.get("fast"), "--")
                 st.markdown(C.kv([("挑战者", f"#{ch['id']}"), ("改动", ch["change"] or "--"), ("前向进度", prog),
                                   ("快速检验", fast)]), unsafe_allow_html=True)
+                if ch.get("split_note"):
+                    st.caption(ch["split_note"])
             elif not r["awaiting"]:
                 st.markdown(C.kv([("挑战者", "无")]), unsafe_allow_html=True)
             if r["awaiting"]:
@@ -331,6 +335,23 @@ def _etf_card(r: dict, actor: str, rl: str, focus: bool) -> None:
                 st.rerun()
             c2[2].caption("下一次买入时按新比例下单，不主动加减已有持仓。BTC 策略可分配的资金 = 总权益 − 预留 − "
                           "max(美股设定比例, 美股当前持仓市值占比)。")
+            c3 = st.columns([1, 1, 2])
+            lp = c3[0].number_input("空仓时借给 BTC 的比例 %", min_value=0.0, max_value=100.0,
+                                    value=float(r.get("lend_pct", 50.0)), step=10.0, key="cs_lend_etf")
+            if c3[1].button("保存借出比例", key="cs_lend_etf_save", use_container_width=True):
+                try:
+                    res = ev.set_lend_pct(lp, actor=actor, role=rl)
+                    flash("console", "ok", f"{r['name']}：{res['message']}")
+                except Exception as e:  # noqa: BLE001
+                    flash("console", "err", f"{r['name']}：{e}")
+                st.rerun()
+            c3[2].caption("美股空仓（看空）时，BTC 最多临时使用这部分额度；美股发出买入信号时收回：BTC 暂停新开仓，"
+                          "持仓按规则卖出、现金够买后美股买入，额度归还。全过程写审计。"
+                          f"当前状态：{ {'none': '未借出', 'lent': '已借出', 'reclaim': '正在收回'}.get(r.get('lend_state'), '--') }。")
+        if r.get("exposed"):
+            st.markdown(f'<div class="aq-warn">验证/测试数据已暴露：{C.esc(r["exposed"]["reason"])}。这条谱系的验证检验只作参考、'
+                        f'不能作为晋级依据；留出检验改用上线日 {C.esc(r["exposed"]["forward_from"])} 之后的前向数据。'
+                        f'验证集计次 {r["validation_used"]}/3（与策略实验室同一套计次）。</div>', unsafe_allow_html=True)
         why_block(r["why"], key="etf")
         if r["mismatch"] and r["diff"]:
             with st.expander(f"参数差异：模拟盘 v{run['version_no']} → 实验室 v{lab['version_no']}（{len(r['diff'])} 项）",

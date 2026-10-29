@@ -2,6 +2,7 @@
 from datetime import date, datetime, timezone
 
 import pandas as pd
+import pytest
 
 from aiquant import db
 from aiquant.paper import etf_trend as et
@@ -209,6 +210,7 @@ def test_loss_streak_brake_in_backtest_uses_trading_days():
 def test_live_step_blocks_after_loss_streak_like_backtest(env, monkeypatch):
     from aiquant import market as mk
     from aiquant import rhythm
+    monkeypatch.setattr(rhythm, "us_mode", lambda: "active")
     _setup_step(monkeypatch)
     rhythm.reset_gate(rhythm.ETF_KEY)
     sent = []
@@ -233,6 +235,7 @@ def test_live_step_vol_sizing_and_long_pause(env, monkeypatch):
     assert abs(sent[0]["notional"] - 15000) < 1                      # 30% × 波动率系数 0.5
     monkeypatch.undo()
     _setup_step(monkeypatch)
+    monkeypatch.setattr(rhythm, "us_mode", lambda: "active")
     sent.clear()
     monkeypatch.setattr(et, "_submit", lambda sym, side, **kw: sent.append(kw) or {})
     monkeypatch.setattr(rhythm, "etf_long_metrics", lambda compute=False: {"ok": False, "mean_ret": -3.0,
@@ -252,3 +255,39 @@ def test_etf_long_metrics_yearly(env, monkeypatch):
     m = rhythm.etf_long_metrics(compute=True)
     assert m["ok"] and m["n_years"] >= 4 and m["pos_years"] == m["n_years"]
     assert rhythm.etf_long_metrics()["hist_end"] == "2021-12-31"       # 只读缓存
+
+
+def test_us_rhythm_shadow_mode_never_blocks_but_records(env, monkeypatch):
+    """影子模式：照常计算连亏刹车 / 长周期体检，但不阻止下单、不影响回测，只记录「如果生效会怎样」。"""
+    from aiquant import market as mk
+    from aiquant import rhythm
+    from aiquant.console import audit_log
+    rhythm.set_config(us_mode_at=None)
+    rhythm.ensure_us_shadow_default()
+    assert rhythm.us_mode() == "shadow" and rhythm.is_shadow(mk.US_EQUITY)
+    assert any(a["action"] == "美股节奏模式" for a in audit_log(20, key="rhythm_us"))
+    assert rhythm.current(mk.US_EQUITY) is None and rhythm.configured(mk.US_EQUITY) is not None
+    assert rhythm.current(mk.CRYPTO) is not None                       # 加密货币不受影响
+    _setup_step(monkeypatch)
+    rhythm.reset_gate(rhythm.ETF_KEY)
+    for d in ("2026-10-12", "2026-10-14"):
+        rhythm.live_on_exit(rhythm.ETF_KEY, datetime.fromisoformat(d + "T14:00:00+00:00"), "信号离场", -50.0,
+                            mk.US_EQUITY)
+    sent = []
+    monkeypatch.setattr(et, "_submit", lambda sym, side, **kw: sent.append(kw) or {})
+    et.step(datetime(2026, 10, 21, 14, 0, tzinfo=timezone.utc))
+    assert sent and abs(sent[0]["notional"] - 30000) < 1               # 影子：照常买入，不缩仓
+    sh = db.get_setting("etf_rhythm_shadow")
+    assert "影子模式" in sh["note"] and "连亏" in sh["note"]
+    # 影子模式下 ETF 回测不带节奏规则（回测与模拟盘一致）
+    from aiquant import challenger
+    import numpy as np
+    idx = pd.bdate_range("2020-01-02", periods=400)
+    df = pd.DataFrame({"sig_close": 100 + 8 * np.sin(np.arange(400) / 6.0), "open": 50.0, "close": 50.0}, index=idx)
+    assert challenger.etf_backtest(df, 20, 0.0, "2020-01-01", "2021-12-31")["blocked"] == 0
+    with pytest.raises(PermissionError):
+        rhythm.set_us_mode("active", actor="g", role="viewer")
+    assert rhythm.set_us_mode("active", actor="t", role="trader")["result"] == "已切换"
+    assert rhythm.current(mk.US_EQUITY) is not None
+    rhythm.set_us_mode("shadow", actor="t", role="trader")
+    rhythm.reset_gate(rhythm.ETF_KEY)

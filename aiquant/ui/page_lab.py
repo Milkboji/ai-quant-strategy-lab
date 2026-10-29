@@ -864,6 +864,18 @@ def _paper_why(n: int) -> None:
         from .page_console import why_block
         v = registry.get_version(dep["version_id"])
         st.markdown(f'<div class="aq-sub">模拟盘运行：{C.esc(registry.label(v))}</div>', unsafe_allow_html=True)
+        pv = registry.promoted_running(n, dep["version_id"])
+        if pv:
+            st.markdown(f'<div class="aq-warn">运行版本已晋级为 v{pv["version_no"]}（{C.esc(console.SOURCE_CN.get(pv["source"], pv["source"]))}）。'
+                        "策略位仍是你之前的版本，点击后才切换。</div>", unsafe_allow_html=True)
+            if st.button(f"切换到 v{pv['version_no']}", key=f"adopt_{n}", use_container_width=True):
+                from .login import effective_user, role
+                try:
+                    res = registry.adopt_running(n, pv["id"], actor=effective_user(), role=role())
+                    flash(f"slot{n}", "ok", res["message"])
+                except Exception as e:  # noqa: BLE001
+                    flash(f"slot{n}", "err", str(e))
+                st.rerun()
         plans = console.plans_for()
         why_block(console.explain(dep, plans.get(dep["id"]), None, console.vol_sizing()), key=f"lab{n}")
     except Exception:  # noqa: BLE001
@@ -949,8 +961,14 @@ def etf_lab_panel() -> None:
     admin = role() in ("admin", "trader")   # 与 BTC 相同：修改 / 部署限管理员和交易员
     lk = etf_versions.lock_state()
     with st.container(border=True):
-        right = C.pill(f"运行中：v{cur['version_no']}", "green") + (" " + C.pill("已锁定", "blue") if lk else "")
+        from .. import challenger, holdout
+        exposed = holdout.exposure(challenger.etf_lineage())
+        right = C.pill(f"运行中：v{cur['version_no']}", "green") + (" " + C.pill("已锁定", "blue") if lk else "") + \
+            (" " + C.pill("验证/测试数据已暴露", "orange") if exposed else "")
         C.section(f"美股 ETF 择时：{cfg['signal_symbol']} 均线 → {cfg['trade_symbol']}", right=right)
+        if exposed:
+            st.caption("这条谱系 2025 年以后的数据此前已被研究看过：预览只显示训练期（2017-01-01 ~ 2025-07-30）；"
+                       f"进化的留出检验改用上线日 {exposed['forward_from']} 之后的前向数据。")
         cols = st.columns([1.3, 1])
         with cols[0]:
             st.markdown(f'<div class="aq-sub"><b>当前规则（{C.esc(etf_versions.label(cur))}）</b></div>', unsafe_allow_html=True)

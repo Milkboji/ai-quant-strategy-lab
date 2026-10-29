@@ -268,6 +268,27 @@ def test_unlocked_strategy_keeps_auto_promotion(clean):
     assert pr.get_deployment(did)["version_id"] == st["new_version_id"]
 
 
+def test_promotion_changes_running_version_only_and_user_adopts(clean):
+    """进化 / 挑战者晋级只改运行版本；策略位指针不动，实验室提示「运行版本已晋级为 vX」，用户点击后才切换（写审计）。"""
+    console.set_promotion_config(actor="boss", role="admin", manual_lock_days=0)
+    v1 = _version(5, "指针测试P", new_lineage=True)
+    did = console.deploy_version("slot:5", v1["id"], actor="tester", role="trader", broker="mock")["deployment_id"]
+    assert registry.get_slot(5)["current_version_id"] == v1["id"]
+    ch = _challenger(did, v1, stop_loss_pct=6.5)
+    _win(ch, did)
+    new_vid = _status_of(ch["id"])["new_version_id"]
+    assert pr.get_deployment(did)["version_id"] == new_vid
+    assert registry.get_slot(5)["current_version_id"] == v1["id"]          # 策略位没有被改
+    pv = registry.promoted_running(5, new_vid)
+    assert pv and pv["id"] == new_vid
+    with pytest.raises(PermissionError):
+        registry.adopt_running(5, new_vid, actor="g", role="viewer")
+    registry.adopt_running(5, new_vid, actor="tester", role="trader")
+    assert registry.get_slot(5)["current_version_id"] == new_vid
+    assert registry.promoted_running(5, new_vid) is None
+    assert any(a["action"] == "实验室切换到运行版本" for a in console.audit_log(20, key="slot:5"))
+
+
 def test_global_confirm_queues_and_reject_records_reason(clean):
     console.set_promotion_config(actor="boss", role="admin", require_confirm=True, manual_lock_days=0)
     assert console.promotion_config()["require_confirm"] is True

@@ -28,6 +28,13 @@ def init() -> None:
     except Exception:  # noqa: BLE001
         pass
     research.get_split()
+    try:   # 留出计次统一（ETF 计次并入、已暴露标注、旧分区挑战者注释），幂等
+        from . import holdout, rhythm
+        holdout.migrate()
+        rhythm.ensure_us_shadow_default()
+    except Exception:  # noqa: BLE001
+        import logging
+        logging.getLogger("aiquant").exception("holdout migrate failed")
     jobs.register("backtest", research.execute_backtest)
     jobs.register("final_test", research.execute_backtest)
     jobs.register("ai_analyze", optimizer.run_analyze)
@@ -102,8 +109,7 @@ def submit_backtest(slot_no: int, *, batch_id: str | None = None, allow_test_tou
         sp = research.get_split(mkt)
         start, end = md.to_utc(sp["val_start"]), md.to_utc(sp["test_start"])
         kind = "backtest"
-        used = db.q1("SELECT COUNT(*) AS n FROM holdout_touches h JOIN strategy_versions v ON v.id=h.version_id "
-                     "WHERE h.split='validation' AND v.lineage_id=?", (v["lineage_id"],))["n"]
+        used = research.validation_runs_used(v["lineage_id"])
         pending = db.q1("SELECT COUNT(*) AS n FROM jobs j JOIN strategy_versions v ON v.id=j.version_id "
                         "WHERE j.status IN ('queued','running') AND v.lineage_id=? AND j.params_json LIKE ?",
                         (v["lineage_id"], f'%"start": "{start.isoformat()}"%'))["n"]

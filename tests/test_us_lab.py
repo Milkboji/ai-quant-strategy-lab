@@ -52,13 +52,19 @@ def test_us_dataset_snapshot_and_calendar_gaps(us_data):
         us_daily.get_dataset("QLD", md.to_utc("2010-01-01"), e)
 
 
-def test_us_split_is_separate_and_frozen(us_data):
+def test_us_split_is_fixed_versioned_and_shared(us_data):
+    from aiquant import challenger
     sp_c, sp_u = research.get_split(), research.get_split(mk.US_EQUITY)
-    assert sp_u["market"] == "us_equity" and sp_u != sp_c
+    assert sp_u["version"] == 1 and sp_u != sp_c
+    assert sp_u["train_start"][:10] == "2017-01-01" and sp_u["val_start"][:10] == "2025-07-31"
+    days = mk.trading_days(md.to_utc(sp_u["test_start"]).date(), (md.to_utc(sp_u["test_end"]) - pd.Timedelta(days=1)).date())
+    assert len(days) == 90                                                  # 测试期 = 90 个交易日
     vs, ts_ = md.to_utc(sp_u["val_start"]), md.to_utc(sp_u["test_start"])
-    assert (ts_ - vs).days == 365
     assert research.split_label(vs, ts_, mk.US_EQUITY) == "验证集"
-    assert research.get_split(mk.US_EQUITY) == sp_u
+    assert research.split_label(md.to_utc("2020-01-01"), vs, mk.US_EQUITY) == "训练集"
+    assert challenger.etf_select() == ("2017-01-01", "2025-07-30")         # ETF 进化与实验室同一套分区
+    db.set_setting("us_split_version", None)
+    assert research.us_split()["version"] == 1
 
 
 def test_engine_daily_matches_regime_timing(us_data):

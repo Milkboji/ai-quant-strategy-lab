@@ -140,6 +140,36 @@ def set_current(slot_no: int, vid: int) -> None:
     db.ex("UPDATE slots SET current_version_id=?, updated_at=? WHERE slot_no=?", (vid, db.now_iso(), slot_no))
 
 
+def promoted_running(slot_no: int, running_vid: int | None) -> dict | None:
+    """模拟盘运行的版本由进化 / 挑战者晋级而来、比策略位当前版本新（同一谱系）→ 返回该版本，供实验室提示「运行版本已晋级」。"""
+    if not running_vid:
+        return None
+    s = get_slot(slot_no)
+    cur, run = get_version(s["current_version_id"]), get_version(running_vid)
+    if not run or (cur and cur["id"] == run["id"]):
+        return None
+    if cur and (cur["lineage_id"] != run["lineage_id"] or run["version_no"] <= cur["version_no"]):
+        return None
+    if run["source"] not in ("auto_evolve", "challenger"):
+        return None
+    return run
+
+
+def adopt_running(slot_no: int, vid: int, *, actor: str | None, role: str | None) -> dict:
+    """用户确认后，把策略位切换到运行中的（已晋级）版本。写策略审计。"""
+    from .. import console
+    console.require_role(role)
+    v = get_version(vid)
+    s = get_slot(slot_no)
+    if not v or v["slot_no"] != slot_no:
+        raise ValueError("这个版本不属于该策略位")
+    old = get_version(s["current_version_id"])
+    set_current(slot_no, vid)
+    console.audit(actor, role, "实验室切换到运行版本", f"slot:{slot_no}", v["name"], None,
+                  old["id"] if old else None, vid, "已切换", f"{label(old)} → {label(v)}")
+    return {"result": "已切换", "message": f"策略位已切换到 {label(v)}"}
+
+
 def copy_to_slot(vid: int, target_slot: int) -> dict:
     """把一个已冻结版本复制到另一个策略位，创建新的谱系（来源 copy），不影响原策略位。"""
     v = get_version(vid)

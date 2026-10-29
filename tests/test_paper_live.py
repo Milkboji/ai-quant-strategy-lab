@@ -210,3 +210,27 @@ def test_stale_entry_signal_is_skipped(live, monkeypatch):
     assert not any(m == "POST" for m, u in fake.calls)
     st = db.get_setting(f"stale_signal::{did}")          # 记下最近一次过期信号，供页面解释“为什么没有动作”
     assert st and st["age_min"] >= 40 and st["limit_min"] == 15 and "已过期" in st["reason"]
+
+
+def test_btc_entries_paused_while_etf_reclaims_budget(live):
+    """美股 ETF 收回临时借给 BTC 的额度期间，BTC 不开新仓（持仓照常按规则卖出）。"""
+    fake, did0 = live
+    d0 = db.q1("SELECT * FROM paper_deployments WHERE id=?", (did0,))
+    did = db.ex("INSERT INTO paper_deployments(version_id,config_json,broker,status,created_at,updated_at,is_test) "
+                "VALUES(?,?,?,?,?,?,1)", (d0["version_id"], d0["config_json"], "alpaca_paper", "configured",
+                                          db.now_iso(), db.now_iso()))
+    pr.start(did)
+    end = datetime(2026, 1, 10, tzinfo=UTC)
+    df = _bars(end, days=10, trend=0.0003)
+    fake.price = float(df["close"].iloc[-1])
+    run = pr.PaperRunner(did)
+    fake.qty = run.ledger_qty_all()
+    n0 = sum(1 for m, u in fake.calls if m == "POST")
+    db.set_setting("etf_lend", {"state": "reclaim", "since": db.now_iso(), "lend_pct": 50})
+    try:
+        r = run.step(df, end + timedelta(minutes=5))
+        assert r["action"] == "blocked" and "收回" in r["reason"], r
+        assert sum(1 for m, u in fake.calls if m == "POST") == n0
+    finally:
+        db.set_setting("etf_lend", None)
+        pr.stop(did)

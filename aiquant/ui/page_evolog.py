@@ -45,6 +45,14 @@ def _lines(items: list[tuple[str, str]]) -> str:
                    for k, v in items)
 
 
+def _etf_exposed() -> bool:
+    try:
+        from .. import challenger, holdout
+        return bool(holdout.exposure(challenger.etf_lineage()))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def render() -> None:
     st.markdown('<div class="aq-title">进化记录</div><div class="aq-sub">每一次晋级、淘汰、拒绝都留下完整证据：'
                 '旧版本 → 新版本、参数差异、季度稳健评分、留出检验、前向测试期间双方的收益和回撤，以及是自动还是人工决定的。</div>',
@@ -72,6 +80,8 @@ def _card(r: dict) -> None:
     with st.container(border=True):
         pills = C.pill(r["event"], EVENT_TONE.get(r["event"], "gray")) + " " + \
             C.pill(r["trigger"], TRIGGER_TONE.get(r["trigger"], "gray"))
+        if r["strategy_key"] == "etf" and _etf_exposed():
+            pills += " " + C.pill("验证/测试数据已暴露", "orange")
         who = f" · {r['actor']}" if r["actor"] and r["actor"] != "系统" else ""
         st.markdown(f'<div class="aq-slothead"><div><span class="aq-slotname">{C.esc(r["label"] or r["strategy_key"] or "--")}</span> '
                     f'<span class="aq-meta">{_bj(r["ts"])} 北京时间{C.esc(who)}</span></div><div>{pills}</div></div>'

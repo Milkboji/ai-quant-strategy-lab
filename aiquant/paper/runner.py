@@ -434,6 +434,16 @@ class PaperRunner:
                 out.update(action="none", reason=f"交易节奏：{block}，跳过本次入场信号")
                 self._note("INFO", out["reason"])
                 return out
+            if self.broker.name == "alpaca_paper":
+                try:   # 美股 ETF 正在收回临时借给 BTC 的额度：BTC 暂停新开仓，直到额度归还
+                    from . import etf_trend
+                    if etf_trend.reclaim_active():
+                        out.update(action="blocked", reason="美股 ETF 发出买入信号，正在收回临时借给 BTC 的额度：暂停新开仓，"
+                                                            "直到额度归还（持仓照常按规则卖出）")
+                        self._note("INFO", out["reason"])
+                        return out
+                except Exception:  # noqa: BLE001
+                    pass
             if self.broker.name == "alpaca_paper" and "budget_usd" in dep["config"] \
                     and float(dep["config"]["budget_usd"] or 0) <= 0:
                 out.update(action="blocked", reason="资金额度为 0（等待重新分配），不开新仓")

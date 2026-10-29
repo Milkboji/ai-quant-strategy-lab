@@ -51,26 +51,31 @@ def _is_us(market) -> bool:
     return market is not None and getattr(market, "key", "crypto") != "crypto"
 
 
+# 美股唯一的一套数据分区（实验室、ETF 进化、ETF 挑战者、快速检验共用）。边界按日期冻结、带版本号，不随时间滚动；
+# 需要调整时新增一个版本并切换 settings.us_split_version，旧结果按记录里的分区版本解读。日期均为美东交易日，结束日不含。
+US_SPLITS = {
+    1: {"version": 1, "train_start": "2017-01-01", "val_start": "2025-07-31", "test_start": "2026-06-23",
+        "test_end": "2026-10-29", "frozen_at": "2026-10-29",
+        "note": "训练期 2017-01-01~2025-07-30；验证期 2025-07-31~2026-06-22（224 个交易日）；"
+                "测试期 2026-06-23~2026-10-28（最近 90 个交易日）"},
+}
+
+
+def us_split(version: int | None = None) -> dict:
+    """美股分区（固定日期，带版本号）。返回与加密货币分区相同的键（val_start / test_start / test_end，UTC ISO）。"""
+    v = int(version or db.get_setting("us_split_version") or max(US_SPLITS))
+    d = US_SPLITS[v]
+    iso = lambda x: f"{x}T00:00:00+00:00"   # noqa: E731
+    return {"version": v, "market": "us_equity", "train_start": iso(d["train_start"]), "val_start": iso(d["val_start"]),
+            "test_start": iso(d["test_start"]), "test_end": iso(d["test_end"]), "frozen_at": d["frozen_at"],
+            "note": d["note"]}
+
+
 def get_split(market=None) -> dict:
-    """数据分区（首次使用时冻结）。加密货币：测试集 = 最近 90 天，验证集 = 其前 60 天。
-    美股（日线，按交易日历）：测试集 = 最近 90 天，验证集 = 其前 365 天（日线策略交易少，需要更长的验证区间）。"""
+    """数据分区。加密货币：首次启动时冻结，测试集 = 最近 90 天，验证集 = 其前 60 天。
+    美股：固定日期、带版本号的唯一分区（us_split），按交易日历。"""
     if _is_us(market):
-        sp = db.get_setting("data_split_us")
-        if sp is None:
-            from . import market as mk
-            d = datetime.now(timezone.utc).astimezone(mk.ET).date()
-            last = d - timedelta(days=1)
-            while not mk.is_trading_day(last):
-                last -= timedelta(days=1)
-            test_end = mk.session_close(last).astimezone(timezone.utc) + timedelta(hours=1)
-            test_end = test_end.replace(minute=0, second=0, microsecond=0)
-            test_start = test_end - timedelta(days=90)
-            val_start = test_start - timedelta(days=365)
-            sp = {"val_start": val_start.isoformat(), "test_start": test_start.isoformat(),
-                  "test_end": test_end.isoformat(), "created_at": db.now_iso(), "market": "us_equity",
-                  "note": "美股首次使用时冻结：测试集=最近90天，验证集=其前365天，更早为训练集（按交易日历计算）"}
-            db.set_setting("data_split_us", sp)
-        return sp
+        return us_split()
     sp = db.get_setting("data_split")
     if sp is None:
         test_end = _utc_today()
@@ -242,8 +247,8 @@ def execute_backtest(job: dict, stage, should_stop) -> int:
         raise ValueError("该回测窗口覆盖独立测试集。研究回测默认禁止触及测试集；"
                          "如确需运行，请在设置中勾选『允许触及测试集（将使其失去独立资格）』。")
     if kind == "backtest" and split in ("验证集", "训练+验证"):
-        n = db.q1("SELECT COUNT(*) AS n FROM holdout_touches h JOIN strategy_versions v ON v.id=h.version_id "
-                  "WHERE h.split='validation' AND v.lineage_id=?", (v["lineage_id"],))["n"]
+        from . import holdout
+        n = holdout.used(v["lineage_id"])
         if n >= VALIDATION_RUN_LIMIT:
             raise ValueError(f"该策略谱系已使用验证集 {n} 次，达到上限 {VALIDATION_RUN_LIMIT}，防止过拟合。")
     stage("校验数据")
@@ -281,6 +286,8 @@ def store_backtest(*, job_id, version: dict, slot_no, ds: dict, start: datetime,
                    "initial_cash": cfg.initial_cash, "max_alloc_pct": cfg.max_alloc_pct,
                    "warmup_start": json.loads(ds["quality_json"]).get("warmup_start"),
                    "data_source": ds["source"], "venue": ds["venue"]}
+    if _is_us(market):
+        assumptions["split_version"] = get_split(market)["version"]
     with db.tx() as c:
         cur = c.execute(
             "INSERT INTO backtests(job_id,version_id,slot_no,dataset_id,dataset_hash,window_start,window_end,"
@@ -300,9 +307,9 @@ def store_backtest(*, job_id, version: dict, slot_no, ds: dict, start: datetime,
                  t["exit_fill_ts"], t["exit_price"], t["qty"], t["fee"], t["spread_cost"], t["slippage_cost"],
                  t["exit_reason"], t["pnl"], t["equity_after"]))
         if split in ("验证集", "训练+验证"):
-            c.execute("INSERT INTO holdout_touches(version_id,split,window_start,window_end,backtest_id,touched_at)"
-                      " VALUES(?,?,?,?,?,?)", (v["id"], "validation", start.isoformat(), end.isoformat(), bid,
-                                              db.now_iso()))
+            from . import holdout
+            holdout.ensure()
+            holdout.record(v["lineage_id"], v["id"], start.isoformat(), end.isoformat(), bid, conn=c)
         if split in ("测试集", "跨越测试集") and not is_test:
             c.execute("INSERT INTO holdout_touches(version_id,split,window_start,window_end,backtest_id,touched_at)"
                       " VALUES(?,?,?,?,?,?)", (v["id"], _touch_name("test_contaminated", market), start.isoformat(),
@@ -315,8 +322,8 @@ def store_backtest(*, job_id, version: dict, slot_no, ds: dict, start: datetime,
 
 
 def validation_runs_used(lineage_id: str) -> int:
-    return db.q1("SELECT COUNT(*) AS n FROM holdout_touches h JOIN strategy_versions v ON v.id=h.version_id "
-                 "WHERE h.split='validation' AND v.lineage_id=?", (lineage_id,))["n"]
+    from . import holdout
+    return holdout.used(lineage_id)
 
 
 def ensure_benchmark(ds: dict, df5: pd.DataFrame, start: datetime, end: datetime, r: dict) -> dict:
