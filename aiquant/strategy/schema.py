@@ -122,6 +122,7 @@ class StrategySchema(BaseModel):
     alloc_pct: float = Field(default=100.0, gt=0, le=100)
     direction: Literal["long_only"] = "long_only"
     hypothesis: str = ""
+    signal_symbol: Optional[str] = Field(default=None, pattern=r"^[A-Z]{1,6}$")   # 美股：用另一只 ETF 的日线出信号（如 QQQ → 交易 QLD）
 
     @model_validator(mode="after")
     def _refs(self):
@@ -167,7 +168,9 @@ def validate(d: dict) -> tuple[StrategySchema | None, list[str]]:
 
 
 def canonical(s: StrategySchema | dict) -> str:
-    d = s.model_dump() if isinstance(s, StrategySchema) else s
+    d = s.model_dump() if isinstance(s, StrategySchema) else dict(s)
+    if d.get("signal_symbol") is None:      # 新增的可选字段：为空时不参与哈希，已有版本的哈希保持不变
+        d.pop("signal_symbol", None)
     return json.dumps(d, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
 
 

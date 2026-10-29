@@ -41,14 +41,26 @@ def _price() -> float | None:
 def render() -> None:
     from .login import effective_user, role
     rows = console.rows(price=_price())
+    eq = None
+    try:
+        snap = console.db.q1("SELECT equity FROM account_snapshots ORDER BY ts DESC LIMIT 1")
+        eq = float(snap["equity"]) if snap else None
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        etf = console.etf_row(eq)
+    except Exception:  # noqa: BLE001
+        console.log.exception("etf row failed")
+        etf = None
     st.markdown('<div class="aq-title">策略总台</div>', unsafe_allow_html=True)
     _rules_panel(effective_user(), role())
     show_flash("console")
-    n_run = sum(1 for r in rows if r["status"] in ("运行中", "暂停中"))
-    n_mis = sum(1 for r in rows if r["mismatch"])
-    n_ch = sum(1 for r in rows if r["challenger"])
+    allr = rows + ([etf] if etf else [])
+    n_run = sum(1 for r in allr if r["status"] in ("运行中", "暂停中", "等待空仓后下线"))
+    n_mis = sum(1 for r in allr if r["mismatch"])
+    n_ch = sum(1 for r in allr if r["challenger"])
     n_pend = len(console.awaiting())
-    cells = [("策略总数", f"{len(rows)}", ""), ("模拟盘运行中", f"{n_run}", ""),
+    cells = [("策略总数", f"{len(allr)}", ""), ("模拟盘运行中", f"{n_run}", ""),
              ("版本不一致", f"{n_mis}", "color:#EA8A0C" if n_mis else ""), ("挑战者 / 待确认", f"{n_ch} / {n_pend}", "color:#7C3AED" if n_pend else "")]
     st.markdown('<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px;margin:6px 0 10px">'
                 + "".join(f'<div class="aq-m"><div class="l">{C.esc(l)}</div><div class="n" style="font-size:22px;{s}">'
@@ -58,6 +70,8 @@ def render() -> None:
     focus = st.session_state.pop("console_focus", None)
     for r in rows:
         _card(r, effective_user(), role(), focus == r["key"])
+    if etf:
+        _etf_card(etf, effective_user(), role(), focus == "etf")
     _audit_panel()
 
 
@@ -207,6 +221,122 @@ def _actions(r: dict, actor: str, rl: str) -> None:
             except Exception as e:  # noqa: BLE001
                 flash("console", "err", f"{r['name']}：{e}")
             st.rerun()
+
+
+def _etf_card(r: dict, actor: str, rl: str, focus: bool) -> None:
+    """美股 ETF 择时卡片：与 BTC 策略同样的版本 / 锁定 / 待确认 / 上下线 / 审计，参数版本来自策略实验室。"""
+    from ..paper import etf_versions as ev
+    run, lab = r["run"], r["lab"]
+    tone = {"运行中": "green", "暂停中": "orange", "等待空仓后下线": "orange", "已下线": "gray"}
+    with st.container(border=True):
+        pills = C.pill(r["status"], tone.get(r["status"], "gray")) + " " + C.pill("美股 · 日线", "blue")
+        if r["mismatch"]:
+            pills += " " + C.pill("版本不一致", "orange")
+        if r["lock"]:
+            pills += " " + C.pill("已锁定", "blue")
+        if r["awaiting"]:
+            pills += " " + C.pill("挑战者胜出，等待确认", "purple")
+        if focus:
+            pills += " " + C.pill("刚从实验室跳转", "blue")
+        st.markdown(f'<div class="aq-slothead"><div><span class="aq-slotname">{C.esc(r["name"])}</span> '
+                    f'<span class="aq-meta">{C.esc(r["signal_symbol"])} → {C.esc(r["trade_symbol"])} · 来源：策略实验室参数版本'
+                    f'</span></div><div>{pills}</div></div>',
+                    unsafe_allow_html=True)
+        cols = st.columns([1.5, 1.2, 1.0, 1.4])
+        with cols[0]:
+            st.markdown(C.kv([("实验室最新", ev.label(lab) if lab else "--"), ("模拟盘", ev.label(run)),
+                              ("K线周期", "日线（美东收盘）")]), unsafe_allow_html=True)
+            if r["mismatch"]:
+                st.markdown(f'<div class="aq-warn">版本不一致：实验室 v{lab["version_no"]} ≠ 模拟盘 v{run["version_no"]}。'
+                            "实验室有更新的版本，尚未部署</div>", unsafe_allow_html=True)
+        with cols[1]:
+            ch = r["challenger"]
+            if ch:
+                prog = (f"{int(ch['days'] or 0)} / {ch['need_days']} 个交易日" if ch.get("need_days") else "等待首次评估")
+                fast = {"pass": "通过", "fail": "更差", "inconclusive": "证据不足，转前向"}.get(ch.get("fast"), "--")
+                st.markdown(C.kv([("挑战者", f"#{ch['id']}"), ("改动", ch["change"] or "--"), ("前向进度", prog),
+                                  ("快速检验", fast)]), unsafe_allow_html=True)
+            elif not r["awaiting"]:
+                st.markdown(C.kv([("挑战者", "无")]), unsafe_allow_html=True)
+            if r["awaiting"]:
+                a = r["awaiting"]
+                st.markdown(f'<div class="aq-sub" style="color:#6D28D9">挑战者 #{a["id"]} 胜出，等待确认：'
+                            f'{C.esc(a["change"] or "")}。请在上方「待确认」里批准或拒绝。</div>', unsafe_allow_html=True)
+        with cols[2]:
+            st.markdown(C.kv([("持仓", f"{r['qty']:,.4f} {r['trade_symbol']}" if r["value"] is not None else "--"),
+                              ("市值", C.usd(r["value"]) if r["value"] is not None else "--"),
+                              ("浮动盈亏", f"{r['unrealized']:+,.0f}" if r["unrealized"] is not None else "--"),
+                              ("资金比例", f"{r['budget_pct']:g}%（固定）")]), unsafe_allow_html=True)
+        with cols[3]:
+            lk = r["lock"]
+            if lk and lk.get("until"):
+                why = ("手动部署后自动锁定" if lk.get("kind") == "manual_deploy" else "已锁定") + f"，至 {_bj(lk['until'])}"
+            elif lk:
+                why = f"{lk.get('by') or ''} 手动锁定，不会自动到期"
+            else:
+                why = "未锁定：挑战者胜出后按规则自动晋级" if not r["block"] else f"未锁定（{r['block']}）"
+            on = st.toggle("锁定版本", value=bool(lk), key="cs_lock_etf", help="锁定后，自动进化仍会生成并前向测试挑战者，"
+                           "但胜出后不会自动替换，只进入待确认队列")
+            st.caption(why)
+            if on != bool(lk):
+                try:
+                    res = ev.set_lock(on, actor=actor, role=rl)
+                    flash("console", "ok", f"{r['name']}：{res['message']}")
+                except Exception as e:  # noqa: BLE001
+                    flash("console", "err", f"{r['name']}：{e}")
+                st.rerun()
+            vs = r["versions"]
+            if vs:
+                ids = [v["id"] for v in vs]
+                want = (lab or {}).get("id")
+                tags = {v["id"]: f"v{v['version_no']} · {v['sma']} 日 ±{float(v['band']):.0%}"
+                        + ("（运行中）" if v["id"] == run["id"] else "") for v in vs}
+                vid = st.selectbox("选择版本", ids, index=ids.index(want) if want in ids else 0, key="cs_v_etf",
+                                   format_func=lambda i: tags.get(i, str(i)))
+                if st.button("部署此版本", key="cs_dep_etf", type="primary", use_container_width=True):
+                    try:
+                        res = ev.deploy(int(vid), confirmed=True, actor=actor, role=rl)
+                        flash("console", "ok", f"{r['name']}：{res['message']}")
+                    except Exception as e:  # noqa: BLE001
+                        flash("console", "err", f"{r['name']}：{e}")
+                    st.rerun()
+            if r["enabled"] and not r["pending_offline"]:
+                conf = st.checkbox("确认下线", key="cs_offc_etf",
+                                   help="空仓时立即下线；有持仓时先停止新开仓，按信号卖出后自动下线。不会主动平仓。")
+                if st.button("下线", key="cs_off_etf", use_container_width=True, disabled=not conf):
+                    try:
+                        res = ev.set_online(False, actor=actor, role=rl)
+                        flash("console", "ok" if res["result"] == "已下线" else "warn", f"{r['name']}：{res['message']}")
+                    except Exception as e:  # noqa: BLE001
+                        flash("console", "err", f"{r['name']}：{e}")
+                    st.rerun()
+            elif not r["enabled"] or r["pending_offline"]:
+                if st.button("重新上线", key="cs_on_etf", use_container_width=True):
+                    try:
+                        res = ev.set_online(True, actor=actor, role=rl)
+                        flash("console", "ok", f"{r['name']}：{res['message']}")
+                    except Exception as e:  # noqa: BLE001
+                        flash("console", "err", f"{r['name']}：{e}")
+                    st.rerun()
+        with st.expander(f"资金比例：{r['budget_pct']:g}%（固定，不参与 BTC 的按实力分配）"):
+            c2 = st.columns([1, 1, 2])
+            pct = c2[0].number_input("资金比例 %", min_value=ev.BUDGET_RANGE[0], max_value=ev.BUDGET_RANGE[1],
+                                     value=float(r["budget_pct"]), step=5.0, key="cs_pct_etf")
+            if c2[1].button("保存资金比例", key="cs_pct_etf_save", use_container_width=True):
+                try:
+                    res = ev.set_budget_pct(pct, actor=actor, role=rl)
+                    flash("console", "ok", f"{r['name']}：{res['message']}")
+                except Exception as e:  # noqa: BLE001
+                    flash("console", "err", f"{r['name']}：{e}")
+                st.rerun()
+            c2[2].caption("下一次买入时按新比例下单，不主动加减已有持仓。BTC 策略可分配的资金 = 总权益 − 预留 − "
+                          "max(美股设定比例, 美股当前持仓市值占比)。")
+        why_block(r["why"], key="etf")
+        if r["mismatch"] and r["diff"]:
+            with st.expander(f"参数差异：模拟盘 v{run['version_no']} → 实验室 v{lab['version_no']}（{len(r['diff'])} 项）",
+                             expanded=focus):
+                st.dataframe(pd.DataFrame([{"项目": k, f"模拟盘 v{run['version_no']}": a, f"实验室 v{lab['version_no']}": b}
+                                           for k, a, b in r["diff"]]), hide_index=True, use_container_width=True)
 
 
 def _audit_panel() -> None:

@@ -59,9 +59,20 @@ def _research_status(act: int) -> str:
 # 全局研究设置
 # ---------------------------------------------------------------------------
 
+def _sym_label(r: dict) -> str:
+    s = r.get("symbol") or "BTC/USD"
+    return "BTC/USD 现货" if s == "BTC/USD" else f"{s} 美股 ETF · 日线"
+
+
+def _bh_name(r: dict) -> str:
+    s = r.get("symbol") or "BTC/USD"
+    return "BTC" if s == "BTC/USD" else s
+
+
 def _save_research():
     ss = st.session_state
     upd = {
+        "symbol": ss.get("g_sym") or "BTC/USD",
         "source": ss["g_src"], "timeframe_min": ss["g_tf"], "window_preset": ss["g_preset"],
         "window_anchor": "latest" if ss["g_anchor"] == "最新数据" else "train_end",
         "initial_cash": float(ss["g_cash"]), "max_alloc_pct": float(ss["g_alloc"]),
@@ -82,12 +93,21 @@ def global_settings() -> dict:
         left, right = st.columns([7.2, 1.5], gap="medium")
         with left:
             c = st.columns([1.05, 1.5, 1.0, 1.0, 1.15, 1.0, 0.85, 0.85, 0.8, 0.8])
-            c[0].selectbox("交易品种", ["BTC/USD 现货"], key="g_sym", help="本版本只研究 BTC/USD 现货（Alpaca us 场所）")
+            from ..data.us_daily import UNIVERSE
+            syms = ["BTC/USD"] + UNIVERSE
+            c[0].selectbox("交易品种", syms, index=syms.index(r["symbol"]) if r["symbol"] in syms else 0, key="g_sym",
+                           format_func=lambda x: "BTC/USD 现货" if x == "BTC/USD" else f"{x}（美股 ETF · 日线）",
+                           on_change=_save_research,
+                           help="BTC/USD：Alpaca 加密货币现货，5 分钟执行；美股 ETF：Alpaca 日线（复权），按美东交易日收盘出信号、"
+                                "下一交易日开盘成交。策略描述里写另一只 ETF（如“QQQ 收盘价站上150日均线”）就用它出信号。")
+            us = research.market_of(r).key != "crypto"
             c[1].selectbox("行情来源", srcs, index=srcs.index(r["source"]) if r["source"] in srcs else 0,
-                           format_func=lambda x: SRC_LABEL[x], key="g_src", on_change=_save_research)
-            c[2].selectbox("K线周期（全局）", TF_OPTS, index=TF_OPTS.index(int(r["timeframe_min"])),
-                           format_func=lambda x: TF_LABEL[x], key="g_tf", on_change=_save_research)
-            presets = ["30天", "90天", "180天", "365天", "自定义"]
+                           format_func=lambda x: SRC_LABEL[x], key="g_src", on_change=_save_research, disabled=us,
+                           help="美股固定使用本地美股日线库（Alpaca 复权日线，每个交易日自动更新）" if us else None)
+            c[2].selectbox("K线周期（全局）", TF_OPTS, index=TF_OPTS.index(1440 if us else int(r["timeframe_min"])),
+                           format_func=lambda x: TF_LABEL[x], key="g_tf", on_change=_save_research, disabled=us,
+                           help="美股只支持日线" if us else None)
+            presets = ["30天", "90天", "180天", "365天", "730天", "1095天", "1825天", "自定义"]
             c[3].selectbox("回测天数", presets, index=presets.index(r["window_preset"]), key="g_preset",
                            on_change=_save_research)
             anchors = ["训练集末尾（推荐）", "最新数据"]
@@ -99,25 +119,31 @@ def global_settings() -> dict:
             c[6].number_input("最大仓位%", min_value=1.0, max_value=100.0, step=5.0, value=float(r["max_alloc_pct"]),
                               key="g_alloc", on_change=_save_research)
             c[7].number_input("手续费 bps/边", min_value=0.0, max_value=200.0, step=1.0, value=float(r["fee_bps"]),
-                              key="g_fee", on_change=_save_research)
+                              key="g_fee", on_change=_save_research, disabled=us)
             c[8].number_input("滑点 bps", min_value=0.0, max_value=100.0, step=0.5, value=float(r["slippage_bps"]),
-                              key="g_slip", on_change=_save_research)
+                              key="g_slip", on_change=_save_research, disabled=us)
             c[9].number_input("点差代理 bps", min_value=0.0, max_value=100.0, step=0.5, value=float(r["spread_bps"]),
-                              key="g_spread", on_change=_save_research,
+                              key="g_spread", on_change=_save_research, disabled=us,
                               help="Alpaca 历史逐笔报价未纳入本版本，采用冻结并披露的点差代理模型（全价差，每笔成交计一半）")
             if r["window_preset"] == "自定义":
                 d = st.columns([1, 1, 4])
                 s0, e0 = research.resolve_window(r) if r.get("custom_start") else (
-                    md.to_utc(research.get_split()["val_start"]) - timedelta(days=90),
-                    md.to_utc(research.get_split()["val_start"]))
+                    md.to_utc(research.get_split(research.market_of(r))["val_start"]) - timedelta(days=90),
+                    md.to_utc(research.get_split(research.market_of(r))["val_start"]))
                 d[0].date_input("开始日期(UTC)", value=s0.date(), key="g_cs", on_change=_save_research)
                 d[1].date_input("结束日期(UTC)", value=e0.date(), key="g_ce", on_change=_save_research)
             try:
                 s, e = research.resolve_window(research.get_research())
-                lab = research.split_label(s, e)
+                lab = research.split_label(s, e, research.market_of(r))
                 warn = "" if lab == "训练集" else " ⚠ 窗口不完全位于训练集"
-                st.caption(f"回测窗口：{s:%Y-%m-%d %H:%M} → {e:%Y-%m-%d %H:%M} UTC（{(e - s).days} 天，{lab}）{warn}　·　"
-                           f"K线周期 ≠ 回测天数：信号按所选周期在整个窗口内执行；另加 {md.DEFAULT_WARMUP_DAYS} 天仅用于指标预热。")
+                if us:
+                    m = research.market_of(r)
+                    st.caption(f"回测窗口：{s:%Y-%m-%d} → {e:%Y-%m-%d}（{(e - s).days} 天，{lab}）{warn}　·　美股日线：另加 420 天仅用于指标预热；"
+                               f"成本固定为佣金 {m.fee_bps:g}、滑点 {m.slippage_bps:g}bp、点差 {m.spread_bps:g}bp（卖出另计监管费 "
+                               f"{m.sell_fee_bps:g}bp），交易节奏按美股参数（交易日计时）。")
+                else:
+                    st.caption(f"回测窗口：{s:%Y-%m-%d %H:%M} → {e:%Y-%m-%d %H:%M} UTC（{(e - s).days} 天，{lab}）{warn}　·　"
+                               f"K线周期 ≠ 回测天数：信号按所选周期在整个窗口内执行；另加 {md.DEFAULT_WARMUP_DAYS} 天仅用于指标预热。")
             except Exception as ex:  # noqa: BLE001
                 st.caption(f"窗口设置无效：{ex}")
         with right:
@@ -173,7 +199,7 @@ def target_banner(r: dict) -> None:
         sp = x["split_label"]
         if sp in best and (best[sp] is None or m["net_return_pct"] > best[sp][0]):
             best[sp] = (m["net_return_pct"], f"{x['name']} v{x['version_no']}")
-    tst = research.test_set_status()
+    tst = research.test_set_status(research.market_of(r))
     tgt = config.DEFAULTS.target_return_pct
     def f(k):
         v = best[k]
@@ -187,7 +213,7 @@ def target_banner(r: dict) -> None:
                 f'({C.esc(dq["grade"])}) · 采集 {ds["fetched_at"][:16]} · 哈希 {ds["sha256"][:10]}'
                 + (' · <b class="neg">测试数据</b>' if ds["is_test"] else "")) if ds else "数据：尚未加载（首次回测会自动从所选来源获取）"
     st.markdown(
-        f'<div class="aq-banner"><span>🎯 <b>研究目标：90天净收益 ≥ 30%</b>（BTC/USD 现货 | 初始资金 {r["initial_cash"]:,.0f} USD | '
+        f'<div class="aq-banner"><span>🎯 <b>研究目标：90天净收益 ≥ 30%</b>（{C.esc(_sym_label(r))} | 初始资金 {r["initial_cash"]:,.0f} USD | '
         f'最大仓位 {r["max_alloc_pct"]:.0f}% | 仅做多 | 1倍 | 不使用杠杆）</span>'
         f'<span>最佳训练收益 {f("训练集")}</span><span>最佳验证收益 {f("验证集")}</span>'
         f'<span>独立测试收益 {test_txt}</span><span>距离目标 <b>{gap}</b>（训练集结果不代表目标达成）</span>'
@@ -323,12 +349,12 @@ def kline_dialog(bt_id: int, title: str):
     else:
         t = trades.rename(columns={"entry_signal_ts": "入场信号时间", "entry_fill_ts": "入场成交时间", "entry_price": "买入价格",
                                    "exit_signal_ts": "退出信号时间", "exit_fill_ts": "退出成交时间", "exit_price": "卖出价格",
-                                   "qty": "BTC数量", "fee": "手续费", "spread_cost": "点差", "slippage_cost": "滑点",
+                                   "qty": "数量", "fee": "手续费", "spread_cost": "点差", "slippage_cost": "滑点",
                                    "exit_reason": "退出原因", "pnl": "每笔盈亏", "equity_after": "累计净值"})
         st.dataframe(t.drop(columns=["id", "backtest_id"]), use_container_width=True, height=300,
                      column_config={c: st.column_config.NumberColumn(format="%.2f") for c in
                                     ("买入价格", "卖出价格", "手续费", "点差", "滑点", "每笔盈亏", "累计净值")} |
-                                   {"BTC数量": st.column_config.NumberColumn(format="%.6f")})
+                                   {"数量": st.column_config.NumberColumn(format="%.6f")})
     with st.expander("回测假设（统一且明确披露）"):
         for a in b["assumptions"]["rules"]:
             st.markdown(f"- {a}")
@@ -353,7 +379,7 @@ def slot_card(n: int, r: dict) -> None:
             tf_eff, aux_eff = research.effective_tf(slot, (cur or {}).get("schema") or draft or {}, r)
         except ValueError:
             aux_eff = None
-        st.markdown(f'<div class="aq-meta">BTC/USD · {TF_LABEL.get(tf_eff, "--")}'
+        st.markdown(f'<div class="aq-meta">{C.esc(_sym_label(r))} · {TF_LABEL.get(tf_eff, "--")}'
                     f'{" + 辅助 " + TF_LABEL[aux_eff] if aux_eff else ""}</div>', unsafe_allow_html=True)
         # K线缩略图（与回测数据版本一致）
         if res:
@@ -611,7 +637,7 @@ def comparison(r: dict) -> None:
             labels = [f"策略{i}" for i in done["策略位"]]
             vals = done["净收益率%"].tolist()
             if bm:
-                labels.append("BTC买入持有")
+                labels.append(f"{_bh_name(r)}买入持有")
                 vals.append(bm["metrics"]["net_return_pct"])
             if labels:
                 st.plotly_chart(C.bar_compare(labels, vals, height=268), use_container_width=True, key="cmp_ret")
@@ -627,7 +653,7 @@ def comparison(r: dict) -> None:
                 b = research.get_backtest(int(row["_bt"]))
                 series[f"策略{row['策略位']}"] = (b["equity"], C.SLOT_COLORS[row["策略位"]], float(r["initial_cash"]))
             if bm:
-                series["BTC买入持有"] = (bm["equity"], C.SLOT_COLORS["BH"], float(r["initial_cash"]))
+                series[f"{_bh_name(r)}买入持有"] = (bm["equity"], C.SLOT_COLORS["BH"], float(r["initial_cash"]))
             if series:
                 st.plotly_chart(C.equity_compare(series, height=250), use_container_width=True, key="cmp_eq")
             else:
@@ -638,7 +664,7 @@ def comparison(r: dict) -> None:
             labels = [f"策略{i}" for i in done["策略位"]]
             vals = done["最大回撤%"].tolist()
             if bm:
-                labels.append("BTC买入持有"); vals.append(bm["metrics"]["max_drawdown_pct"])
+                labels.append(f"{_bh_name(r)}买入持有"); vals.append(bm["metrics"]["max_drawdown_pct"])
             if labels:
                 st.plotly_chart(C.bar_compare(labels, vals, height=250, horizontal=True,
                                               colors=[C.RED] * len(vals)), use_container_width=True, key="cmp_dd")
@@ -655,7 +681,7 @@ def comparison(r: dict) -> None:
                 st.markdown('<div class="aq-placeholder">暂无数据</div>', unsafe_allow_html=True)
     with c[3]:
         with st.container(border=True):
-            C.section("BTC 买入持有基准")
+            C.section(f"{_bh_name(r)} 买入持有基准")
             if bm:
                 m = bm["metrics"]
                 best = done.iloc[0]
@@ -855,7 +881,8 @@ def _confirm_panel(n: int, draft: dict, cur: dict | None) -> None:
     ok = registry.draft_confirmed(n)
     with st.container(border=True):
         st.markdown('<div class="aq-sub"><b>规则复述（请核对）</b>：系统是这样理解你的策略的</div>', unsafe_allow_html=True)
-        for t, x in narrate(draft):
+        r_ = research.get_research()
+        for t, x in narrate(draft, research.market_of(r_), r_.get("symbol")):
             st.markdown(f'<div class="aq-sub" style="margin:3px 0;overflow-wrap:anywhere"><b>{C.esc(t)}</b>：{C.esc(x)}</div>',
                         unsafe_allow_html=True)
         if same:
@@ -919,7 +946,7 @@ def etf_lab_panel() -> None:
     from .login import effective_user, role
     cfg = etf_trend.get_config()
     cur = etf_versions.running()
-    admin = role() == "admin"
+    admin = role() in ("admin", "trader")   # 与 BTC 相同：修改 / 部署限管理员和交易员
     lk = etf_versions.lock_state()
     with st.container(border=True):
         right = C.pill(f"运行中：v{cur['version_no']}", "green") + (" " + C.pill("已锁定", "blue") if lk else "")
@@ -990,7 +1017,7 @@ def etf_lab_panel() -> None:
                     flash("etf", "err", str(e))
                 st.rerun()
         if not admin:
-            st.caption("你可以查看规则、版本和参数；修改和部署需要管理员账号。")
+            st.caption("你可以查看规则、版本和参数；修改和部署需要管理员或交易员账号。")
         show_flash("etf")
 
 

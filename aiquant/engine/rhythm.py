@@ -44,16 +44,17 @@ class Rhythm:
         names = {f.name for f in fields(cls)}
         return cls(**{k: v for k, v in d.items() if k in names})
 
-    def describe(self) -> list[str]:
+    def describe(self, unit: str = "小时", asset: str = "BTC") -> list[str]:
+        """unit：时长单位（加密货币「小时」，美股「个交易日」）。"""
         out = []
         if self.cooldown_hours_after_stop:
-            out.append(f"止损后冷却 {self.cooldown_hours_after_stop:g} 小时")
+            out.append(f"止损后冷却 {self.cooldown_hours_after_stop:g} {unit}")
         if self.cooldown_hours_after_exit:
-            out.append(f"普通离场后冷却 {self.cooldown_hours_after_exit:g} 小时")
+            out.append(f"普通离场后冷却 {self.cooldown_hours_after_exit:g} {unit}")
         if self.loss_streak_n:
-            out.append(f"连亏 {self.loss_streak_n} 笔暂停开仓 {self.loss_streak_pause_hours:g} 小时")
+            out.append(f"连亏 {self.loss_streak_n} 笔暂停开仓 {self.loss_streak_pause_hours:g} {unit}")
         if self.regime_sma_days:
-            out.append(f"BTC 日线低于 {self.regime_sma_days} 日均线不开新仓")
+            out.append(f"{asset} 日线低于 {self.regime_sma_days} 日均线不开新仓")
         if self.vol_target_pct:
             out.append(f"波动率定仓：年化目标 {self.vol_target_pct:g}%，最低 {self.vol_min_mult:.0%} 仓位")
         if self.max_entries_per_day:
@@ -64,17 +65,29 @@ class Rhythm:
 STOP_REASONS = ("止损", "移动止损", "止损/移动止损")
 
 
-def daily_context(df5: pd.DataFrame, rh: Rhythm) -> pd.DataFrame:
-    """按 UTC 日聚合，返回每个已收盘日线的 close_time、regime_ok、vol_mult。
+def daily_context(df5: pd.DataFrame, rh: Rhythm, market=None) -> pd.DataFrame:
+    """按「日」聚合，返回每个已收盘日线的 close_time、regime_ok、vol_mult。
 
-    close_time = 次日 00:00 UTC；某时刻 t 只能使用 close_time <= t 的日线。
+    加密货币：UTC 自然日，close_time = 次日 00:00 UTC，年化 √365。
+    美股：美东交易日，close_time = 当天收盘（16:00，半日市 13:00），年化 √252。
+    某时刻 t 只能使用 close_time <= t 的日线。df5 可以是 5 分钟 K 线，也可以直接是日线（列 ts、close）。
     """
     if df5.empty:
         return pd.DataFrame(columns=["close_time", "regime_ok", "vol_mult"])
     d = df5[["ts", "close"]].copy()
     d["ts"] = pd.to_datetime(d["ts"], utc=True)
-    day = d.set_index("ts")["close"].resample("1D").last().dropna()
-    out = pd.DataFrame({"close_time": day.index + pd.Timedelta(days=1), "close": day.values})
+    us = market is not None and getattr(market, "key", "crypto") != "crypto"
+    if us:
+        from .. import market as mk
+        d["day"] = d["ts"].dt.tz_convert(mk.ET).dt.date
+        day = d.groupby("day")["close"].last()
+        ct = [pd.Timestamp(mk.session_close(x)) for x in day.index]
+        out = pd.DataFrame({"close_time": pd.to_datetime(ct, utc=True), "close": day.values})
+        ann = float(market.periods_per_year)
+    else:
+        day = d.set_index("ts")["close"].resample("1D").last().dropna()
+        out = pd.DataFrame({"close_time": day.index + pd.Timedelta(days=1), "close": day.values})
+        ann = float(getattr(market, "periods_per_year", 365) or 365)
     if rh.regime_sma_days:
         sma = out["close"].rolling(rh.regime_sma_days, min_periods=rh.regime_sma_days).mean()
         out["regime_ok"] = (out["close"] >= sma) | sma.isna()
@@ -82,7 +95,7 @@ def daily_context(df5: pd.DataFrame, rh: Rhythm) -> pd.DataFrame:
         out["regime_ok"] = True
     if rh.vol_target_pct:
         r = np.log(out["close"]).diff()
-        vol = r.rolling(rh.vol_lookback_days, min_periods=max(5, rh.vol_lookback_days // 2)).std() * np.sqrt(365) * 100
+        vol = r.rolling(rh.vol_lookback_days, min_periods=max(5, rh.vol_lookback_days // 2)).std() * np.sqrt(ann) * 100
         m = (rh.vol_target_pct / vol).clip(lower=rh.vol_min_mult, upper=1.0)
         out["vol_mult"] = m.fillna(1.0)
     else:
@@ -109,8 +122,9 @@ def lookup(ctx: pd.DataFrame, times) -> tuple[np.ndarray, np.ndarray]:
 class Gate:
     """节奏状态机：回测与实盘共用。时间均为 UTC pandas Timestamp。"""
 
-    def __init__(self, rh: Rhythm):
+    def __init__(self, rh: Rhythm, market=None):
         self.rh = rh
+        self.market = market        # None / 加密货币：时长按小时；美股：按交易日（休市日不算）
         self.block_until: pd.Timestamp | None = None
         self.block_why = ""
         self.streak = 0
@@ -120,18 +134,29 @@ class Gate:
         rh = self.rh
         hrs = rh.cooldown_hours_after_stop if reason in STOP_REASONS else rh.cooldown_hours_after_exit
         if hrs:
-            self._extend(t + pd.Timedelta(hours=hrs), "止损后冷却" if reason in STOP_REASONS else "离场后冷却")
+            self._extend(self._after(t, hrs), "止损后冷却" if reason in STOP_REASONS else "离场后冷却")
         self.streak = self.streak + 1 if pnl <= 0 else 0
         if rh.loss_streak_n and self.streak >= rh.loss_streak_n:
-            self._extend(t + pd.Timedelta(hours=rh.loss_streak_pause_hours), f"连亏 {self.streak} 笔刹车")
+            self._extend(self._after(t, rh.loss_streak_pause_hours), f"连亏 {self.streak} 笔刹车")
             self.streak = 0
+
+    def _after(self, t: pd.Timestamp, amount: float) -> pd.Timestamp:
+        if self.market is None or getattr(self.market, "duration_unit", "hours") == "hours":
+            return t + pd.Timedelta(hours=amount)
+        return self.market.after(t, amount)
 
     def _extend(self, until: pd.Timestamp, why: str) -> None:
         if self.block_until is None or until > self.block_until:
             self.block_until, self.block_why = until, why
 
+    def _day(self, t: pd.Timestamp) -> str:
+        """「每日开仓上限」按哪一天计数：加密货币 UTC 日，美股美东交易日。"""
+        if self.market is not None and getattr(self.market, "key", "crypto") != "crypto":
+            return pd.Timestamp(t).tz_convert("America/New_York").strftime("%Y-%m-%d")
+        return t.strftime("%Y-%m-%d")
+
     def on_entry(self, t: pd.Timestamp) -> None:
-        k = t.strftime("%Y-%m-%d")
+        k = self._day(t)
         self.entries_day[k] = self.entries_day.get(k, 0) + 1
 
     def check(self, t: pd.Timestamp, regime_ok: bool = True) -> str | None:
@@ -139,7 +164,7 @@ class Gate:
         if self.block_until is not None and t < self.block_until:
             return f"{self.block_why}（至 {(self.block_until + pd.Timedelta(hours=8)):%m-%d %H:%M} 北京时间）"
         if self.rh.regime_sma_days and not regime_ok:
-            return f"大势过滤：BTC 日线低于 {self.rh.regime_sma_days} 日均线"
-        if self.rh.max_entries_per_day and self.entries_day.get(t.strftime("%Y-%m-%d"), 0) >= self.rh.max_entries_per_day:
+            return f"大势过滤：日线低于 {self.rh.regime_sma_days} 日均线"
+        if self.rh.max_entries_per_day and self.entries_day.get(self._day(t), 0) >= self.rh.max_entries_per_day:
             return f"今日开仓已达 {self.rh.max_entries_per_day} 次"
         return None

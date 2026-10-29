@@ -267,6 +267,8 @@ def _get_dataset(start: datetime, end: datetime, *, source: str = "alpaca", symb
 def load_dataset(ds: dict) -> pd.DataFrame:
     df = pd.read_csv(ds["path"])
     df["ts"] = pd.to_datetime(df["ts"], utc=True)
+    if "close_time" in df.columns:          # 美股日线快照
+        df["close_time"] = pd.to_datetime(df["close_time"], utc=True)
     if _hash_df(df) != ds["sha256"]:
         raise RuntimeError(f"数据快照 {ds['id']} 哈希校验失败，可能被修改")
     return df

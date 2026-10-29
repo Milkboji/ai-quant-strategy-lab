@@ -174,6 +174,9 @@ def etf_panel() -> None:
         c[4].metric("最近检查", (str(stt.get("checked_at"))[5:16].replace("T", " ") + " UTC") if stt else "--")
         if stt.get("action"):
             st.caption(f"最近动作：{stt['action']}（信号日 {sig.get('date')}）")
+        why = et.get_why()
+        if why:
+            st.caption(f"现在：{why['text']}")
         od = et.orders(10)
         if od:
             st.dataframe(pd.DataFrame([{"时间(UTC)": o["ts"][:16].replace("T", " "), "方向": "买入" if o["side"] == "buy" else "卖出",

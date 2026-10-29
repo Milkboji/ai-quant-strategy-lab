@@ -58,8 +58,8 @@ def _cond_txt(c: dict, inds: dict, aux_tf: int | None) -> str:
     return f"{_operand(c['left'], inds, aux_tf)} {OP_TXT.get(c['op'], c['op'])} {_operand(c['right'], inds, aux_tf)}"
 
 
-def narrate(schema: dict | None) -> list[tuple[str, str]]:
-    """返回 [(小标题, 大白话)]；schema 不合法时返回空列表。"""
+def narrate(schema: dict | None, market=None, trade_symbol: str | None = None) -> list[tuple[str, str]]:
+    """返回 [(小标题, 大白话)]；schema 不合法时返回空列表。market：研究设置里交易品种所属市场（加密货币 / 美股）。"""
     obj, errs = validate(schema or {})
     if not obj:
         return []
@@ -67,9 +67,17 @@ def narrate(schema: dict | None) -> list[tuple[str, str]]:
     inds = {i["id"]: i for i in s["indicators"]}
     aux = s.get("aux_tf")
     out: list[tuple[str, str]] = []
-    tf = TF_CN.get(s.get("signal_tf"), "全局设置里的周期")
-    out.append(("周期", f"信号周期：{tf}K线；每根K线收盘后才判断，不看还没走完的K线。"
-                + (f"辅助周期：{TF_CN.get(aux, '辅助周期')}，用来看大方向（只用已收盘的K线）。" if aux else "")))
+    us = market is not None and getattr(market, "key", "crypto") != "crypto"
+    if us:
+        sig = s.get("signal_symbol")
+        who = (f"信号品种 {sig}，交易品种 {trade_symbol or '--'}" if sig and sig != trade_symbol
+               else f"信号和交易都用 {trade_symbol or '--'}")
+        out.append(("周期", f"美股日线：{who}；每个交易日美东收盘（16:00，半日市 13:00）后判断，"
+                           "下一个交易日开盘成交；周末和节假日不交易。"))
+    else:
+        tf = TF_CN.get(s.get("signal_tf"), "全局设置里的周期")
+        out.append(("周期", f"信号周期：{tf}K线；每根K线收盘后才判断，不看还没走完的K线。"
+                    + (f"辅助周期：{TF_CN.get(aux, '辅助周期')}，用来看大方向（只用已收盘的K线）。" if aux else "")))
     ent = s["entry"]["conditions"]
     trig = [c for c in ent if c["op"].startswith("cross")]
     filt = [c for c in ent if not c["op"].startswith("cross")]
@@ -100,7 +108,18 @@ def narrate(schema: dict | None) -> list[tuple[str, str]]:
     if s.get("max_hold_bars"):
         risk.append(f"最多持有 {s['max_hold_bars']} 根K线，到时间就卖出")
     out.append(("止损止盈", ("；".join(risk) + "。") if risk else "没有设置止损、止盈和移动止损（只靠离场规则）。"))
-    out.append(("仓位", f"每次买入使用可用资金的 {s['alloc_pct']:g}%；只做多，不做空，不加杠杆。"))
-    out.append(("系统统一规则", "回测、进化和模拟盘还会统一执行交易节奏：止损后冷却、连亏刹车、按波动率缩小仓位；"
-                "入场信号超过 15 分钟没执行就放弃，不追单。"))
+    out.append(("仓位", f"每次买入使用可用资金的 {s['alloc_pct']:g}%；只做多，不做空，不加杠杆"
+                       + ("（杠杆只能来自杠杆 ETF 本身）。" if us else "。")))
+    if us:
+        try:
+            from .. import rhythm
+            rh = rhythm.current(market)
+            rules = "；".join(rh.describe(market.unit_cn, "信号品种")) if rh else "已关闭"
+        except Exception:  # noqa: BLE001
+            rules = "--"
+        out.append(("系统统一规则", f"回测和模拟盘统一执行美股交易节奏（按交易日历，节假日顺延）：{rules}；"
+                    "成本按美股（佣金 0，滑点和点差每笔计一次，卖出另计监管费）。"))
+    else:
+        out.append(("系统统一规则", "回测、进化和模拟盘还会统一执行交易节奏：止损后冷却、连亏刹车、按波动率缩小仓位；"
+                    "入场信号超过 15 分钟没执行就放弃，不追单。"))
     return out

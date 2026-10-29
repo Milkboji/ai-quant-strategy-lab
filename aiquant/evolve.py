@@ -238,10 +238,7 @@ def evaluate(df5: pd.DataFrame, sch: dict, start: datetime, end: datetime, r: di
     if errs:
         raise ValueError("；".join(errs))
     tf = int(sch.get("signal_tf") or 15)
-    from . import rhythm
-    cfg = bt.BTConfig(start=start, end=end, initial_cash=float(r["initial_cash"]),
-                      max_alloc_pct=float(r["max_alloc_pct"]), cost=research.cost_model(r),
-                      rhythm=rhythm.current())
+    cfg = research.bt_config(start, end, r)
     res = bt.run(df5, obj, tf, sch.get("aux_tf"), cfg)
     m = res["metrics"]
     segs = segment_returns(res["equity"], start, end)
@@ -411,7 +408,7 @@ def evolve_one(dep: dict, cfgv: dict, r: dict, train: tuple[datetime, datetime],
         return rec
     nv = registry.freeze(cur["slot_no"], best_sch, nl_text=cur["nl_text"], source="auto_evolve",
                          change_summary=f"[自动进化#{run_id}] {best_why}"[:500], parent_id=cur["id"],
-                         set_current=cur["slot_no"] is not None)
+                         set_current=registry.slot_points_to(cur["slot_no"], cur["id"]))
     research.store_backtest(job_id=None, version=nv, slot_no=cur["slot_no"], ds=train_ds, start=start, end=end,
                             tf=best_eval["tf"], aux=best_eval["aux"], split="训练集", cfg=best_eval["cfg"],
                             res=best_eval["res"])
@@ -603,7 +600,8 @@ def run(job: dict, stage, should_stop) -> int:
                   "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                   (rid, None, "美股 ETF 择时", None, None, 27,
                    json.dumps(_etf_brief(er.get("current")), ensure_ascii=False),
-                   json.dumps(_etf_brief(er.get("best")), ensure_ascii=False), None,
+                   json.dumps(_etf_brief(er.get("best")), ensure_ascii=False),
+                   json.dumps(er.get("holdout"), ensure_ascii=False) if er.get("holdout") else None,
                    er.get("decision", "保留"), er.get("reason", ""), None, db.now_iso()))
             results.append({"decision": er.get("decision"), "candidates": 27})
         except Exception:  # noqa: BLE001
@@ -863,10 +861,9 @@ def plan_budgets(equity: float, deps: list[dict], cfgv: dict | None = None) -> d
     """按实力分配额度。每个部署返回 budget / weight / why，以及 detail（公式代入的数值，供页面解释）和 share_pct。"""
     c = cfgv or get_config()
     other = 0.0
-    try:   # 美股 ETF 趋势策略占用的资金比例，从 BTC 策略可分配资金中扣除
+    try:   # 美股 ETF 实际占用的资金比例（设定比例与持仓市值取大），从 BTC 策略可分配资金中扣除
         from .paper import etf_trend
-        ec = etf_trend.get_config()
-        other = float(ec["budget_pct"]) if ec.get("enabled") else 0.0
+        other = etf_trend.capital_share(equity)
     except Exception:  # noqa: BLE001
         pass
     total = equity * (1 - (float(c["reserve_pct"]) + other) / 100)

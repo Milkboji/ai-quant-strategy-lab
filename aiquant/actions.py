@@ -87,18 +87,19 @@ def submit_backtest(slot_no: int, *, batch_id: str | None = None, allow_test_tou
         tf, aux = research.effective_tf(slot, v["schema"], r)
     except ValueError as e:
         return None, str(e)
+    mkt = research.market_of(r)
     if kind == "final_test":
-        st = research.test_set_status()
+        st = research.test_set_status(mkt)
         if not st["ok"]:
             return None, st["label"]
         done = db.q1("SELECT h.id FROM holdout_touches h JOIN backtests b ON b.id=h.backtest_id "
-                     "WHERE h.version_id=? AND h.split='final_test' AND b.is_test=0", (vid,))
+                     "WHERE h.version_id=? AND h.split IN ('final_test','final_test_us') AND b.is_test=0", (vid,))
         if done:
             return None, "该版本已运行过独立最终测试，不可重复"
-        sp = research.get_split()
+        sp = research.get_split(mkt)
         start, end = md.to_utc(sp["test_start"]), md.to_utc(sp["test_end"])
     elif kind == "validation":
-        sp = research.get_split()
+        sp = research.get_split(mkt)
         start, end = md.to_utc(sp["val_start"]), md.to_utc(sp["test_start"])
         kind = "backtest"
         used = db.q1("SELECT COUNT(*) AS n FROM holdout_touches h JOIN strategy_versions v ON v.id=h.version_id "

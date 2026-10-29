@@ -102,11 +102,16 @@ def _loop() -> None:
         try:
             if http.paper_orders_unlocked():
                 tick()
-                try:   # 美股 ETF 趋势择时（QQQ 均线 → QLD）
-                    from . import etf_trend
-                    etf_trend.step()
-                except Exception:  # noqa: BLE001
-                    log.error("etf trend error: %s", traceback.format_exc())
+            try:   # 美股 ETF 趋势择时（QQQ 均线 → QLD）；下单锁未开时只记录「为什么没有动作」
+                from . import etf_trend
+                etf_trend.step()
+            except Exception:  # noqa: BLE001
+                log.error("etf trend error: %s", traceback.format_exc())
+            try:   # 美股交易日历（节假日 / 半日市），每周从 Alpaca 刷新一次
+                from .. import market
+                market.refresh_calendar()
+            except Exception:  # noqa: BLE001
+                log.error("calendar refresh error: %s", traceback.format_exc())
             try:   # 一次性策略升级（登记为挑战者，走系统自己的检验）
                 from .. import upgrades
                 if upgrades.run_pending():

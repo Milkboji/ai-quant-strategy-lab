@@ -317,6 +317,10 @@ def deploy_version(key: str, version_id: int, *, actor: str | None, role: str | 
         raise ValueError("版本不存在或未冻结")
     if key_of_version(v) != key:
         raise ValueError(f"版本 {registry.label(v)} 不属于这个策略")
+    from . import research
+    if research.version_market(v).key != "crypto":
+        raise ValueError("这是美股日线策略版本：模拟盘的美股目前只运行「美股 ETF 择时」（在本页下方的美股卡片部署参数版本），"
+                         "策略位里的美股版本暂时只能回测研究，不能部署到 BTC 模拟盘")
     ok, checks = pr.deploy_gate(v["id"])
     if broker == "alpaca_paper" and not ok:
         raise ValueError("部署门禁未通过：" + "；".join(f"{n}（{d}）" for n, p, d in checks if not p))
@@ -606,12 +610,10 @@ def approve(ch_id: int, *, actor: str | None, role: str | None) -> dict:
             challenger._close(ch, "expired", "现役参数已变化，待确认的挑战者作废")
             audit(actor, role, "批准晋级", "etf", "美股 ETF 择时", None, None, None, "已作废", "现役参数已变化")
             raise ValueError("现役参数已变化，这个挑战者已作废")
-        db.set_setting("etf_trend_config", dict(db.get_setting("etf_trend_config") or {}, sma=cand["sma"], band=cand["band"]))
-        _etf_version(cand, f"挑战者 #{ch['id']} 经批准晋级")
+        from .paper import etf_versions
+        etf_versions.activate(int(cand["sma"]), float(cand["band"]), trigger="approve", actor=actor, role=role,
+                              note=f"挑战者 #{ch['id']} 经批准晋级")
         challenger._close(ch, "promoted", f"{actor or '用户'} 批准晋级：{ch['reason'] or ''}", trigger="人工批准", actor=actor)
-        pr.event(None, "INFO", f"[ETF趋势] {actor or '用户'} 批准挑战者 #{ch['id']}，参数改为 {cand['sma']} 日均线 ±{cand['band']:.0%}")
-        audit(actor, role, "批准晋级", "etf", "美股 ETF 择时", None, None, None, "已晋级",
-              f"#{ch['id']}：{champ['sma']}/{champ['band']} → {cand['sma']}/{cand['band']}")
         return {"result": "已晋级", "message": f"美股 ETF 参数已改为 {cand['sma']} 日均线 ±{cand['band']:.0%}"}
     dep = pr.get_deployment(ch["deployment_id"])
     key = _dep_key(dep) if dep else None
@@ -852,11 +854,103 @@ def plans_for(broker: str = "alpaca_paper") -> dict[int, dict]:
         return {}
 
 
-def _etf_version(cand: dict, note: str) -> None:
-    """ETF 参数变了：登记为一个 ETF 版本（策略实验室里能看到版本历史）。"""
+# ---------------------------------------------------------------------------
+# 美股 ETF 择时：策略总台卡片（复用同一套版本 / 锁定 / 待确认 / 审计机制）
+# ---------------------------------------------------------------------------
+
+def etf_explain(equity: float | None = None) -> dict:
+    """美股 ETF 为什么没有动作：与 explain() 相同的结构 {"headline", "items", "calc"}。"""
+    import pandas as pd
+    from . import market as mk
+    from . import rhythm
+    from .paper import etf_trend
+    cfg = etf_trend.get_config()
+    now = pd.Timestamp.now(tz="UTC")
+    items, calc, heads = [], [], []
+    w = etf_trend.get_why() or {}
+    if w.get("text"):
+        heads.append(w["text"])
+        items.append(("最近一次判断", f"{_bj(w.get('at'))}：{w['text']}"))
+    stt = db.get_setting("etf_trend_state") or {}
+    sig = stt.get("signal") or {}
+    if sig:
+        pos_txt = "看多（持有）" if sig.get("regime") else "看空（现金）"
+        items.append(("信号", f"{sig.get('date')} 收盘 {cfg['signal_symbol']} {sig['close']:.2f}，{cfg['sma']} 日均线 "
+                             f"{sig['sma']:.2f}，缓冲带 {sig['lower']:.2f}~{sig['upper']:.2f} → {pos_txt}"))
+    lm = rhythm.etf_long_metrics()
+    rc = rhythm.get_config()
+    if lm:
+        items.append(("长期体检", f"{'达标' if lm.get('ok') else '不达标'}：{lm['n_years']} 年年均收益 {lm['mean_ret']:+.1f}%，"
+                                f"盈利 {lm['pos_years']}/{lm['n_years']} 年，年均回撤 {lm['mean_dd']:.1f}%"
+                                + ("" if lm.get("ok") else f"（年均收益为负且盈利年份少于 {rc['long_min_pos_years']} 年 → 暂停新开仓）")))
+    g = db.get_setting(f"rhythm_state::{rhythm.ETF_KEY}") or {}
+    bu = pd.Timestamp(g["block_until"]) if g.get("block_until") else None
+    rh = rhythm.current(mk.US_EQUITY)
+    if bu is not None and bu > now:
+        items.append(("冷却中", f"{g.get('block_why') or '交易节奏'}；剩余 {_dur(bu - now)}，到 {_bj(bu)} 北京时间（按交易日计算，节假日顺延）"))
+        if not heads or "节奏" not in heads[0]:
+            heads.append(f"交易节奏冷却中，还剩 {_dur(bu - now)}")
+    elif rh is not None and rh.loss_streak_n:
+        items.append(("连亏计数", f"当前连亏 {int(g.get('streak') or 0)} 笔（满 {rh.loss_streak_n} 笔暂停 "
+                                f"{rh.loss_streak_pause_hours:g} 个交易日）"))
+    if cfg.get("pending_offline"):
+        heads.insert(0, "等待空仓后下线：不再开新仓")
+    if not cfg.get("enabled"):
+        heads = ["已下线"]
+    pct = float(cfg["budget_pct"])
+    if equity:
+        share = etf_trend.capital_share(equity)
+        calc.append(("资金比例", f"固定 {pct:g}% × 账户权益 {equity:,.0f} = {equity * pct / 100:,.0f} USD（不参与 BTC 的按实力分配）"))
+        calc.append(("从 BTC 额度中扣除", f"max(设定比例 {pct:g}%, 当前持仓市值占比) = {share:.1f}%"))
+    else:
+        calc.append(("资金比例", f"固定 {pct:g}%（不参与 BTC 的按实力分配）"))
+    if rh is not None and rh.vol_target_pct:
+        calc.append(("波动率定仓", f"目标年化波动率 {rh.vol_target_pct:g}%（√252 年化）"))
+    else:
+        calc.append(("波动率定仓", "美股不采用（研究见交易节奏说明）：每次买入使用全部资金比例"))
+    pos = stt.get("position") or {}
+    if pos and equity:
+        calc.append(("当前仓位", f"{cfg['trade_symbol']} {float(pos.get('qty') or 0):,.4f} 股，市值 {float(pos.get('market_value') or 0):,.0f} USD"
+                                f" = 账户权益的 {float(pos.get('market_value') or 0) / equity:.1%}"))
+    return {"headline": "；".join(heads) or "等待下一次美股开盘检查", "items": items, "calc": calc}
+
+
+def etf_row(equity: float | None = None) -> dict:
+    """策略总台的美股 ETF 卡片数据。"""
+    from . import challenger, evolog
+    from .paper import etf_trend, etf_versions
+    etf_versions.ensure_tables()
+    challenger.ensure_tables()
+    cfg = etf_trend.get_config()
+    run = etf_versions.running()
+    vs = etf_versions.versions()
+    lab = max(vs, key=lambda v: v["version_no"]) if vs else None
+    mismatch = bool(lab and lab["id"] != run["id"] and lab["version_no"] > run["version_no"])
+    diff = []
+    if mismatch:
+        plain, _ = evolog.etf_diff({"sma": run["sma"], "band": run["band"]}, {"sma": lab["sma"], "band": lab["band"]})
+        diff = plain
+    ch = None
+    for c in challenger.running("etf"):
+        ev = json.loads(c["last_eval_json"] or "{}")
+        tj = json.loads(c["train_json"] or "{}")
+        ch = {"id": c["id"], "change": c["change"], "days": ev.get("days"), "need_days": ev.get("need_days"),
+              "fast": (tj.get("fast") or {}).get("verdict"), "challenger": ev.get("challenger"), "champion": ev.get("champion")}
+    aw = next((a for a in awaiting() if a["kind"] == "etf"), None)
+    stt = db.get_setting("etf_trend_state") or {}
+    pos = stt.get("position") or {}
+    status = etf_versions.status()
     try:
-        from .paper import etf_versions
-        v = etf_versions.ensure_version(int(cand["sma"]), float(cand["band"]), "challenger", note)
-        db.ex("UPDATE etf_versions SET deployed_at=? WHERE id=?", (db.now_iso(), v["id"]))
+        from . import rhythm
+        if status == "运行中" and rhythm.etf_long_paused():
+            status = "暂停中"
     except Exception:  # noqa: BLE001
-        log.exception("etf version record failed")
+        pass
+    return {"key": "etf", "name": "美股 ETF 择时", "status": status,
+            "run": run, "lab": lab, "mismatch": mismatch, "diff": diff, "lock": etf_versions.lock_state(),
+            "block": challenger._etf_block(), "challenger": ch, "awaiting": aw, "versions": vs,
+            "qty": float(pos.get("qty") or 0), "value": float(pos.get("market_value") or 0) if pos else None,
+            "unrealized": float(pos.get("unrealized_pl") or 0) if pos else None,
+            "budget_pct": float(cfg["budget_pct"]), "pending_offline": bool(cfg.get("pending_offline")),
+            "enabled": bool(cfg.get("enabled")), "why": etf_explain(equity),
+            "trade_symbol": cfg["trade_symbol"], "signal_symbol": cfg["signal_symbol"]}

@@ -178,7 +178,7 @@ def _card_etf(pos: list[dict], clock: dict | None) -> None:
           [(f"{cfg['signal_symbol']} / {cfg['sma']}日线", f"{sig['close']:,.2f} / {sig['sma']:,.2f}" if sig else "--"),
            ("持仓市值", f"{_f(p['market_value']):,.0f}" if p else "0"),
            ("下次美股开盘", nxt)],
-          f"站上均线持有 2 倍纳指，跌破转现金；占资金 {cfg['budget_pct']:g}%")
+          (et.get_why() or {}).get("text") or f"站上均线持有 2 倍纳指，跌破转现金；占资金 {cfg['budget_pct']:g}%")
     st.page_link(st.session_state["_pages"]["paper"], label="查看订单与原因 →")
 
 

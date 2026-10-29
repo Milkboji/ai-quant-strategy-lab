@@ -149,3 +149,30 @@ tests/                     pytest 单元/集成测试 + e2e_browser.py（Playwri
 2. 公开仓库 `Milkboji/ai-quant-strategy-lab`：同步代码改动并推送；保持 `PAPER_ORDER_SUBMISSION_UNLOCKED = False`，
    不放入含本机路径 / 私有域名的文档（docs 下的报告、进度、使用说明）、`.env`、`config/secrets.local`、数据和备份。
 3. 把改动文件同步到运行电脑的项目文件夹并更新 `BUILD_INFO.json`，由管理员在页面上「安全重启」生效。
+
+## 美股链路（2026-10-29，见 docs/美股链路现状报告.md 的改动清单）
+
+- 市场配置 `aiquant/market.py`：CRYPTO / US_EQUITY（年化 365/252、时长单位 小时/交易日、成本、交易日历）。
+  交易日历优先 Alpaca `/v2/calendar`（settings.us_calendar，服务循环每周刷新），否则内置纽交所规则 + SPECIAL_CLOSURES。
+  `Market.after(t, n)`：美股 = t 所在交易日之后 n 个完整交易日，第 n+1 个交易日开盘解除。
+- 美股日线库 `aiquant/data/us_daily.py`：只写已收盘日线（美东日期 < 今天）；每日一次多品种请求更新全部 UNIVERSE；
+  同日收盘价差 > 0.2% 视为复权口径变化 → 整只重下。`get_dataset()` 写 datasets 表（venue=alpaca_stocks，timeframe 1440，
+  SHA256，交易日缺口报告）；快照列 ts=开盘、close_time=收盘（UTC）。
+- 唯一回测配置入口 `research.bt_config(start, end, r, market)`：实验室 / 进化 / 挑战者 / 长周期体检都用它（成本按市场、节奏按市场）。
+  `params_key` 含节奏规则哈希。数据分区按市场：`get_split(market)`（美股 settings.data_split_us：测试 90 天、验证 365 天），
+  留出触及记录美股为 test_contaminated_us / final_test_us（验证集按谱系计数）。
+- 主引擎日线：快照带 close_time → `signals.build_frame` 走日线（只允许 1440、无辅助周期）；成交 = 下一交易日开盘
+  （MAX_FILL_DELAY_DAILY 6 天）。`run(..., df_signal=)` 支持「信号品种 ≠ 交易品种」（schema.signal_symbol，例 QQQ → QLD）。
+  schema.signal_symbol 为空时不参与哈希（已有版本哈希不变）。解析器识别 UNIVERSE 代码、均线倍数（1.02 倍 / 2% 以上）。
+- 交易节奏：`rhythm.current(market)` → rules（加密货币，小时）/ rules_us（美股，交易日：连亏 2 笔停 20 交易日，不用波动率定仓）。
+  Gate(rh, market)、daily_context(df, rh, market) 同一份代码。ETF 回测 `engine/regime_bt.py` 与模拟盘 `etf_trend.step`
+  共用 Gate（状态 settings.rhythm_state::etf）。ETF 长周期体检 `rhythm.etf_long_metrics`（2017 起逐年），不达标暂停新开仓。
+- ETF 运行参数唯一写入口 `etf_versions.activate()`（手动部署 / 批准晋级 / 挑战者晋级），写审计，手动部署自动锁定。
+  锁 `etf_version_lock`（until 为空 = 手动锁定）；上下线 `set_online`（有持仓 → pending_offline，空仓后下线）；
+  资金比例 `set_budget_pct`（5~60%，审计）。BTC 可分配资金扣除 `etf_trend.capital_share(equity)` = max(设定比例, 持仓市值占比)。
+- ETF 进化：`etf_round` 挑选期 2016-2024 → `etf_holdout`（前向 ≥60 交易日，否则验证集 2025-01-01 至冻结日，限 3 次，
+  holdout_touches.split='etf_validation'）→ 通过即晋级 / 进待确认；都不可用 → 挑战者（SPY→SSO 快速检验 + 前向，1/3 时间可提前决策）。
+- ETF 下单：被拒当天不重试（通知 order_failed）；部分成交次日补足（state.entry）；`etf_trend.set_why()` 结构化原因（WHY_CODES），
+  策略总台 `console.etf_row / etf_explain`、模拟盘面板、首页卡片、每日摘要都读它。
+- 策略位指针：进化 / 挑战者晋级只在 `registry.slot_points_to(slot, 被替换版本)` 时移动指针。
+- 策略位里的美股版本（`research.version_market`）不能部署到 BTC 模拟盘；美股模拟盘目前只运行 ETF 择时（参数版本）。

@@ -110,7 +110,7 @@ def test_etf_versions_freeze_deploy_lock_and_permissions(env):
         cur = etf_versions.running()
         assert cur["sma"] == int(etf_trend.get_config()["sma"])
         with pytest.raises(PermissionError):
-            etf_versions.freeze(160, 0.03, confirmed=True, actor="t", role="trader")
+            etf_versions.freeze(160, 0.03, confirmed=True, actor="g", role="viewer")   # 观察员只读；交易员可改
         with pytest.raises(ValueError):
             etf_versions.freeze(160, 0.03, confirmed=False, actor="boss", role="admin")
         with pytest.raises(ValueError):
@@ -129,7 +129,7 @@ def test_etf_versions_freeze_deploy_lock_and_permissions(env):
         assert etf_versions.running()["id"] == v["id"] and etf_versions.lock_state()
         assert "锁定" in (challenger._etf_block() or "")
         assert any(x["action"] == "部署此版本" and x["strategy_key"] == "etf" for x in console.audit_log(50))
-        challenger._etf_version({"sma": 170, "band": 0.02}, "测试晋级")
+        challenger._etf_activate({"sma": 170, "band": 0.02}, "测试晋级")
         assert any(x["sma"] == 170 and x["source"] == "challenger" for x in etf_versions.versions())
         n = dict(etf_versions.narrate(160, 0.03))
         assert "160 日均线" in n["入场"] and "3%" in n["过滤条件"]

@@ -40,6 +40,7 @@ ASSUMPTIONS = [
 
 
 MAX_FILL_DELAY = np.timedelta64(15, "m")
+MAX_FILL_DELAY_DAILY = np.timedelta64(6, "D")     # 美股日线：收盘出信号 → 下一交易日开盘成交（含长周末 / 节假日）
 
 
 class Cancelled(Exception):
@@ -55,6 +56,18 @@ class BTConfig:
     cost: CostModel = CostModel()
     reserve_pct: float = 0.5
     rhythm: Rhythm | None = None
+    market: object = None          # aiquant.market.Market；None = 加密货币
+
+
+ASSUMPTIONS_DAILY = [
+    "美股日线：信号只使用已收盘的日线（美东 16:00，半日市 13:00 收盘），无未来数据",
+    "成交在信号后下一交易日的开盘价（作为中间价代理）；休市日、节假日按交易日历顺延",
+    "止损 / 止盈按日线最高价、最低价检查；同一天同时触及时按先止损处理（保守假设）",
+    "跳空穿越止损价时按开盘价成交",
+    "成本按美股：佣金 0，滑点与半个点差每笔成交计一次，卖出另计监管费",
+    "仅做多、1倍、无杠杆、不允许负现金（杠杆来自杠杆 ETF 本身）",
+    "窗口结束仍持仓时按最后收盘价平仓并计入成本",
+]
 
 
 def _naive(s: pd.Series) -> np.ndarray:
@@ -90,10 +103,16 @@ def _downsample(ts: np.ndarray, eq: np.ndarray, n: int = 1500) -> list[list]:
 
 
 def run(df5: pd.DataFrame, s: StrategySchema, signal_tf: int, aux_tf: int | None, cfg: BTConfig,
-        should_stop=None) -> dict:
+        should_stop=None, df_signal: pd.DataFrame | None = None) -> dict:
+    """df5：执行 K 线。加密货币为 5 分钟 K 线；美股为日线（带 close_time 列，成交在下一交易日开盘）。
+    df_signal：信号品种的 K 线（美股可用另一只 ETF 出信号，如 QQQ → 交易 QLD）；None = 用执行品种本身。"""
     start, end = pd.Timestamp(cfg.start), pd.Timestamp(cfg.end)
+    daily = "close_time" in df5.columns
     df5 = df5[df5["ts"] < end].reset_index(drop=True)
-    frame = build_frame(df5, s, signal_tf, aux_tf, data_end=end)
+    sig_src = df5 if df_signal is None else df_signal[df_signal["ts"] < end].reset_index(drop=True)
+    frame = build_frame(sig_src, s, signal_tf, aux_tf, data_end=end)
+    bar = pd.Timedelta(days=1) if daily else pd.Timedelta(minutes=5)
+    max_delay = MAX_FILL_DELAY_DAILY if daily else MAX_FILL_DELAY
     ent = group_signal(frame, s.entry)
     ex = group_signal(frame, s.exit)
     ct = _naive(frame["close_time"])
@@ -117,16 +136,16 @@ def run(df5: pd.DataFrame, s: StrategySchema, signal_tf: int, aux_tf: int | None
     for mi in np.nonzero(in_win)[0]:
         fi = int(fidx[mi])
         if fi < n:
-            if ts[fi] - ct[mi] > MAX_FILL_DELAY:
+            if ts[fi] - ct[mi] > max_delay:
                 dropped_gap += 1  # 信号后行情缺口过长，不在远离信号的价格成交
                 continue
             events[fi] = int(mi)  # 多根主K线落在同一执行K线时保留最新一根
 
     alloc = min(s.alloc_pct, cfg.max_alloc_pct)
     rh = cfg.rhythm if (cfg.rhythm is not None and cfg.rhythm.active) else None
-    gate = Gate(rh) if rh else None
+    gate = Gate(rh, cfg.market) if rh else None
     if rh and (rh.regime_sma_days or rh.vol_target_pct):
-        reg_ok, vmult = lookup(daily_context(df5, rh), frame["close_time"])
+        reg_ok, vmult = lookup(daily_context(df5, rh, cfg.market), frame["close_time"])
     else:
         reg_ok, vmult = np.ones(len(frame), bool), np.ones(len(frame))
     rhythm_skipped = 0
@@ -154,7 +173,7 @@ def run(df5: pd.DataFrame, s: StrategySchema, signal_tf: int, aux_tf: int | None
         trades.append({
             "entry_signal_ts": ef["signal_ts"], "entry_fill_ts": ef["ts"], "entry_price": ef["price"],
             "exit_signal_ts": signal_ts, "exit_fill_ts": _iso(ts[i]) if reason != "回测结束平仓"
-            else _iso(pd.Timestamp(ts[i]) + pd.Timedelta(minutes=5)),
+            else _iso(pd.Timestamp(ts[i]) + bar),
             "exit_price": f.price, "qty": f.qty,
             "fee": ef["fee"] + f.fee, "spread_cost": ef["spread"] + f.spread_cost,
             "slippage_cost": ef["slip"] + f.slippage_cost, "exit_reason": reason, "pnl": pnl,
@@ -234,7 +253,7 @@ def run(df5: pd.DataFrame, s: StrategySchema, signal_tf: int, aux_tf: int | None
     hold_bars = 0
     if len(tr):
         for t in trades:
-            hold_bars += (pd.Timestamp(t["exit_fill_ts"]) - pd.Timestamp(t["entry_fill_ts"])) / pd.Timedelta(minutes=5)
+            hold_bars += (pd.Timestamp(t["exit_fill_ts"]) - pd.Timestamp(t["entry_fill_ts"])) / bar
     metrics = {
         "initial_cash": cfg.initial_cash, "final_equity": final,
         "net_profit": final - cfg.initial_cash,
@@ -253,7 +272,11 @@ def run(df5: pd.DataFrame, s: StrategySchema, signal_tf: int, aux_tf: int | None
         "partial_bars_excluded": int(frame.attrs.get("partial_bars_excluded", 0)),
         "exec_bars": int(len(ets)),
     }
-    return {"metrics": metrics, "trades": trades, "equity": _downsample(ets, eq), "assumptions": ASSUMPTIONS}
+    assumptions = list(ASSUMPTIONS_DAILY if daily else ASSUMPTIONS)
+    if rh:
+        unit = getattr(cfg.market, "unit_cn", "小时") if cfg.market is not None else "小时"
+        assumptions.append("交易节奏（与自动进化、模拟盘相同）：" + "；".join(rh.describe(unit)))
+    return {"metrics": metrics, "trades": trades, "equity": _downsample(ets, eq), "assumptions": assumptions}
 
 
 def buy_and_hold(df5: pd.DataFrame, cfg: BTConfig) -> dict:

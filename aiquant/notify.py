@@ -25,6 +25,7 @@ EVENTS = {
     "awaiting": "等待人工确认",
     "auto_pause": "长期体检自动暂停",
     "loss_streak": "连亏刹车",
+    "order_failed": "模拟盘下单被拒",
     "watchdog_restart": "守护进程重启",
     "tunnel_down": "外网通道断开超过 60 秒",
     "daily_summary": "每日运行摘要",
@@ -226,10 +227,25 @@ def daily_summary_text(now: datetime | None = None) -> tuple[str, str]:
         pass
     deps = db.q("SELECT status FROM paper_deployments WHERE broker='alpaca_paper' AND is_test=0 "
                 "AND status IN ('running','paused_entries')")
-    lines.append(f"策略：运行 {sum(1 for d in deps if d['status'] == 'running')} 个，"
-                 f"暂停新开仓 {sum(1 for d in deps if d['status'] == 'paused_entries')} 个")
+    n_run = sum(1 for d in deps if d["status"] == "running")
+    n_pause = sum(1 for d in deps if d["status"] == "paused_entries")
+    etf_on = False
+    try:
+        from .paper import etf_trend
+        etf_on = bool(etf_trend.get_config().get("enabled"))
+    except Exception:  # noqa: BLE001
+        pass
+    lines.append(f"策略：运行 {n_run + (1 if etf_on else 0)} 个（含美股 ETF）" if etf_on else f"策略：运行 {n_run} 个")
+    if n_pause:
+        lines[-1] += f"，暂停新开仓 {n_pause} 个"
     o = db.q1("SELECT COUNT(*) AS n FROM paper_orders WHERE status='filled' AND is_test=0 AND created_at>=?", (day0,))
-    lines.append(f"今日成交：{o['n'] if o else 0} 笔")
+    n_etf = 0
+    try:
+        e = db.q1("SELECT COUNT(*) AS n FROM etf_orders WHERE status='filled' AND ts>=?", (day0,))
+        n_etf = int(e["n"]) if e else 0
+    except Exception:  # noqa: BLE001
+        pass
+    lines.append(f"今日成交：{(o['n'] if o else 0) + n_etf} 笔" + (f"（其中美股 ETF {n_etf} 笔）" if n_etf else ""))
     try:
         from . import evolog
         evs = [r for r in evolog.rows(200) if r["ts"] >= day0]
@@ -248,11 +264,32 @@ def daily_summary_text(now: datetime | None = None) -> tuple[str, str]:
     hb = db.get_setting("paper_loop_heartbeat")
     if hb:
         lines.append(f"自动交易循环心跳：{(datetime.fromisoformat(hb).astimezone(BJ)):%m-%d %H:%M} 北京时间")
-    st = db.get_setting("etf_trend_state") or {}
-    if st.get("signal"):
-        lines.append(f"美股 ETF：{'看多·持有' if st['signal'].get('regime') else '看空·空仓'}")
+    try:
+        lines += etf_summary_lines()
+    except Exception:  # noqa: BLE001
+        log.exception("etf summary failed")
     lines.append("真实资金交易：永久关闭")
     return f"每日运行摘要 {bj:%m-%d}", "\n".join(lines)
+
+
+def etf_summary_lines() -> list[str]:
+    """每日摘要里的美股 ETF：信号、持仓与浮动盈亏、今天为什么没有动作、下次开盘。"""
+    from .paper import etf_trend
+    cfg = etf_trend.get_config()
+    st = db.get_setting("etf_trend_state") or {}
+    if not cfg.get("enabled"):
+        return ["美股 ETF：已下线"]
+    sig, pos = st.get("signal") or {}, st.get("position") or {}
+    head = f"美股 ETF（{cfg['signal_symbol']}→{cfg['trade_symbol']}）："
+    head += ("看多·持有" if sig.get("regime") else "看空·空仓") if sig else "等待美股开盘"
+    if pos and float(pos.get("qty") or 0) > 0:
+        head += (f"，持有 {float(pos['qty']):,.4f} 股，市值 {float(pos.get('market_value') or 0):,.0f} USD，"
+                 f"浮动盈亏 {float(pos.get('unrealized_pl') or 0):+,.0f} USD")
+    out = [head]
+    w = etf_trend.get_why() or {}
+    if w.get("text"):
+        out.append(f"美股 ETF 现在：{w['text']}")
+    return out
 
 
 def maybe_daily(now: datetime | None = None) -> bool:

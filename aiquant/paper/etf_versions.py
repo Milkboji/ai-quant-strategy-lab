@@ -113,49 +113,180 @@ def preview(sma: int, band: float) -> dict:
 
 
 def lock_state() -> dict | None:
+    """有效的 ETF 版本锁（与 BTC 部署的 version_lock 相同结构）：{"until": iso|None, "kind": manual_deploy|manual, ...}。"""
     lk = db.get_setting("etf_version_lock")
-    if not lk or not lk.get("until"):
+    if not lk:
         return None
-    if datetime.fromisoformat(lk["until"]) <= datetime.now(timezone.utc):
+    if lk.get("until") and datetime.fromisoformat(lk["until"]) <= datetime.now(timezone.utc):
         return None
     return lk
 
 
+def _require(role: str | None) -> None:
+    from .. import console
+    console.require_role(role)
+
+
+def set_lock(on: bool, *, actor: str | None, role: str | None) -> dict:
+    """策略总台「锁定版本」开关（与 BTC 的 console.set_lock 同样的语义：打开 = 不设到期；关闭 = 清除任何锁）。"""
+    from .. import console
+    from . import runner as pr
+    _require(role)
+    v = running()
+    if on:
+        db.set_setting("etf_version_lock", {"until": None, "kind": "manual", "by": actor or "用户", "at": db.now_iso()})
+        pr.event(None, "INFO", f"[ETF趋势] 策略总台：{actor or '用户'} 锁定版本，自动进化不会自动替换")
+        console.audit(actor, role, "锁定版本", "etf", "美股 ETF 择时", None, None, None, "已锁定", label(v))
+        return {"result": "已锁定", "message": "已锁定：挑战者胜出后会进入待确认队列"}
+    db.set_setting("etf_version_lock", None)
+    pr.event(None, "INFO", f"[ETF趋势] 策略总台：{actor or '用户'} 解除版本锁定")
+    console.audit(actor, role, "解除锁定", "etf", "美股 ETF 择时", None, None, None, "已解除", label(v))
+    return {"result": "已解除", "message": "已解除锁定：恢复自动晋级规则"}
+
+
+TRIGGER_CN = {"manual": "手动部署", "approve": "批准晋级", "challenger": "挑战者晋级"}
+
+
+def activate(sma: int, band: float, *, trigger: str, note: str = "", actor: str | None = None,
+             role: str | None = None, lock_days: float | None = None) -> dict:
+    """唯一改写美股 ETF 运行参数的入口：手动部署、批准晋级、挑战者自动晋级都走这里。
+    登记 / 复用版本 → 写入运行参数（下一次每日检查生效）→ 记录部署时间 → 事件 + 审计 →（手动部署）自动锁定。"""
+    from .. import console
+    from . import runner as pr
+    old = running()
+    src = {"manual": "manual", "approve": "challenger", "challenger": "challenger"}.get(trigger, "manual")
+    v = ensure_version(int(sma), float(band), src, note or TRIGGER_CN.get(trigger, trigger), actor)
+    if old["id"] == v["id"]:
+        return {"result": "无变化", "message": f"{label(v)} 已在运行", "version": v}
+    db.set_setting("etf_trend_config", dict(db.get_setting("etf_trend_config") or {}, sma=int(v["sma"]), band=float(v["band"])))
+    db.ex("UPDATE etf_versions SET deployed_at=? WHERE id=?", (db.now_iso(), v["id"]))
+    lock = None
+    if lock_days and lock_days > 0:
+        lock = {"until": (datetime.now(timezone.utc) + timedelta(days=lock_days)).replace(microsecond=0).isoformat(),
+                "kind": "manual_deploy", "by": actor or "管理员", "at": db.now_iso(), "days": lock_days}
+        db.set_setting("etf_version_lock", lock)
+    who = actor or ("自动进化" if trigger == "challenger" else "用户")
+    pr.event(None, "INFO", f"[ETF趋势] {who} {TRIGGER_CN.get(trigger, trigger)}：{label(old)} → {label(v)}，下一次每日检查起生效")
+    console.audit(actor or "系统", role or "system", {"manual": "部署此版本", "approve": "批准晋级",
+                                                      "challenger": "挑战者晋级"}.get(trigger, trigger),
+                  "etf", "美股 ETF 择时", None, None, None, "已部署",
+                  f"{label(old)} → {label(v)}" + (f"；锁定 {lock_days:g} 天" if lock else "") + (f"；{note}" if note else ""))
+    return {"result": "已部署", "version": v, "lock": lock,
+            "message": f"已部署 {label(v)}，下一次每日检查起生效" + (f"；已锁定 {lock_days:g} 天" if lock else "")}
+
+
 def freeze(sma, band, *, confirmed: bool, actor: str | None, role: str | None) -> dict:
-    if role != "admin":
-        raise PermissionError("只有管理员可以修改美股 ETF 择时参数")
+    _require(role)
     if not confirmed:
         raise ValueError("请先核对规则复述并勾选「确认无误」")
     sma, band = check_params(sma, band)
-    v = ensure_version(sma, band, "manual", "管理员在策略实验室修改", actor)
+    v = ensure_version(sma, band, "manual", "在策略实验室修改", actor)
     from .. import console
     console.audit(actor, role, "保存 ETF 版本", "etf", "美股 ETF 择时", None, None, None, label(v))
     return v
 
 
 def deploy(vid: int, *, confirmed: bool, actor: str | None, role: str | None) -> dict:
-    """部署某个 ETF 版本：写入运行参数（下一次每日检查生效），并锁定 N 天。"""
+    """手动部署某个 ETF 版本（管理员 / 交易员）：写入运行参数（下一次每日检查生效），并按设置锁定 N 天。"""
     from .. import console
-    if role != "admin":
-        raise PermissionError("只有管理员可以部署美股 ETF 择时版本")
+    _require(role)
     if not confirmed:
         raise ValueError("请先勾选部署确认")
     v = get(vid)
     if not v:
         raise ValueError("版本不存在")
-    old = running()
-    if old["id"] == v["id"]:
-        return {"result": "无变化", "message": f"{label(v)} 已在运行"}
-    db.set_setting("etf_trend_config", dict(db.get_setting("etf_trend_config") or {}, sma=int(v["sma"]), band=float(v["band"])))
-    db.ex("UPDATE etf_versions SET deployed_at=? WHERE id=?", (db.now_iso(), v["id"]))
     days = float(console.promotion_config().get("manual_lock_days") or 0)
-    lock = None
-    if days > 0:
-        lock = {"until": (datetime.now(timezone.utc) + timedelta(days=days)).replace(microsecond=0).isoformat(),
-                "by": actor or "管理员", "at": db.now_iso(), "days": days}
-    db.set_setting("etf_version_lock", lock)
+    res = activate(int(v["sma"]), float(v["band"]), trigger="manual", actor=actor, role=role, lock_days=days)
+    res.pop("version", None)
+    res.pop("lock", None)
+    return res
+
+
+# ---------------------------------------------------------------------------
+# 上线 / 下线（与 BTC 相同：有持仓时先停止新开仓，等按信号离场空仓后再下线）
+# ---------------------------------------------------------------------------
+
+def status() -> str:
+    c = etf_trend.get_config()
+    if not c.get("enabled"):
+        return "已下线"
+    if c.get("pending_offline"):
+        return "等待空仓后下线"
+    return "运行中"
+
+
+def set_online(on: bool, *, actor: str | None, role: str | None) -> dict:
+    from .. import console
     from . import runner as pr
-    pr.event(None, "INFO", f"[ETF趋势] {actor or '管理员'} 部署 {label(v)}（原 {label(old)}），下一次每日检查起生效")
-    console.audit(actor, role, "部署此版本", "etf", "美股 ETF 择时", None, None, None, "已部署",
-                  f"{label(old)} → {label(v)}" + (f"；锁定 {days:g} 天" if lock else ""))
-    return {"result": "已部署", "message": f"已部署 {label(v)}，下一次每日检查起生效" + (f"；已锁定 {days:g} 天" if lock else "")}
+    _require(role)
+    cfg = dict(db.get_setting("etf_trend_config") or {})
+    if on:
+        cfg.update(enabled=True, pending_offline=False)
+        db.set_setting("etf_trend_config", cfg)
+        pr.event(None, "INFO", f"[ETF趋势] 策略总台：{actor or '用户'} 重新上线美股 ETF 择时")
+        console.audit(actor, role, "上线", "etf", "美股 ETF 择时", None, None, None, "已上线")
+        _rebalance()
+        return {"result": "已上线", "message": "已上线：下一次每日检查起按信号交易"}
+    st = db.get_setting("etf_trend_state") or {}
+    held = float((st.get("position") or {}).get("qty") or 0) > 0
+    if held:
+        cfg.update(pending_offline=True)
+        db.set_setting("etf_trend_config", cfg)
+        pr.event(None, "INFO", f"[ETF趋势] 策略总台：{actor or '用户'} 下线，先停止新开仓，按信号卖出空仓后下线")
+        console.audit(actor, role, "下线", "etf", "美股 ETF 择时", None, None, None, "等待空仓后下线")
+        return {"result": "等待空仓后下线", "message": "已停止新开仓；持仓按信号卖出后自动下线"}
+    cfg.update(enabled=False, pending_offline=False)
+    db.set_setting("etf_trend_config", cfg)
+    pr.event(None, "INFO", f"[ETF趋势] 策略总台：{actor or '用户'} 下线美股 ETF 择时")
+    console.audit(actor, role, "下线", "etf", "美股 ETF 择时", None, None, None, "已下线")
+    _rebalance()
+    return {"result": "已下线", "message": "已下线，资金比例释放给 BTC 策略"}
+
+
+BUDGET_RANGE = (5.0, 60.0)
+
+
+def set_budget_pct(pct, *, actor: str | None, role: str | None) -> dict:
+    """修改美股 ETF 的资金比例（管理员 / 交易员），写审计并立即重新分配 BTC 额度。下一次买入时生效，不主动调仓。"""
+    from .. import console
+    from . import runner as pr
+    _require(role)
+    try:
+        v = round(float(pct), 2)
+    except (TypeError, ValueError):
+        raise ValueError("资金比例必须是数字")
+    if not BUDGET_RANGE[0] <= v <= BUDGET_RANGE[1]:
+        raise ValueError(f"资金比例需在 {BUDGET_RANGE[0]:g}%~{BUDGET_RANGE[1]:g}% 之间")
+    cfg = dict(db.get_setting("etf_trend_config") or {})
+    old = float(etf_trend.get_config()["budget_pct"])
+    if abs(old - v) < 1e-9:
+        return {"result": "无变化", "message": f"资金比例已是 {v:g}%"}
+    cfg["budget_pct"] = v
+    db.set_setting("etf_trend_config", cfg)
+    pr.event(None, "INFO", f"[ETF趋势] {actor or '用户'} 把资金比例从 {old:g}% 改为 {v:g}%（下一次买入生效）")
+    console.audit(actor, role, "修改资金比例", "etf", "美股 ETF 择时", None, None, None, "已修改", f"{old:g}% → {v:g}%")
+    _rebalance()
+    return {"result": "已修改", "message": f"资金比例已改为 {v:g}%，下一次买入时生效；BTC 策略额度已重新分配"}
+
+
+def finish_pending_offline(pos_qty: float) -> bool:
+    """服务循环里调用：等待下线且已空仓 → 正式下线。"""
+    cfg = dict(db.get_setting("etf_trend_config") or {})
+    if not cfg.get("pending_offline") or pos_qty > 0:
+        return False
+    cfg.update(enabled=False, pending_offline=False)
+    db.set_setting("etf_trend_config", cfg)
+    from .. import console
+    from . import runner as pr
+    pr.event(None, "INFO", "[ETF趋势] 已空仓，按计划下线")
+    console.audit("系统", "system", "下线完成", "etf", "美股 ETF 择时", None, None, None, "已下线")
+    _rebalance()
+    return True
+
+
+def _rebalance() -> None:
+    try:
+        from .. import evolve
+        evolve.rebalance()
+    except Exception:  # noqa: BLE001
+        pass

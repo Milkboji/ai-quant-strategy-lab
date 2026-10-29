@@ -15,6 +15,15 @@ class FreezeError(ValueError):
     pass
 
 
+def slot_points_to(slot_no: int | None, version_id: int) -> bool:
+    """策略位当前指向的就是 version_id 吗？进化 / 挑战者晋级只在这种情况下移动策略位指针，
+    用户在实验室里另存的新版本不会被进化静默覆盖。"""
+    if slot_no is None:
+        return False
+    s = db.q1("SELECT current_version_id FROM slots WHERE slot_no=?", (slot_no,))
+    return bool(s and s["current_version_id"] == version_id)
+
+
 def get_slot(slot_no: int) -> dict:
     s = db.q1("SELECT * FROM slots WHERE slot_no=?", (slot_no,))
     if s is None:

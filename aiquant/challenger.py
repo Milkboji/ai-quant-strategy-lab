@@ -365,7 +365,7 @@ def _promote_btc(ch, dep, champ, cand, fwd_eval, rr, why, trigger: str = "自动
     from .engine import backtest as bt
     nv = registry.freeze(champ["slot_no"], dict(cand, name=champ["schema"]["name"]), nl_text=champ["nl_text"],
                          source="auto_evolve", change_summary=f"[挑战者#{ch['id']}晋级] {ch['change']}"[:500],
-                         parent_id=champ["id"], set_current=champ["slot_no"] is not None)
+                         parent_id=champ["id"], set_current=registry.slot_points_to(champ["slot_no"], champ["id"]))
     try:   # 部署门禁需要训练集回测：用与进化相同的训练窗口补算并保存
         tr = evolve._windows()["train"]
         ds = md.get_dataset(*tr, source=rr["source"])
@@ -404,23 +404,13 @@ def _etf_data() -> pd.DataFrame | None:
     return pd.DataFrame({"sig_close": s["close"], "open": t["open"], "close": t["close"]}).dropna()
 
 
-def etf_backtest(df: pd.DataFrame, sma: int, band: float, start: str, end: str, cost: float = 0.0005) -> dict:
-    """收盘出信号，次日开盘调仓，持有期收益=开盘到下一日开盘；空仓收益为 0（现金）。"""
-    from .paper.etf_trend import regime_series
-    st = regime_series(df["sig_close"], int(sma), float(band))
-    w = st.shift(1).fillna(0.0)
-    r = df["open"].pct_change().shift(-1).fillna(0.0)
-    pr = w * r - (w.diff().abs().fillna(0.0)) * cost
-    x = pr[start:end]
-    if len(x) < 20:
-        return {"cagr": 0.0, "dd": 0.0, "ret": 0.0, "calmar": 0.0, "days": len(x), "switches": 0}
-    eq = (1 + x).cumprod()
-    yrs = len(x) / 252
-    cagr = (eq.iloc[-1] ** (1 / yrs) - 1) * 100
-    dd = float((eq / eq.cummax() - 1).min() * 100)
-    return {"cagr": round(cagr, 2), "dd": round(dd, 2), "ret": round((eq.iloc[-1] - 1) * 100, 2),
-            "calmar": round(cagr / max(abs(dd), 1.0), 3), "days": int(len(x)),
-            "switches": int((w[start:end].diff().abs() > 0).sum())}
+def etf_backtest(df: pd.DataFrame, sma: int, band: float, start: str, end: str) -> dict:
+    """收盘出信号，次日开盘调仓，持有期收益=开盘到下一日开盘；空仓收益为 0（现金）。
+    统一走 engine/regime_bt：美股成本模型 + 美股交易节奏（与模拟盘 etf_trend.step 相同的规则）。"""
+    from . import market as mk
+    from . import rhythm
+    from .engine import regime_bt
+    return regime_bt.backtest(df, sma, band, start, end, market=mk.US_EQUITY, rhythm=rhythm.current(mk.US_EQUITY))
 
 
 def etf_round(run_id: int | None = None) -> dict:
@@ -449,13 +439,86 @@ def etf_round(run_id: int | None = None) -> dict:
         rec.update(decision="保留", reason="已有 ETF 挑战者在模拟运行，等待其结果")
         return rec
     change = f"均线 {cur['sma']}→{best['sma']} 日，缓冲 {cur['band']:.0%}→{best['band']:.0%}"
+    ho = etf_holdout(df, cur, best)
+    rec["holdout"] = {k: v for k, v in ho.items() if not k.startswith("_")}
+    if ho.get("kind") and not ho["passed"]:
+        if ho["kind"] == "验证集":
+            _etf_touch(ho)
+        rec.update(decision="保留", reason="留出检验未通过：" + ho["reason"])
+        return rec
     cid = db.ex("INSERT INTO evolve_challengers(kind,label,champion_params,candidate_json,change,train_json,registered_at,"
                 "status) VALUES(?,?,?,?,?,?,?,?)",
-                ("etf", "美股 ETF 择时", json.dumps(cur), json.dumps(best), change, json.dumps(best_m),
-                 db.now_iso(), "running"))
-    _event(None, "INFO", f"[ETF趋势] 自动进化：挑战者 #{cid} 开始模拟运行（{change}；挑选期 Calmar {base['calmar']}→{best_m['calmar']}）")
-    rec.update(decision="挑战者上线", reason=change)
+                ("etf", "美股 ETF 择时", json.dumps(cur), json.dumps(best), change,
+                 json.dumps(dict(best_m, holdout=rec["holdout"]), ensure_ascii=False), db.now_iso(), "running"))
+    ch = db.q1("SELECT * FROM evolve_challengers WHERE id=?", (cid,))
+    if ho.get("kind"):            # 通过留出检验：与 BTC 相同，直接晋级（锁定 / 人工确认时进入待确认队列）
+        if ho["kind"] == "验证集":
+            _etf_touch(ho)
+        block = _etf_block()
+        if block:
+            _await(ch, "通过留出检验：" + ho["reason"], block)
+            rec.update(decision="待人工确认", reason=f"挑战者 #{cid} 通过留出检验，等待确认（{block}）：{ho['reason']}")
+            return rec
+        _etf_activate(best, f"自动进化 #{run_id or '-'} 通过留出检验")
+        _close(ch, "promoted", "通过留出检验，晋级上线：" + ho["reason"])
+        _event(None, "INFO", f"[ETF趋势] 自动进化：{change}，通过留出检验直接晋级 — {ho['reason']}")
+        rec.update(decision="替换", reason=f"{change}；{ho['reason']}")
+        return rec
+    _event(None, "INFO", f"[ETF趋势] 自动进化：挑战者 #{cid} 开始模拟运行（{change}；挑选期 Calmar {base['calmar']}→{best_m['calmar']}）"
+                         f"；{ho.get('reason') or ''}")
+    rec.update(decision="挑战者上线", reason=f"{change}；{ho.get('reason') or ''}")
     return rec
+
+
+# 美股 ETF 的数据分区（与 BTC 的训练 / 验证 / 前向同一思路，按交易日计）：
+#   挑选期 2016-2024（参数搜索）→ 验证集 2025-01-01 至冻结日（每条谱系最多 3 次）→ 冻结日之后的前向新数据（满 60 个交易日可用）
+ETF_VALIDATION_START = "2025-01-01"
+ETF_VALIDATION_LIMIT = 3
+
+
+def etf_split() -> dict:
+    sp = db.get_setting("etf_split")
+    if not sp:
+        df = _etf_data()
+        end = str(df.index[-1].date()) if df is not None and len(df) else datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        sp = {"select": list(ETF_SELECT), "validation": [ETF_VALIDATION_START, end], "frozen_at": db.now_iso(),
+              "note": "首次使用时冻结：验证集 = 2025-01-01 到冻结日，之后为前向新数据"}
+        db.set_setting("etf_split", sp)
+    return sp
+
+
+def etf_validation_used() -> int:
+    r = db.q1("SELECT COUNT(*) AS n FROM holdout_touches WHERE split='etf_validation'")
+    return int(r["n"]) if r else 0
+
+
+def _etf_touch(ho: dict) -> None:
+    from .paper import etf_versions
+    db.ex("INSERT INTO holdout_touches(version_id,split,window_start,window_end,backtest_id,touched_at)"
+          " VALUES(?,?,?,?,?,?)", (etf_versions.running()["id"], "etf_validation", ho["start"], ho["end"], None,
+                                   db.now_iso()))
+
+
+def etf_holdout(df: pd.DataFrame, cur: dict, cand: dict) -> dict:
+    """在候选从未参与挑选的数据上比较候选与当前参数：优先用前向新数据（满 60 个交易日），否则用验证集（限 3 次）。
+    都不可用 → kind=None，转为挑战者（跨市场快速检验 + 实时前向）。"""
+    sp = etf_split()
+    vend = sp["validation"][1]
+    fwd = df[df.index > pd.Timestamp(vend)]
+    if len(fwd) >= ETF_MIN_DAYS:
+        kind, a, b = "前向新数据", str(fwd.index[0].date()), str(fwd.index[-1].date())
+    elif etf_validation_used() < ETF_VALIDATION_LIMIT:
+        kind, a, b = "验证集", sp["validation"][0], vend
+    else:
+        return {"kind": None, "reason": f"验证集次数已用完，前向新数据只有 {len(fwd)} 个交易日（需要 {ETF_MIN_DAYS} 个），转为挑战者"}
+    c = etf_backtest(df, cur["sma"], cur["band"], a, b)
+    k = etf_backtest(df, cand["sma"], cand["band"], a, b)
+    passed = k["ret"] >= c["ret"] - TOL_RET and k["dd"] >= c["dd"] - TOL_DD
+    reason = (f"{kind}（{a}~{b}，{k['days']} 个交易日）：候选 {k['ret']:+.2f}% / 回撤 {k['dd']:.1f}%，"
+              f"当前 {c['ret']:+.2f}% / 回撤 {c['dd']:.1f}%")
+    return {"kind": kind, "start": a, "end": b, "passed": passed, "reason": reason,
+            "current": {"return_pct": c["ret"], "max_dd_pct": c["dd"], "trades": c["switches"]},
+            "candidate": {"return_pct": k["ret"], "max_dd_pct": k["dd"], "trades": k["switches"]}}
 
 
 def _etf_block() -> str | None:
@@ -466,6 +529,8 @@ def _etf_block() -> str | None:
     from .paper import etf_versions
     lk = etf_versions.lock_state()
     if lk:
+        if not lk.get("until"):
+            return "美股 ETF 版本已手动锁定"
         bj = (datetime.fromisoformat(lk["until"]) + timedelta(hours=8)).strftime("%m-%d %H:%M")
         return f"美股 ETF 版本已锁定至 {bj}（北京时间）"
     return None
@@ -498,8 +563,7 @@ def evaluate_etf(now: datetime | None = None) -> list[str]:
                 out.append(f"ETF #{ch['id']} 等待确认")
                 continue
             if fc["verdict"] == "pass":
-                db.set_setting("etf_trend_config", dict(db.get_setting("etf_trend_config") or {}, sma=cand["sma"], band=cand["band"]))
-                _etf_version(cand, f"挑战者 #{ch['id']} 晋级")
+                _etf_activate(cand, f"挑战者 #{ch['id']} 快速检验通过")
                 _close(ch, "promoted", "快速检验通过，晋级上线：" + fc["reason"])
                 _event(None, "INFO", f"[ETF趋势] 自动进化：挑战者 #{ch['id']} 快速晋级，参数改为 {cand['sma']} 日均线 ±{cand['band']:.0%} — {fc['reason']}")
                 out.append(f"ETF #{ch['id']} 快速晋级")
@@ -517,16 +581,28 @@ def evaluate_etf(now: datetime | None = None) -> list[str]:
               "challenger": {"return_pct": k["ret"], "max_dd_pct": k["dd"], "trades": k["switches"]},
               "champion": {"return_pct": c["ret"], "max_dd_pct": c["dd"], "trades": c["switches"]}}
         db.ex("UPDATE evolve_challengers SET last_eval_json=? WHERE id=?", (json.dumps(ev), ch["id"]))
-        if k["days"] < ETF_MIN_DAYS:
-            continue
         why = f"前向 {k['days']} 个交易日：挑战者 {k['ret']:+.2f}% / 回撤 {k['dd']:.1f}%，现役 {c['ret']:+.2f}% / 回撤 {c['dd']:.1f}%"
+        early = None
+        if k["days"] >= ETF_MIN_DAYS // 3 and (k["switches"] + c["switches"]) >= 1:   # 与 BTC 相同的提前决策
+            if k["ret"] >= c["ret"] + EARLY_LEAD and k["dd"] >= c["dd"] - TOL_DD:
+                early = "win"
+            elif k["ret"] <= c["ret"] - EARLY_LAG:
+                early = "lose"
+        if k["days"] < ETF_MIN_DAYS and not early:
+            continue
+        if early:
+            why = "提前决策，" + why
+        if early == "lose":
+            _close(ch, "rejected", "淘汰：" + why)
+            _event(None, "INFO", f"[ETF趋势] 自动进化：挑战者 #{ch['id']} 提前淘汰 — {why}")
+            out.append(f"ETF #{ch['id']} 淘汰")
+            continue
         if k["ret"] >= c["ret"] - TOL_RET and k["dd"] >= c["dd"] - TOL_DD and _etf_block():
             _await(ch, why, _etf_block())
             _event(None, "INFO", f"[ETF趋势] 自动进化：挑战者 #{ch['id']} 胜出，等待确认 — {why}")
             out.append(f"ETF #{ch['id']} 等待确认")
         elif k["ret"] >= c["ret"] - TOL_RET and k["dd"] >= c["dd"] - TOL_DD:
-            db.set_setting("etf_trend_config", dict(db.get_setting("etf_trend_config") or {}, sma=cand["sma"], band=cand["band"]))
-            _etf_version(cand, f"挑战者 #{ch['id']} 晋级")
+            _etf_activate(cand, f"挑战者 #{ch['id']} 前向胜出")
             _close(ch, "promoted", "晋级上线：" + why)
             _event(None, "INFO", f"[ETF趋势] 自动进化：挑战者 #{ch['id']} 晋级，参数改为 {cand['sma']} 日均线 ±{cand['band']:.0%} — {why}")
             out.append(f"ETF #{ch['id']} 晋级")
@@ -574,11 +650,7 @@ def evaluate_all(now: datetime | None = None) -> list[str]:
     return out
 
 
-def _etf_version(cand: dict, note: str) -> None:
-    """ETF 参数变了：登记为一个 ETF 版本（策略实验室里能看到版本历史）。"""
-    try:
-        from .paper import etf_versions
-        v = etf_versions.ensure_version(int(cand["sma"]), float(cand["band"]), "challenger", note)
-        db.ex("UPDATE etf_versions SET deployed_at=? WHERE id=?", (db.now_iso(), v["id"]))
-    except Exception:  # noqa: BLE001
-        log.exception("etf version record failed")
+def _etf_activate(cand: dict, note: str) -> None:
+    """挑战者自动晋级：走唯一入口 etf_versions.activate（版本登记 + 运行参数 + 审计）。"""
+    from .paper import etf_versions
+    etf_versions.activate(int(cand["sma"]), float(cand["band"]), trigger="challenger", note=note)

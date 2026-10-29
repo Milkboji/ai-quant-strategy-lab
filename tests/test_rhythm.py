@@ -157,3 +157,95 @@ def test_backtest_paused_converted_to_long(env):
         assert f"#{did} 转为长周期暂停" not in evolve.health_check()      # 只转换一次
     finally:
         db.ex("UPDATE paper_deployments SET status='stopped' WHERE id=?", (did,))
+
+
+# ---------------------------------------------------------------------------
+# 市场配置：交易日历、交易日时长、年化口径、统一回测配置入口
+# ---------------------------------------------------------------------------
+
+def test_market_calendar_and_trading_day_durations():
+    from datetime import date
+
+    import pandas as pd
+
+    from aiquant import market as mk
+    assert not mk.is_trading_day(date(2026, 4, 3))                  # 耶稣受难日
+    assert not mk.is_trading_day(date(2025, 1, 9))                  # 国葬日
+    assert not mk.is_trading_day(date(2026, 7, 3))                  # 独立日（周六）提前到周五休市
+    assert mk.is_half_day(date(2026, 11, 27)) and mk.is_half_day(date(2025, 7, 3))
+    assert mk.session_close(date(2026, 11, 27)).hour == 18            # 13:00 ET = 18:00 UTC（冬令时）
+    # 周五收盘后止损、冷却 3 个交易日 → 周一二三不开仓，周四美东开盘起恢复
+    t = pd.Timestamp("2026-10-23 20:30Z")
+    assert mk.US_EQUITY.after(t, 3) == pd.Timestamp("2026-10-29 13:30Z")
+    assert mk.CRYPTO.after(t, 72) == t + pd.Timedelta(hours=72)
+    # 感恩节（11-26）顺延
+    assert mk.US_EQUITY.after(pd.Timestamp("2026-11-25 21:00Z"), 1) == pd.Timestamp("2026-11-30 14:30Z")
+    assert mk.of_symbol("BTC/USD") is mk.CRYPTO and mk.of_symbol("QLD") is mk.US_EQUITY
+
+
+def test_gate_and_daily_context_follow_market():
+    import numpy as np
+    import pandas as pd
+
+    from aiquant import market as mk
+    from aiquant.engine.rhythm import Gate, Rhythm, daily_context
+    rh = Rhythm(cooldown_hours_after_stop=3, vol_target_pct=40, vol_lookback_days=20)
+    g = Gate(rh, mk.US_EQUITY)
+    g.on_exit(pd.Timestamp("2026-10-23 20:30Z"), "止损", -1.0)
+    assert g.check(pd.Timestamp("2026-10-28 15:00Z"))                  # 周三仍在冷却
+    assert g.check(pd.Timestamp("2026-10-29 14:00Z")) is None          # 周四开盘后恢复
+    rng = np.random.default_rng(1)
+    days = pd.bdate_range("2026-01-02", periods=60, tz="America/New_York") + pd.Timedelta(hours=16)
+    df = pd.DataFrame({"ts": days.tz_convert("UTC"), "close": 100 * np.exp(np.cumsum(rng.normal(0, 0.04, 60)))})
+    us = daily_context(df, rh, mk.US_EQUITY)
+    cr = daily_context(df.assign(ts=df["ts"].dt.floor("D") + pd.Timedelta(hours=12)), rh, mk.CRYPTO)
+    # 同样的日收益：美股年化按 √252，加密货币按 √365 → 美股波动率更低、仓位系数更高
+    assert us["vol_mult"].iloc[-1] > cr["vol_mult"].iloc[-1]
+    assert us["close_time"].iloc[0].hour in (20, 21)                   # 美东 16:00 收盘
+
+
+def test_lab_backtest_uses_same_rhythm_as_evolution(env):
+    from aiquant import market as mk
+    from aiquant import research, rhythm
+    r = research.get_research()
+    sp = research.get_split()
+    s, e = research.md.to_utc(sp["val_start"]), research.md.to_utc(sp["test_start"])
+    cfg = research.bt_config(s, e, r)
+    assert cfg.rhythm == rhythm.current() and cfg.rhythm is not None
+    assert cfg.market is mk.CRYPTO and cfg.cost.fee_bps == float(r["fee_bps"])
+    us = research.bt_config(s, e, dict(r, symbol="QLD"))
+    assert us.market is mk.US_EQUITY and us.cost.fee_bps == 0 and us.cost.sell_fee_bps > 0
+    k1 = research.params_key(1, 60, None, s, e, r, "test")
+    rhythm.set_config(enabled=False)
+    try:
+        assert research.params_key(1, 60, None, s, e, r, "test") != k1   # 节奏规则变化 → 不复用旧回测
+    finally:
+        rhythm.set_config(enabled=True)
+
+
+def test_calendar_refresh_uses_alpaca_and_backs_off(env, monkeypatch):
+    from datetime import date
+
+    from aiquant import db
+    from aiquant import market as mk
+    from aiquant.data import alpaca
+    calls = []
+
+    def fake_get(path, params=None):
+        calls.append(path)
+        return 200, [{"date": "2030-01-02", "open": "09:30", "close": "16:00"},
+                     {"date": "2030-01-04", "open": "09:30", "close": "13:00"}]
+
+    monkeypatch.setattr(alpaca, "paper_get", fake_get)
+    db.set_setting("us_calendar", None)
+    db.set_setting("us_calendar_attempt", None)
+    assert mk.refresh_calendar() is True
+    assert mk.is_half_day(date(2030, 1, 4)) and not mk.is_trading_day(date(2030, 1, 3))   # 日历里没有 → 休市
+    assert mk.refresh_calendar() is False and len(calls) == 1                              # 一周内不重复拉
+    db.set_setting("us_calendar", None)
+    mk.invalidate_cache()
+    monkeypatch.setattr(alpaca, "paper_get", lambda path, params=None: (calls.append(path) or (None, None)))
+    db.set_setting("us_calendar_attempt", None)
+    assert mk.refresh_calendar() is False and mk.refresh_calendar() is False
+    assert len(calls) == 2                                                                  # 失败后 6 小时内不再请求
+    assert mk.is_trading_day(date(2030, 1, 3))                                              # 回到内置规则

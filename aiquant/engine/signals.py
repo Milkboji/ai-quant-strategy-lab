@@ -11,16 +11,38 @@ from . import indicators
 PRICE = ["open", "high", "low", "close", "volume"]
 
 
+def daily_bars(df: pd.DataFrame, data_end=None) -> pd.DataFrame:
+    """美股日线（ts = 当天开盘，close_time = 当天收盘，均为 UTC）→ 与 resample() 相同的列；
+    收盘时刻晚于 data_end 的日线（尚未走完）标记为不完整。"""
+    out = df[["ts", "open", "high", "low", "close", "volume"]].rename(columns={"ts": "open_time"}).reset_index(drop=True)
+    out["open_time"] = pd.to_datetime(out["open_time"], utc=True)
+    out["close_time"] = pd.to_datetime(df["close_time"], utc=True).reset_index(drop=True)
+    out["n_5m"] = 1
+    out["expected_5m"] = 1
+    last = pd.Timestamp(data_end) if data_end is not None else out["close_time"].max()
+    out["complete"] = out["close_time"] <= last
+    return out[["open_time", "close_time", "open", "high", "low", "close", "volume", "n_5m", "expected_5m",
+                "complete"]].reset_index(drop=True)
+
+
 def build_frame(df5: pd.DataFrame, s: StrategySchema, signal_tf: int, aux_tf: int | None,
                 data_end=None) -> pd.DataFrame:
-    """返回主周期 K 线 + 指标列（含 aux.* 列），只保留已完成 K 线。"""
-    main = resample(df5, signal_tf, data_end)
+    """返回主周期 K 线 + 指标列（含 aux.* 列），只保留已完成 K 线。
+    df5 带 close_time 列时视为美股日线（主周期只能是日线，不支持辅助周期）。"""
+    if "close_time" in df5.columns:
+        if int(signal_tf) != 1440:
+            raise ValueError("美股只支持日线周期（按美东交易时段，收盘后出信号）")
+        if aux_tf:
+            raise ValueError("美股日线策略暂不支持辅助周期")
+        main = daily_bars(df5, data_end)
+    else:
+        main = resample(df5, signal_tf, data_end)
     n_partial = int((~main["complete"]).sum())
     main = main[main["complete"]].reset_index(drop=True)
     for ind in s.indicators:
         if ind.tf == "main":
             main[ind.id] = indicators.compute(main, ind.type, ind.params, ind.source).values
-    if aux_tf:
+    if aux_tf and "close_time" not in df5.columns:
         aux = resample(df5, aux_tf, data_end)
         aux = aux[aux["complete"]].reset_index(drop=True)
         cols = {}

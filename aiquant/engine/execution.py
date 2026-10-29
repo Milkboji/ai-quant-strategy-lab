@@ -17,10 +17,14 @@ class CostModel:
     slippage_bps: float = 2.0
     spread_bps: float = 1.0
     spread_source: str = "冻结代理模型"
+    sell_fee_bps: float = 0.0          # 只在卖出时收取的费用（美股 SEC / FINRA TAF 监管费），计入手续费
 
     def as_dict(self) -> dict:
-        return {"fee_bps_per_side": self.fee_bps, "slippage_bps_per_fill": self.slippage_bps,
-                "spread_bps_full": self.spread_bps, "spread_source": self.spread_source}
+        d = {"fee_bps_per_side": self.fee_bps, "slippage_bps_per_fill": self.slippage_bps,
+             "spread_bps_full": self.spread_bps, "spread_source": self.spread_source}
+        if self.sell_fee_bps:
+            d["sell_fee_bps"] = self.sell_fee_bps
+        return d
 
 
 @dataclass
@@ -41,7 +45,8 @@ def fill(side: str, mid: float, qty: float, cm: CostModel) -> Fill:
     sgn = 1 if side == "buy" else -1
     price = mid * (1 + sgn * (half + slip))
     notional = price * qty
-    return Fill(side, mid, price, qty, notional, notional * cm.fee_bps / 1e4,
+    fee_bps = cm.fee_bps + (cm.sell_fee_bps if side == "sell" else 0.0)
+    return Fill(side, mid, price, qty, notional, notional * fee_bps / 1e4,
                 mid * half * qty, mid * slip * qty)
 
 

@@ -164,11 +164,15 @@ def rhythm_panel() -> None:
         C.section("交易节奏（系统统一把控）", purple=True, right=C.pill("开启" if rh else "已关闭", "purple" if rh else "gray"))
         st.markdown(
             '<div class="aq-sub">在每个策略的买卖信号之上加一层统一纪律：信号照常产生，但<b>要不要做、做多大</b>由节奏规则决定。'
-            '规则是用 2021 年至今 BTC 和 ETH 的 5 分钟历史，对全部 8 个策略逐年回测、比较 25 种方案后选定的；'
-            '进化、挑战者检验和模拟盘下单用的是同一套规则。</div>', unsafe_allow_html=True)
+            '加密货币的规则用 2021 年至今 BTC 和 ETH 的 5 分钟历史，对全部 8 个策略逐年回测、比较 25 种方案后选定；'
+            '美股的参数用 2017 年至今 6 组「指数 → 杠杆 ETF」均线择时逐年回测选定。两个市场是同一套代码，只是参数不同；'
+            '策略实验室、进化、挑战者检验和模拟盘下单用的都是这套规则。</div>', unsafe_allow_html=True)
         cols = st.columns([2.2, 1])
         with cols[0]:
-            rules = (rh or rhythm.RULES_V1).describe()
+            from .. import market as mk
+            rules = ["加密货币（BTC/ETH，时长按小时、年化 √365）：" + "；".join((rh or rhythm.RULES_V1).describe())]
+            rus = rhythm.current(mk.US_EQUITY) or rhythm.RULES_US_V1
+            rules.append("美股 ETF（时长按交易日、年化 √252，节假日顺延）：" + "；".join(rus.describe(mk.US_EQUITY.unit_cn, "信号品种")))
             extra = [f"自动进化不再生成 {rc['min_signal_tf']} 分钟以下的版本（0.25% 单边手续费下，短周期长期被成本吃掉）",
                      f"长周期体检（每天）：近 {rc['long_years']} 年平均年收益为负且盈利年份少于 {rc['long_min_pos_years']} 个 → 暂停新开仓并释放额度",
                      "资金额度按长周期 年均收益 / 年均回撤 分配：长期最稳的日线趋势策略拿最多"]
@@ -183,12 +187,26 @@ def rhythm_panel() -> None:
             last = db.get_setting("rhythm_long_refreshed") or {}
             st.caption(f"长周期体检：{_bj(last.get('at')) if last.get('at') else '尚未运行'}")
         rows = rhythm.status_rows()
+        try:
+            from ..paper import etf_trend
+            ecfg = etf_trend.get_config()
+            elm = rhythm.etf_long_metrics() or {}
+            g = db.get_setting("rhythm_state::etf") or {}
+            bu = pd.Timestamp(g["block_until"]) if g.get("block_until") else None
+            blocked = bool(bu is not None and bu > pd.Timestamp.now(tz="UTC"))
+            rows.append({"id": "ETF", "label": f"美股 ETF 择时（{ecfg['signal_symbol']}→{ecfg['trade_symbol']}）",
+                         "status": "paused_entries" if rhythm.etf_long_paused() else "running",
+                         "blocked": blocked, "block_why": g.get("block_why") if blocked else "",
+                         "streak": int(g.get("streak") or 0), "long": elm, "budget": None,
+                         "budget_txt": f"{float(ecfg['budget_pct']):g}%"})
+        except Exception:  # noqa: BLE001
+            pass
         if rows:
             tbl = []
             for r in rows:
                 lm = r["long"] or {}
                 tbl.append({
-                    "部署": f"#{r['id']}", "策略": r["label"],
+                    "部署": f"#{r['id']}" if r["id"] != "ETF" else "ETF", "策略": r["label"],
                     "状态": "🟢 运行" if r["status"] == "running" else "⏸ 暂停开仓",
                     "节奏": f"⏳ {r['block_why']}" if r["blocked"] else "✅ 可开仓",
                     "连亏": r["streak"],
@@ -196,7 +214,7 @@ def rhythm_panel() -> None:
                     "年均回撤": f"{lm['mean_dd']:.1f}%" if lm else "--",
                     "盈利年份": f"{lm['pos_years']}/{lm['n_years']}" if lm else "--",
                     "体检": ("✅ 达标" if lm.get("ok") else "❌ 不达标") if lm else "待计算",
-                    "额度": f"{float(r['budget'] or 0):,.0f}"})
+                    "额度": r.get("budget_txt") or f"{float(r['budget'] or 0):,.0f}"})
             st.dataframe(pd.DataFrame(tbl), hide_index=True, use_container_width=True)
 
 

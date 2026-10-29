@@ -79,7 +79,7 @@ def test_etf_challenger_round_and_promotion(evo_env):
     m = challenger.etf_backtest(df, 150, 0.02, "2016-01-01", "2024-12-31")
     assert m["days"] > 1000 and "calmar" in m
     rec = challenger.etf_round()
-    assert rec["decision"] in ("保留", "挑战者上线")
+    assert rec["decision"] in ("保留", "挑战者上线", "替换", "待人工确认")
     db.ex("UPDATE evolve_challengers SET status='expired' WHERE kind='etf'")
     cid = db.ex("INSERT INTO evolve_challengers(kind,label,champion_params,candidate_json,change,registered_at,status) "
                 "VALUES('etf','美股 ETF 择时',?,?,?,?, 'running')",

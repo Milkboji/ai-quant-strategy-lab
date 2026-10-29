@@ -41,7 +41,7 @@ def _norm(t: str) -> str:
     t = re.sub(r"(?i)\brsi", "RSI", t)
     t = re.sub(r"(?i)\bmacd", "MACD", t)
     t = re.sub(r"(?i)\bma(?=\s*\(?\d)", "SMA", t)
-    t = re.sub(r"(\d+)\s*(?:日|周期|根)?均线", r"SMA\1", t)
+    t = re.sub(r"(\d+)\s*(?:日|周期|根)?均线", r"SMA\1 ", t)
     return t
 
 
@@ -183,17 +183,30 @@ def _match_sub(s: str, b: _Builder, aux: bool, warnings: list[str]) -> list[dict
         per = int(m.group(2)) if m.group(2) else 20
         v = b.ind("VOL_SMA", {"period": per}, aux)
         return [_cond("aux.volume" if aux else "volume", ">", v, float(m.group(1)))]
-    # 价格 vs 均线
+    # 价格 vs 均线（可带倍数 / 缓冲带：“高于1.02倍150日均线”“150日均线的0.98倍”“站上均线2%以上”）
     if len(mas) == 1:
         a = b.ind(mas[0][0], {"period": int(mas[0][1])}, aux)
+        mult = 1.0
+        mm = (re.search(NUM + r"\s*倍\s*(?:的)?\s*(?:EMA|SMA)", s)
+              or re.search(r"(?:EMA|SMA)\s*\(?\s*\d+\s*\)?\s*的\s*" + NUM + r"\s*倍", s))
+        if mm:
+            mult = float(mm.group(1))
+        else:
+            mp = re.search(r"(?:EMA|SMA)\s*\(?\s*\d+\s*\)?\s*(上方|之上|以上|下方|之下|以下)?\s*" + NUM + r"\s*%\s*(以上|以下)?", s)
+            if mp:
+                up = (mp.group(1) or mp.group(3) or "") in ("上方", "之上", "以上") or (
+                    not (mp.group(1) or mp.group(3)) and re.search(ABOVE_WORDS, s))
+                mult = 1 + float(mp.group(2)) / 100 if up else 1 - float(mp.group(2)) / 100
+        if mult <= 0 or mult > 10:
+            mult = 1.0
         if re.search(DOWN_WORDS, s):
-            return [_cond(price, "cross_below", a)]
+            return [_cond(price, "cross_below", a, mult)]
         if re.search(UP_WORDS, s):
-            return [_cond(price, "cross_above", a)]
+            return [_cond(price, "cross_above", a, mult)]
         if re.search(BELOW_WORDS, s):
-            return [_cond(price, "<", a)]
+            return [_cond(price, "<", a, mult)]
         if re.search(ABOVE_WORDS, s):
-            return [_cond(price, ">", a)]
+            return [_cond(price, ">", a, mult)]
     return None
 
 
@@ -227,6 +240,12 @@ def parse(text: str, default_name: str = "自定义策略") -> ParseResult:
         return ParseResult(None, "error", errors=["策略描述为空"])
     t = _norm(text)
     b = _Builder()
+    # 美股：文字里提到某只 ETF（如“QQQ 收盘价站上150日均线时买入”）→ 用它的日线出信号；交易品种由研究设置决定
+    from ..data.us_daily import UNIVERSE
+    tickers = [x for x in re.findall(r"(?<![A-Za-z])([A-Z]{2,5})(?![A-Za-z])", t) if x in UNIVERSE]
+    sig_sym = tickers[0] if tickers else None
+    if tickers:
+        t = re.sub(r"(?<![A-Za-z])(" + "|".join(sorted(set(tickers), key=len, reverse=True)) + r")(?![A-Za-z])(的)?", "", t)
 
     # 周期识别
     tfs = []
@@ -243,6 +262,10 @@ def parse(text: str, default_name: str = "自定义策略") -> ParseResult:
         main_tf = tfs[0]
 
     sch: dict = {"name": default_name}
+    if sig_sym:
+        sch["signal_symbol"] = sig_sym
+        if main_tf is None:
+            main_tf = 1440
     # 风控类条款（全局抽取）
     m = re.search(r"(?<!移动)(?:固定)?止损\s*(?:为|设为|设置为)?\s*" + NUM + r"\s*%|" + NUM + r"\s*%\s*(?:的)?(?:固定)?止损", t)
     if m:
@@ -288,7 +311,7 @@ def parse(text: str, default_name: str = "自定义策略") -> ParseResult:
             continue
         role = None
         if re.search(SHORT_WORDS, clause_core):
-            warnings.append("本系统仅支持做多（BTC现货1倍），『做空』信号已按『平仓』处理。")
+            warnings.append("本系统仅支持做多（1倍，不做空），『做空』信号已按『平仓』处理。")
             role = "exit"
         elif re.search(EXIT_WORDS, clause_core):
             role = "exit"
@@ -381,6 +404,8 @@ GENERAL_SYNTAX = [
     ("最长持仓", "持仓超过48根K线平仓", "到时间就卖出"),
     ("组合条件", "EMA20上穿EMA60且RSI(14)大于50时买入", "“且”= 同时满足；“或”= 任一满足"),
     ("离场", "反向交叉时平仓", "沿用上面的交叉条件，反方向时卖出"),
+    ("均线缓冲带", "收盘价站上150日均线2%以上时买入", "也可写“高于1.02倍150日均线”；跌破时写“2%以下”或“0.98倍”"),
+    ("美股", "QQQ收盘价站上150日均线2%以上时买入", "交易品种选美股 ETF（日线）；写另一只 ETF 就用它的日线出信号，如 QQQ → 交易 QLD"),
 ]
 
 
