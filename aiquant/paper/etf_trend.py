@@ -57,19 +57,21 @@ def reclaim_active() -> bool:
 
 
 def capital_share(equity: float | None) -> float:
-    """美股 ETF 实际占用的资金比例（%），BTC 策略按实力分配时先扣除它：
-    运行中取「设定比例」和「当前持仓市值 / 权益」的较大者（ETF 涨多了也不会让两边合计超过账户）；
-    空仓且已临时借出时，只扣除未借出的部分（BTC 最多临时使用这部分额度的 lend_pct%）；
-    下线 / 等待下线时只扣除仍在持有的市值。"""
-    cfg = get_config()
-    st = db.get_setting("etf_trend_state") or {}
-    held = float((st.get("position") or {}).get("market_value") or 0)
-    held_pct = held / equity * 100 if equity and equity > 0 else 0.0
-    target = float(cfg["budget_pct"]) if cfg.get("enabled") and not cfg.get("pending_offline") else 0.0
-    ls = lend_state()
-    if ls.get("state") == "lent":
-        target *= 1 - float(ls.get("lend_pct", cfg.get("lend_pct", 50.0))) / 100
-    return round(max(target, held_pct), 4)
+    """美股实际占用的资金比例（%），BTC 策略按实力分配时先扣除它（第一层，见 allocation.layer1）：
+    max(美股目标 − 临时借出部分, 美股持仓市值占比)；没有运行中的美股部署时只算仍在持有的市值。"""
+    from .. import allocation
+    from . import us_exec
+    if us_exec.etf_deployment() is None:     # 还没迁移（首次启动前）：原公式
+        cfg = get_config()
+        st = db.get_setting("etf_trend_state") or {}
+        held = float((st.get("position") or {}).get("market_value") or 0)
+        held_pct = held / equity * 100 if equity and equity > 0 else 0.0
+        target = float(cfg["budget_pct"]) if cfg.get("enabled") and not cfg.get("pending_offline") else 0.0
+        ls = lend_state()
+        if ls.get("state") == "lent":
+            target *= 1 - float(ls.get("lend_pct", cfg.get("lend_pct", 50.0))) / 100
+        return round(max(target, held_pct), 4)
+    return round(allocation.layer1(equity)["us_deduct_pct"], 4)
 
 
 RECLAIM_DEADLINE_MIN = 10 * 60 + 30     # 美东 10:30 前等 BTC 还款；过了就按可用现金买入（缩量并通知）
@@ -207,11 +209,15 @@ def _clock() -> dict | None:
 
 
 def _position(sym: str) -> dict:
+    """券商持仓。404 = 没有持仓；其他错误（网络、凭证）带 error=True，调用方不能当作空仓。"""
     code, b = alpaca.paper_get(f"/v2/positions/{sym}")
     if code == 200 and isinstance(b, dict):
         return {"qty": float(b.get("qty") or 0), "market_value": float(b.get("market_value") or 0),
                 "avg_entry_price": float(b.get("avg_entry_price") or 0), "unrealized_pl": float(b.get("unrealized_pl") or 0)}
-    return {"qty": 0.0, "market_value": 0.0, "avg_entry_price": 0.0, "unrealized_pl": 0.0}
+    out = {"qty": 0.0, "market_value": 0.0, "avg_entry_price": 0.0, "unrealized_pl": 0.0}
+    if code != 404:
+        out["error"] = True
+    return out
 
 
 def _account() -> dict | None:
@@ -220,20 +226,16 @@ def _account() -> dict | None:
 
 
 def _submit(sym: str, side: str, *, notional: float | None = None, qty: float | None = None,
-            signal_date: str, reason: str) -> dict:
-    coid = f"etf-{sym.lower()}-{side}-{signal_date}-{uuid.uuid4().hex[:6]}"
+            signal_date: str | None = None, reason: str | None = None, coid: str | None = None) -> dict:
+    """向 Alpaca Paper 提交当日有效（DAY）市价单。迁移后由通用美股执行器调用（订单与分账记在 us_orders / us_order_allocs）。"""
+    coid = coid or f"etf-{sym.lower()}-{side}-{signal_date}-{uuid.uuid4().hex[:6]}"
     body = {"symbol": sym, "side": side, "type": "market", "time_in_force": "day", "client_order_id": coid}
     if notional is not None:
         body["notional"] = f"{notional:.2f}"
     else:
         body["qty"] = f"{qty:.9f}".rstrip("0").rstrip(".")
-    db.ex("INSERT INTO etf_orders(ts,symbol,side,notional,qty,status,client_order_id,signal_date,reason) "
-          "VALUES(?,?,?,?,?,?,?,?,?)", (db.now_iso(), sym, side, notional, qty, "new", coid, signal_date, reason))
     r = http.request("POST", f"{config.ALPACA_PAPER_URL}/v2/orders", headers=alpaca._paper_headers(), json_body=body)
     info = r.json() if r.content else {}
-    status = info.get("status") if r.status_code in (200, 201) else f"rejected_{r.status_code}"
-    db.ex("UPDATE etf_orders SET status=?, raw_json=? WHERE client_order_id=?",
-          (status, json.dumps(info, ensure_ascii=False)[:2000], coid))
     if r.status_code not in (200, 201):
         raise RuntimeError(f"Alpaca Paper 拒绝订单 {r.status_code}: {r.text[:160]}")
     return info
@@ -410,182 +412,13 @@ def _rhythm_exit(now: datetime, pnl: float) -> None:
 
 
 def step(now: datetime | None = None) -> dict:
-    try:   # 安全重启进行中：不下新单
-        from .. import safe_restart
-        if safe_restart.active():
-            set_why("safe_restart", "安全重启进行中，暂停下新单")
-            return {"skipped": "安全重启进行中，暂停下新单"}
-    except Exception:  # noqa: BLE001
-        pass
-    cfg = get_config()
-    if not cfg["enabled"]:
-        set_why("disabled", "美股 ETF 择时已下线（未启用）")
-        return {}
-    if not http.paper_orders_unlocked():
-        set_why("locked", "模拟下单锁未打开（双重锁），只计算信号不下单")
-        return {}
-    ensure_tables()
-    sync_orders()
-    now = now or datetime.now(timezone.utc)
-    st = db.get_setting("etf_trend_state") or {}
-    if not db.get_setting("etf_trend_rebalanced"):   # 首次启用：把 ETF 资金比例从 BTC 策略额度中划出
-        try:
-            from .. import evolve
-            evolve.rebalance()
-            db.set_setting("etf_trend_rebalanced", db.now_iso())
-        except Exception:  # noqa: BLE001
-            pass
-    clk = _clock()
-    if not clk:
-        set_why("no_clock", "暂时连不上券商时钟，稍后重试")
-        return st
-    if not clk.get("is_open"):
-        set_why("closed", f"美股休市中，下次开盘 {_bj(clk.get('next_open'))}（北京时间）", next_open=clk.get("next_open"))
-        return st
-    now_et = now.astimezone(ET)
-    today = now_et.date()
-    if st.get("last_action_date") == str(today):
-        return st
-    if now_et.hour * 60 + now_et.minute < 9 * 60 + 35:
-        set_why("pre_open", "已开盘，等到美东 9:35（开盘 5 分钟后）再按前一日收盘信号决定")
-        return st
-    sym = cfg["trade_symbol"]
-    try:
-        update_daily_csv([cfg["signal_symbol"], sym], now)
-    except Exception:  # noqa: BLE001
-        log.warning("etf daily csv refresh failed", exc_info=True)
-    try:
-        sig = compute_signal(daily_bars(cfg["signal_symbol"]), today, cfg)
-    except Exception as e:  # noqa: BLE001
-        set_why("data_error", f"日线数据暂时取不到，稍后重试：{str(e)[:120]}")
-        return st
-    pos = _position(sym)
-    try:
-        from . import etf_versions
-        if etf_versions.finish_pending_offline(float(pos["qty"] or 0)):
-            set_why("disabled", "已空仓，按计划下线")
-            return st
-    except Exception:  # noqa: BLE001
-        log.warning("pending offline check failed", exc_info=True)
-    try:   # 美股影子模式：每个交易日记录一次「如果生效会怎样」并自检
-        from .. import rhythm
-        rhythm.shadow_record(str(today), now)
-    except Exception:  # noqa: BLE001
-        log.warning("shadow record failed", exc_info=True)
-    acct = _account() or {}
-    equity = float(acct.get("equity") or 0)
-    budget = equity * float(cfg["budget_pct"]) / 100
-    cash = float(acct.get("cash") or 0)
-    pending = db.q1("SELECT id FROM etf_orders WHERE symbol=? AND status IN ('new','accepted','pending_new',"
-                    "'partially_filled')", (sym,))
-    in_band = sig["lower"] <= sig["close"] <= sig["upper"]
-    band_txt = (f"（收盘 {sig['close']:.2f} 在均线缓冲带 {sig['lower']:.2f}~{sig['upper']:.2f} 内，维持原状态）"
-                if in_band else "")
-    entry = st.get("entry") if isinstance(st.get("entry"), dict) else None
-    # 美股空仓时把一部分额度临时借给 BTC；买入信号（收盘后确认，见 after_close）时收回：
-    # BTC 在下一个美股开盘前按借用比例减仓并暂停新开仓；开盘后 ETF 先等还款、再买入（ETF 买入优先）
-    flat = pos["qty"] <= 0 and not pending
-    ls = lend_state().get("state", "none")
-    lend_pct = float(cfg.get("lend_pct", 50.0))
-    if not flat and ls == "lent":
-        _set_lend("none", f"已持有 {sym}，借出状态结束", cfg)
-        ls = "none"
-    elif flat and sig["regime"] == 0 and ls == "none" and lend_pct > 0 and not cfg.get("pending_offline"):
-        _set_lend("lent", f"美股空仓（看空），BTC 最多临时使用美股额度的 {lend_pct:g}%", cfg)
-        ls = "lent"
-    elif flat and sig["regime"] == 1 and ls == "lent":
-        _set_lend("reclaim", f"{cfg['signal_symbol']} 发出买入信号（开盘检查时确认，收盘后检查没有运行），收回借给 BTC 的额度：BTC 按"
-                             "借用比例减仓并暂停新开仓", cfg, signal_date=sig["date"])
-        ls = "reclaim"
-    if ls == "reclaim" and sig["regime"] == 0:
-        _set_lend("none", "收回结束（信号转空）", cfg)
-        ls = "none"
-    if ls == "reclaim" and flat and sig["regime"] == 1:
-        waiting = reclaim_pending()
-        mins = now_et.hour * 60 + now_et.minute
-        if waiting and mins < RECLAIM_DEADLINE_MIN:
-            set_why("reclaim", f"看多，先等 BTC 按借用比例减仓、归还额度（还剩部署 {', '.join('#' + w for w in waiting)}；"
-                               f"BTC 已暂停新开仓）。现金 {cash:,.0f} / 需要 {budget:,.0f} USD；最晚美东 10:30 按可用现金买入")
-            return st       # 不记 last_action_date：还款完成后当天就买
-    reserved = 0.0
-    try:
-        from . import cash_guard
-        reserved = cash_guard.reserved_cash(_btc_price(), exclude="etf")
-    except Exception:  # noqa: BLE001
-        log.warning("reserved cash failed", exc_info=True)
-    action = "保持"
-    side = None
-    try:
-        if pending:
-            action = "等待未完成订单"
-            set_why("pending", "上一笔订单还没完成，等它成交或过期后再动作")
-        elif sig["regime"] == 1 and pos["qty"] <= 0 and cfg.get("pending_offline"):
-            set_why("pending_offline", "等待下线：不再开新仓")
-        elif sig["regime"] == 1 and pos["qty"] <= 0:
-            block, vm = _rhythm_gate(sym, now)
-            if block:
-                set_why("long_pause" if block.startswith("长周期体检") else "rhythm", f"看多，但{block}，暂不买入")
-            else:
-                from . import cash_guard
-                target = budget * vm
-                notional, short = cash_guard.check_buy(target, cash, who="美股 ETF 择时", symbol=sym, reserved=reserved,
-                                                       dedupe=f"cash-etf-{today}")
-                if notional >= cash_guard.MIN_ORDER_USD:
-                    side = "buy"
-                    why = f"{cfg['signal_symbol']} 收盘 {sig['close']:.2f} 高于 {cfg['sma']} 日均线上沿 {sig['upper']:.2f}"
-                    if vm < 1:
-                        why += f"；波动率定仓 {vm:.0%}"
-                    if short:
-                        why += f"；{short}"
-                    action = _buy(sym, notional, sig, why) or "保持"
-                    if action != "保持":
-                        entry = {"signal_date": sig["date"], "target": round(target, 2)}
-                        set_why("bought", f"看多：{why}，已下单 {action}" + ("；差额下一个交易日补足" if short else ""))
-                        if short:
-                            _log("WARN", short)
-                        _rhythm_entry(now)
-                        if lend_state().get("state") != "none" and not short:
-                            _set_lend("none", f"已买入 {sym}，额度归还", cfg)
-                else:
-                    set_why("small", (short or f"看多，但可用资金不足 10 USD（现金 {cash:,.2f}）") + "，暂不买入")
-        elif sig["regime"] == 1 and pos["qty"] > 0:
-            from . import cash_guard
-            need = 0.0
-            if entry and not cfg.get("pending_offline"):
-                need = topup_needed(entry["target"], entry_filled_usd(sym, entry["signal_date"]))
-            rem, short = cash_guard.check_buy(need, cash, who="美股 ETF 择时（补足）", symbol=sym, reserved=reserved,
-                                              dedupe=f"cash-etf-topup-{today}") if need else (0.0, None)
-            if rem >= cash_guard.MIN_ORDER_USD:
-                side = "buy"
-                action = _buy(sym, rem, sig, f"上次买入只部分成交，补足到目标 {entry['target']:,.0f} USD"
-                              + (f"；{short}" if short else "")) or "保持"
-                if action != "保持":
-                    action = "补足 " + action
-                    set_why("topup", f"上次买入只部分成交，今天补买 {rem:,.0f} USD" + (f"（{short}）" if short else ""))
-                    if lend_state().get("state") == "reclaim" and not short:
-                        _set_lend("none", f"已补足 {sym}，额度归还", cfg)
-            else:
-                if lend_state().get("state") == "reclaim" and not need:
-                    _set_lend("none", f"已持有 {sym} 且达到目标，额度归还", cfg)
-                set_why("hold", f"看多且已持有 {sym}，保持不动{band_txt}" + (f"；{short}" if short else ""))
-        elif sig["regime"] == 0 and pos["qty"] > 0:
-            side = "sell"
-            _submit(sym, "sell", qty=pos["qty"], signal_date=sig["date"],
-                    reason=f"{cfg['signal_symbol']} 收盘 {sig['close']:.2f} 低于 {cfg['sma']} 日均线下沿 {sig['lower']:.2f}")
-            action = f"卖出全部 {sym}"
-            entry = None
-            _rhythm_exit(now, float(pos.get("unrealized_pl") or 0))
-            set_why("sold", f"看空：{cfg['signal_symbol']} 跌破 {cfg['sma']} 日均线下沿 {sig['lower']:.2f}，已卖出全部 {sym}")
-        else:
-            set_why("flat", f"看空，保持现金，不持有 {sym}{band_txt}")
-    except RuntimeError as e:
-        return _reject(st, today, sym, side or "buy", e, sig)
-    st = {"last_action_date": str(today), "signal": sig, "action": action, "position": pos,
-          "budget": budget, "checked_at": db.now_iso(), "entry": entry}
-    db.set_setting("etf_trend_state", st)
-    _log("INFO", f"{sig['date']} 收盘 {cfg['signal_symbol']} {sig['close']:.2f}，{cfg['sma']} 日均线 {sig['sma']:.2f}"
-                 f"（上沿 {sig['upper']:.2f} / 下沿 {sig['lower']:.2f}）→ {'看多，持有' if sig['regime'] else '看空，空仓'} {sym}；动作：{action}")
-    return st
+    """美股 ETF 择时已迁移为通用美股日线执行器上的一个普通部署（us_exec，kind=etf_sma）：
+    规则不变（已收盘日线出信号、美东 9:35 后 DAY 单、被拒不重试、部分成交次日补足、写「为什么」），这里只转调。"""
+    from . import us_exec
+    res = us_exec.step(now)
+    if isinstance(res, dict) and res.get("skipped"):
+        return res
+    return db.get_setting("etf_trend_state") or {}
 
 
 def _btc_price() -> float | None:
@@ -598,47 +431,22 @@ def _btc_price() -> float | None:
 
 
 def after_close(now: datetime | None = None) -> dict | None:
-    """美股收盘后（含周末、节假日）检查：用刚收盘的日线确认下一交易日的信号。
-    美股空仓、额度已借给 BTC、且确认为买入信号 → 立即进入「收回」：BTC 在下一个美股开盘前按借用比例减仓、暂停新开仓。
-    每个收盘日只确认一次（日线还没出来时稍后重试）。"""
-    from .. import market as mk
-    cfg = get_config()
-    if not cfg["enabled"] or lend_state().get("state") != "lent":
-        return None
-    now = now or datetime.now(timezone.utc)
-    now_et = now.astimezone(ET)
-    d = now_et.date()
-    last = d if (mk.is_trading_day(d) and now >= mk.session_close(d) + timedelta(minutes=15)) else None
-    if last is None:
-        cur = d
-        for _ in range(10):
-            cur -= timedelta(days=1)
-            if mk.is_trading_day(cur):
-                last = cur
-                break
-        if mk.is_trading_day(d) and now >= mk.session_open(d):
-            return None          # 今天的交易时段内（含收盘后 15 分钟）：交给开盘检查
-    if last is None or (db.get_setting("etf_after_close") or {}).get("date") == str(last):
-        return None
-    nxt = mk.trading_days_after(last, 1)[0]
-    try:
-        sig = compute_signal(daily_bars(cfg["signal_symbol"]), nxt, cfg)
-    except Exception as e:  # noqa: BLE001
-        log.info("after-close signal not ready: %s", e)
-        return None
-    if sig["date"] != str(last):
-        return None              # 收盘日线还没出来
-    pos = _position(cfg["trade_symbol"])
-    out = {"date": str(last), "next": str(nxt), "regime": sig["regime"], "at": db.now_iso()}
-    db.set_setting("etf_after_close", out)
-    if sig["regime"] == 1 and float(pos.get("qty") or 0) <= 0:
-        _set_lend("reclaim", f"{last} 收盘后确认 {cfg['signal_symbol']} 买入信号（收盘 {sig['close']:.2f} 高于均线上沿 "
-                             f"{sig['upper']:.2f}），收回借给 BTC 的额度：BTC 在 {nxt} 美股开盘前按借用比例减仓、暂停新开仓",
-                  cfg, signal_date=sig["date"])
-        set_why("reclaim", f"{last} 收盘后确认买入信号：BTC 在 {nxt} 美股开盘前按借用比例减仓，开盘后先还款再买入 {cfg['trade_symbol']}")
-    return out
+    """收盘后确认下一交易日信号（借出 → 收回；偏离目标 → 下一交易日再平衡），见 us_exec.after_close。"""
+    from . import us_exec
+    return us_exec.after_close(now)
 
 
 def orders(limit: int = 30) -> list[dict]:
+    """美股 ETF 择时的订单：迁移后来自通用执行器（每个策略分到的份额），迁移前的旧订单仍在 etf_orders。"""
+    from . import us_exec, us_ledger
     ensure_tables()
-    return db.q("SELECT * FROM etf_orders ORDER BY id DESC LIMIT ?", (limit,))
+    out = []
+    dep = us_exec.etf_deployment()
+    if dep:
+        for a in us_ledger.allocs_for(dep["id"], limit):
+            out.append({"ts": a["created_at"], "symbol": a["symbol"], "side": a["side"], "notional": a["req_notional"],
+                        "qty": a["req_qty"], "status": a["order_status"] or a["status"], "filled_qty": a["filled_qty"],
+                        "filled_price": a["filled_price"], "client_order_id": a["client_order_id"],
+                        "signal_date": a["trade_date"], "reason": a["reason"]})
+    out += db.q("SELECT * FROM etf_orders ORDER BY id DESC LIMIT ?", (limit,))
+    return out[:limit]

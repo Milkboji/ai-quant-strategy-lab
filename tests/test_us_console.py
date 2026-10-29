@@ -276,6 +276,8 @@ def test_idle_etf_budget_lent_to_btc_and_reclaimed(etf, monkeypatch):
     from aiquant import evolve
     from aiquant.paper import runner as pr
     from datetime import datetime, timezone
+    from tests.us_fake import reset_us
+    reset_us()
     db.set_setting("etf_lend", None)
     db.ex("DELETE FROM etf_orders")
     monkeypatch.setattr(etf_trend.http, "paper_orders_unlocked", lambda: True)

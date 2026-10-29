@@ -66,6 +66,7 @@ def render() -> None:
                 + "".join(f'<div class="aq-m"><div class="l">{C.esc(l)}</div><div class="n" style="font-size:22px;{s}">'
                           f'{C.esc(v)}</div></div>' for l, v, s in cells) + "</div>", unsafe_allow_html=True)
     _queue_panel(effective_user(), role())
+    _capital_panel(eq, effective_user(), role())
     _deploy_all_bar(effective_user(), role())
     focus = st.session_state.pop("console_focus", None)
     for r in rows:
@@ -106,6 +107,8 @@ def _card(r: dict, actor: str, rl: str, focus: bool) -> None:
             pills += " " + C.pill("挑战者胜出，等待确认", "purple")
         if focus:
             pills += " " + C.pill("刚从实验室跳转", "blue")
+        if r.get("market") == "us_equity":
+            pills += " " + C.pill(f"美股日线 · {r.get('trade_symbol') or ''}", "blue")
         st.markdown(f'<div class="aq-slothead"><div><span class="aq-slotname">{C.esc(r["name"])}</span> '
                     f'<span class="aq-meta">{C.esc(r["origin"])} · 来源：{C.esc(r["source_cn"])}</span></div>'
                     f'<div>{pills}</div></div>', unsafe_allow_html=True)
@@ -146,7 +149,9 @@ def _card(r: dict, actor: str, rl: str, focus: bool) -> None:
                 st.markdown(f'<div class="aq-sub" style="color:#6D28D9">挑战者 #{a["id"]} 胜出，等待确认：'
                             f'{C.esc(a["change"] or "")}。请在上方「待确认」里批准或拒绝。</div>', unsafe_allow_html=True)
         with cols[2]:
-            st.markdown(C.kv([("持仓", f"{r['qty']:.6f} BTC" if dep else "--"),
+            unit = r.get("trade_symbol") if r.get("market") == "us_equity" else "BTC"
+            qfmt = f"{r['qty']:,.4f} {unit}" if r.get("market") == "us_equity" else f"{r['qty']:.6f} BTC"
+            st.markdown(C.kv([("持仓", qfmt if dep else "--"),
                               ("市值", C.usd(r["value"]) if dep and r["value"] is not None else "--"),
                               ("资金权重", C.pct(r["weight_pct"], sign=False, digits=1) if r["weight_pct"] is not None else "--"),
                               ("额度", C.usd(r["budget"]) if dep else "--")]), unsafe_allow_html=True)
@@ -240,6 +245,8 @@ def _etf_card(r: dict, actor: str, rl: str, focus: bool) -> None:
             pills += " " + C.pill("验证/测试数据已暴露", "orange")
         if focus:
             pills += " " + C.pill("刚从实验室跳转", "blue")
+        if r.get("market") == "us_equity":
+            pills += " " + C.pill(f"美股日线 · {r.get('trade_symbol') or ''}", "blue")
         st.markdown(f'<div class="aq-slothead"><div><span class="aq-slotname">{C.esc(r["name"])}</span> '
                     f'<span class="aq-meta">{C.esc(r["signal_symbol"])} → {C.esc(r["trade_symbol"])} · 来源：策略实验室参数版本'
                     f'</span></div><div>{pills}</div></div>',
@@ -322,7 +329,9 @@ def _etf_card(r: dict, actor: str, rl: str, focus: bool) -> None:
                     except Exception as e:  # noqa: BLE001
                         flash("console", "err", f"{r['name']}：{e}")
                     st.rerun()
-        with st.expander(f"资金比例：{r['budget_pct']:g}%（固定，不参与 BTC 的按实力分配）"):
+        if r.get("deployment_id"):
+            st.caption(f"运行在通用美股日线执行器上：部署 #{r['deployment_id']}（与实验室美股版本同一套执行规则、分账台账）")
+        with st.expander(f"美股目标比例：{r['budget_pct']:g}%（资金第一层；美股内部按实力公式分配）"):
             c2 = st.columns([1, 1, 2])
             pct = c2[0].number_input("资金比例 %", min_value=ev.BUDGET_RANGE[0], max_value=ev.BUDGET_RANGE[1],
                                      value=float(r["budget_pct"]), step=5.0, key="cs_pct_etf")
@@ -333,8 +342,8 @@ def _etf_card(r: dict, actor: str, rl: str, focus: bool) -> None:
                 except Exception as e:  # noqa: BLE001
                     flash("console", "err", f"{r['name']}：{e}")
                 st.rerun()
-            c2[2].caption("下一次买入时按新比例下单，不主动加减已有持仓。BTC 策略可分配的资金 = 总权益 − 预留 − "
-                          "max(美股设定比例, 美股当前持仓市值占比)。")
+            c2[2].caption("美股目标比例（第一层）。持仓偏离目标超过再平衡阈值时，收盘后记下、下一个交易日开盘后调整。"
+                          "BTC 策略可分配的资金 = 总权益 − 预留 − max(美股目标 − 借出部分, 美股持仓市值占比)。")
             c3 = st.columns([1, 1, 2])
             lp = c3[0].number_input("空仓时借给 BTC 的比例 %", min_value=0.0, max_value=100.0,
                                     value=float(r.get("lend_pct", 50.0)), step=10.0, key="cs_lend_etf")
@@ -358,6 +367,51 @@ def _etf_card(r: dict, actor: str, rl: str, focus: bool) -> None:
                              expanded=focus):
                 st.dataframe(pd.DataFrame([{"项目": k, f"模拟盘 v{run['version_no']}": a, f"实验室 v{lab['version_no']}": b}
                                            for k, a, b in r["diff"]]), hide_index=True, use_container_width=True)
+
+
+def _capital_panel(eq: float | None, actor: str, rl: str) -> None:
+    """资金两层分配：第一层（市场之间的上下限）与第二层（市场内部按实力公式）的计算过程，以及第一层设置。"""
+    from .. import allocation
+    try:
+        ex = allocation.explain(eq or 0)
+    except Exception as e:  # noqa: BLE001
+        console.log.exception("capital explain failed")
+        st.caption(f"资金分配读取失败：{e}")
+        return
+    l1 = ex["layer1"]
+    with st.expander(f"资金两层分配：加密货币 {l1['crypto_pct']:.1f}% · 美股 {l1['us_deduct_pct']:.1f}% · "
+                     f"现金 {l1['cash_pct']:.1f}%（账户权益 {C.usd(eq) if eq else '--'}）"):
+        st.markdown("**第一层：市场之间（上下限可配置）**")
+        st.markdown("".join(f"<div>• {C.esc(x)}</div>" for x in l1["steps"]), unsafe_allow_html=True)
+        st.markdown("**第二层：市场内部按实力公式**（长周期 年均收益 / 年均回撤，没有长周期结果时用训练集 收益 / 回撤；权重有上下限）")
+        if ex["us"]:
+            st.dataframe(pd.DataFrame([{"美股部署": f"#{x['deployment']} {x['label']}", "额度": C.usd(x["budget"]),
+                                        "美股内占比": C.pct(x["share_pct"], sign=False, digits=1) if x["share_pct"] is not None else "--",
+                                        "目标 / 实际（占权益）": (f"{x['target_pct']:.1f}% / {x['actual_pct']:.1f}%"
+                                                         if x["target_pct"] is not None else "--"),
+                                        "依据": x["why"]} for x in ex["us"]]), hide_index=True, use_container_width=True)
+        if ex["crypto"]:
+            st.dataframe(pd.DataFrame([{"加密货币部署": f"#{x['deployment']} {x['label']}", "额度": C.usd(x["budget"]),
+                                        "加密内占比": C.pct(x["share_pct"], sign=False, digits=1) if x.get("share_pct") is not None else "--",
+                                        "依据": x["why"]} for x in ex["crypto"]]), hide_index=True, use_container_width=True)
+        st.caption(f"美股策略实际仓位偏离目标超过 {l1['rebalance_pp']:g} 个百分点时，收盘后记下、下一个交易日开盘后再平衡；"
+                   "加密货币按信号逐笔开仓，额度变化在下一次开仓时生效。")
+        c = allocation.get_config()
+        cols = st.columns(3)
+        us_min = cols[0].number_input("美股下限 %", 0.0, 100.0, float(c["us_equity"]["min"]), 5.0, key="cap_us_min")
+        us_max = cols[1].number_input("美股上限 %", 0.0, 100.0, float(c["us_equity"]["max"]), 5.0, key="cap_us_max")
+        rpp = cols[2].number_input("再平衡阈值（百分点）", 1.0, 50.0, float(c["rebalance_pp"]), 1.0, key="cap_rpp")
+        cols = st.columns(3)
+        cr_min = cols[0].number_input("加密货币下限 %", 0.0, 100.0, float(c["crypto"]["min"]), 5.0, key="cap_cr_min")
+        cr_max = cols[1].number_input("加密货币上限 %", 0.0, 100.0, float(c["crypto"]["max"]), 5.0, key="cap_cr_max")
+        if cols[2].button("保存资金分层", key="cap_save", use_container_width=True):
+            try:
+                res = allocation.set_config(actor=actor, role=rl, us_min=us_min, us_max=us_max, crypto_min=cr_min,
+                                            crypto_max=cr_max, rebalance_pp=rpp)
+                flash("console", "ok", res["message"])
+            except Exception as e:  # noqa: BLE001
+                flash("console", "err", str(e))
+            st.rerun()
 
 
 def _audit_panel() -> None:

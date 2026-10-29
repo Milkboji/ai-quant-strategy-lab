@@ -240,10 +240,12 @@ def _etf_env(monkeypatch, fake, log):
     """美股 ETF 执行器接到同一个假 Alpaca 账户：ETF 买入扣同一份现金。"""
     from aiquant import evolve
     from aiquant.paper import etf_trend
+    from tests.us_fake import reset_us
     etf_trend.ensure_tables()
     db.ex("DELETE FROM etf_orders")
-    db.set_setting("etf_trend_state", None)
-    db.set_setting("etf_after_close", None)
+    lend = db.get_setting("etf_lend")
+    reset_us()
+    db.set_setting("etf_lend", lend)
     days = pd.bdate_range(end="2026-01-09", periods=200).date
     up = pd.DataFrame({"date": days, "close": [100 + i * 0.2 for i in range(200)]})
     monkeypatch.setattr(etf_trend, "daily_bars", lambda sym, days_=420: up)
@@ -302,7 +304,9 @@ def test_etf_buy_day_btc_repays_lent_position_first_then_etf_buys(live, monkeypa
     try:
         # 1) 周五收盘后确认 QQQ 买入信号 → 收回：BTC 待减仓 25%、暂停新开仓
         out = et.after_close(datetime(2026, 1, 9, 22, 7, tzinfo=UTC))
-        assert out and out["regime"] == 1 and out["next"] == "2026-01-12"
+        from aiquant.paper import us_exec
+        edid = us_exec.etf_deployment()["id"]
+        assert out and out["deployments"][edid]["regime"] == 1 and out["next"] == "2026-01-12"
         assert et.reclaim_active() and et.pending_cut(did)["frac"] == 0.25
         assert et.after_close(datetime(2026, 1, 9, 23, 0, tzinfo=UTC)) is None          # 每个收盘日只确认一次
         # 2) 如果 BTC 还没卖，周一开盘 ETF 不抢先买（不记已动作，还款后当天就买）

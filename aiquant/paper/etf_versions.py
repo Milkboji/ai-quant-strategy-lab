@@ -247,7 +247,8 @@ BUDGET_RANGE = (5.0, 60.0)
 
 
 def set_budget_pct(pct, *, actor: str | None, role: str | None) -> dict:
-    """修改美股 ETF 的资金比例（管理员 / 交易员），写审计并立即重新分配 BTC 额度。下一次买入时生效，不主动调仓。"""
+    """修改美股目标比例（资金第一层，管理员 / 交易员），写审计并立即重新分配。
+    下一次买入按新比例；已有持仓偏离新目标超过再平衡阈值时，收盘后记下、下一交易日再平衡（allocation / us_exec）。"""
     from .. import console
     from . import runner as pr
     _require(role)
@@ -263,10 +264,15 @@ def set_budget_pct(pct, *, actor: str | None, role: str | None) -> dict:
         return {"result": "无变化", "message": f"资金比例已是 {v:g}%"}
     cfg["budget_pct"] = v
     db.set_setting("etf_trend_config", cfg)
-    pr.event(None, "INFO", f"[ETF趋势] {actor or '用户'} 把资金比例从 {old:g}% 改为 {v:g}%（下一次买入生效）")
+    lay = dict(db.get_setting("capital_layers") or {})
+    if (lay.get("us_equity") or {}).get("target") is not None:     # 第一层的美股目标与它保持一致
+        lay["us_equity"] = dict(lay["us_equity"], target=v)
+        db.set_setting("capital_layers", lay)
+    pr.event(None, "INFO", f"[ETF趋势] {actor or '用户'} 把美股目标比例从 {old:g}% 改为 {v:g}%")
     console.audit(actor, role, "修改资金比例", "etf", "美股 ETF 择时", None, None, None, "已修改", f"{old:g}% → {v:g}%")
     _rebalance()
-    return {"result": "已修改", "message": f"资金比例已改为 {v:g}%，下一次买入时生效；BTC 策略额度已重新分配"}
+    return {"result": "已修改", "message": f"美股目标比例已改为 {v:g}%；BTC 策略额度已重新分配，"
+                                         "美股持仓偏离新目标超过再平衡阈值时下一交易日调整"}
 
 
 def set_lend_pct(pct, *, actor: str | None, role: str | None) -> dict:

@@ -876,6 +876,11 @@ def _paper_why(n: int) -> None:
                 except Exception as e:  # noqa: BLE001
                     flash(f"slot{n}", "err", str(e))
                 st.rerun()
+        if dep["broker"] == "alpaca_us":    # 美股日线版本：运行在通用美股日线执行器上
+            st.markdown(f'<div class="aq-sub">美股日线执行器 · 部署 #{dep["id"]} · 交易 {C.esc(dep["config"].get("trade_symbol") or "")}'
+                        '</div>', unsafe_allow_html=True)
+            why_block(console._us_explain(dep, None), key=f"lab{n}")
+            return
         plans = console.plans_for()
         why_block(console.explain(dep, plans.get(dep["id"]), None, console.vol_sizing()), key=f"lab{n}")
     except Exception:  # noqa: BLE001

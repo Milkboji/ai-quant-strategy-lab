@@ -105,10 +105,26 @@ def _dep_key(dep: dict) -> str | None:
     return dep["config"].get("strategy_key") or key_of_version(registry.get_version(dep["version_id"]))
 
 
+def _us_lab_deployments(include_test: bool = False) -> list[dict]:
+    """策略位里的美股日线版本部署（通用美股执行器，broker=alpaca_us，kind=lab）。ETF 择时有自己的卡片，不在这里。"""
+    return [d for d in _deployments("alpaca_us") if d["config"].get("kind", "lab") == "lab"
+            and (include_test or not d["is_test"])]
+
+
+def _with_us(broker: str) -> list[dict]:
+    """策略总台的「策略位 / 预设」行：BTC 部署 + 同一策略位里的美股部署（同一个总台、同一套部署 / 下线 / 锁定）。"""
+    deps = _deployments(broker)
+    if broker == "alpaca_paper":
+        deps = deps + _us_lab_deployments()
+    elif broker == "mock":
+        deps = deps + [d for d in _us_lab_deployments(include_test=True) if d["is_test"]]
+    return sorted(deps, key=lambda d: d["id"])
+
+
 def active_deployment(key: str, broker: str = "alpaca_paper") -> dict | None:
-    """该策略当前有效的部署（已配置 / 运行中 / 暂停新开仓），同一策略只取最新一个。"""
+    """该策略当前有效的部署（已配置 / 运行中 / 暂停新开仓），同一策略只取最新一个。美股版本的部署也算。"""
     hit = None
-    for d in _deployments(broker):
+    for d in _with_us(broker):
         if d["status"] in ACTIVE and _dep_key(d) == key:
             hit = d
     return hit
@@ -118,7 +134,15 @@ def is_offline(key: str) -> bool:
     return bool(db.get_setting(f"console_offline::{key}"))
 
 
+def _is_us(did: int) -> bool:
+    r = db.q1("SELECT broker FROM paper_deployments WHERE id=?", (did,))
+    return bool(r and r["broker"] == "alpaca_us")
+
+
 def _ledger_qty(did: int) -> float:
+    if _is_us(did):
+        from .paper import us_ledger
+        return float(sum(p["qty"] for p in us_ledger.position(did).values()))
     q = 0.0
     for r in db.q("SELECT side, filled_qty FROM paper_orders WHERE deployment_id=? AND status='filled'", (did,)):
         q += r["filled_qty"] if r["side"] == "buy" else -r["filled_qty"]
@@ -132,6 +156,9 @@ def _has_open_orders(did: int) -> bool:
 
 
 def is_flat(did: int) -> bool:
+    if _is_us(did):
+        from .paper import us_exec
+        return us_exec.is_flat(did)
     return _ledger_qty(did) <= 1e-9 and not _has_open_orders(did)
 
 
@@ -214,7 +241,7 @@ def rows(broker: str = "alpaca_paper", price: float | None = None) -> list[dict]
     """策略总台每一行的数据。"""
     from .strategy import registry
     include_test = broker == "mock"
-    deps = _deployments(broker)
+    deps = _with_us(broker)
     active = {}
     had = set()
     for d in deps:
@@ -228,7 +255,17 @@ def rows(broker: str = "alpaca_paper", price: float | None = None) -> list[dict]
     vol = vol_sizing()
     budgets = {k: float(d["config"].get("budget_usd") or 0) for k, d in active.items()
                if d["status"] in ("running", "paused_entries")}
-    total_budget = sum(budgets.values())
+    tot_by = {}
+    for k, d in active.items():
+        if k in budgets:
+            tot_by[d["broker"]] = tot_by.get(d["broker"], 0.0) + budgets[k]
+    us_equity = None
+    if any(d["broker"] == "alpaca_us" for d in active.values()):
+        try:
+            snap = db.q1("SELECT equity FROM account_snapshots ORDER BY ts DESC LIMIT 1")
+            us_equity = float(snap["equity"]) if snap else None
+        except Exception:  # noqa: BLE001
+            us_equity = None
     out = []
     for s in _base_strategies():
         k, lab = s["key"], s["lab"]
@@ -243,8 +280,14 @@ def rows(broker: str = "alpaca_paper", price: float | None = None) -> list[dict]
                 diff.append(("K线周期（分钟）", str(run_tf), str(lab_tf)))
         pend = (dep or {}).get("config", {}).get("pending_switch") if dep else None
         pend_v = registry.get_version(pend["version_id"]) if pend else None
+        is_us = bool(dep and dep["broker"] == "alpaca_us")
         qty = _ledger_qty(dep["id"]) if dep else 0.0
         b = budgets.get(k, 0.0)
+        total_budget = tot_by.get(dep["broker"], 0.0) if dep else 0.0
+        us_value = None
+        if is_us:
+            from .paper import us_exec
+            us_value = float((us_exec.dep_state(dep).get("position") or {}).get("market_value") or 0)
         offline = is_offline(k)
         out.append({
             "key": k, "kind": s["kind"], "origin": s["origin"], "name": s["name"], "draft": s["draft"],
@@ -259,13 +302,25 @@ def rows(broker: str = "alpaca_paper", price: float | None = None) -> list[dict]
             "challenger": _challenger_for(dep["id"] if dep else None),
             "awaiting": _awaiting_for(dep["id"] if dep else None),
             "lock": lock_state(dep), "block": promotion_block(dep) if dep else None,
-            "qty": qty, "value": qty * price if price else None,
+            "market": "us_equity" if is_us else "crypto",
+            "trade_symbol": dep["config"].get("trade_symbol") if is_us else ("BTC/USD" if dep else None),
+            "qty": qty, "value": us_value if is_us else (qty * price if price else None),
             "budget": b if dep else 0.0, "weight_pct": (b / total_budget * 100) if dep and total_budget else None,
             "budget_reason": (dep or {}).get("config", {}).get("budget_reason") if dep else None,
             "signal_tf": (dep or {}).get("config", {}).get("signal_tf") if dep else None,
-            "why": explain(dep, plans.get(dep["id"]) if dep else None, price, vol) if dep else None,
+            "why": (_us_explain(dep, us_equity) if is_us else
+                    explain(dep, plans.get(dep["id"]) if dep else None, price, vol)) if dep else None,
         })
     return out
+
+
+def _us_explain(dep: dict, equity: float | None) -> dict:
+    from .paper import us_exec
+    try:
+        return us_exec.explain(dep, equity)
+    except Exception as e:  # noqa: BLE001
+        log.exception("us explain failed")
+        return {"headline": f"读取失败：{type(e).__name__}", "items": [], "calc": []}
 
 
 # ---------------------------------------------------------------------------
@@ -318,12 +373,11 @@ def deploy_version(key: str, version_id: int, *, actor: str | None, role: str | 
     if key_of_version(v) != key:
         raise ValueError(f"版本 {registry.label(v)} 不属于这个策略")
     from . import research
-    if research.version_market(v).key != "crypto":
-        raise ValueError("这是美股日线策略版本：模拟盘的美股目前只运行「美股 ETF 择时」（在本页下方的美股卡片部署参数版本），"
-                         "策略位里的美股版本暂时只能回测研究，不能部署到 BTC 模拟盘")
     ok, checks = pr.deploy_gate(v["id"])
     if broker == "alpaca_paper" and not ok:
         raise ValueError("部署门禁未通过：" + "；".join(f"{n}（{d}）" for n, p, d in checks if not p))
+    if research.version_market(v).key != "crypto":   # 美股日线版本：部署到通用美股执行器（同一套部署 / 锁定 / 审计）
+        return _deploy_us(key, v, actor=actor, role=role, broker=broker)
     was_offline = is_offline(key)
     db.set_setting(f"console_offline::{key}", None)
     tf, aux = _tf_for(v, broker)
@@ -390,6 +444,68 @@ def deploy_version(key: str, version_id: int, *, actor: str | None, role: str | 
         res["message"] += f"；已锁定 {lk['days']:g} 天，期间自动进化不会替换"
     audit(actor, role, "部署此版本", key, v["name"], did, None, v["id"], res["result"],
           "；".join(x for x in ("重新上线" if was_offline else "", f"锁定 {lk['days']:g} 天" if lk else "") if x))
+    return res
+
+
+def _deploy_us(key: str, v: dict, *, actor: str | None, role: str | None, broker: str) -> dict:
+    """美股日线版本 → 通用美股日线执行器上的部署（broker=alpaca_us）。规则与 BTC 部署相同：
+    已有部署且版本不同 → 空仓时立即切换，否则等空仓；新部署 → 启动后按两层资金分配拿额度；手动部署后锁定；写审计。"""
+    from . import evolve
+    from .paper import runner as pr
+    from .paper import us_exec
+    from .strategy import registry
+    was_offline = is_offline(key)
+    db.set_setting(f"console_offline::{key}", None)
+    dep = active_deployment(key, broker)
+    if dep and dep["broker"] != "alpaca_us":
+        raise ValueError("这个策略位正在运行 BTC 版本：请先在策略总台下线，再部署美股版本")
+    if dep:
+        notes = []
+        cfg = dep["config"]
+        if cfg.pop("pending_offline", None):
+            notes.append("取消待下线")
+            _save_cfg(dep["id"], cfg)
+            if dep["status"] == "paused_entries":
+                pr.set_status(dep["id"], "running")
+        if dep["version_id"] == v["id"]:
+            if cfg.pop("pending_switch", None):
+                notes.append("取消待切换")
+                _save_cfg(dep["id"], cfg)
+            res = {"result": "无变化", "deployment_id": dep["id"], "message": f"{registry.label(v)} 已在运行"}
+        else:
+            r = us_exec.switch_version(pr.get_deployment(dep["id"]), v, actor=actor,
+                                       reason=f"{actor or '用户'} 在策略总台确认部署")
+            res = {"result": r, "deployment_id": dep["id"],
+                   "message": f"已切换到 {registry.label(v)}" if r == "已切换" else
+                   f"{registry.label(v)} 将在该策略空仓且没有未完成订单时切换"}
+        lk = lock_after_manual_deploy(dep["id"], actor)
+        if lk:
+            notes.append(f"锁定 {lk['days']:g} 天")
+            res["message"] += f"；已锁定 {lk['days']:g} 天"
+        audit(actor, role, "部署此版本", key, v["name"], dep["id"], dep["version_id"], v["id"], res["result"],
+              "；".join(["美股日线执行器"] + notes))
+        return res
+    out = us_exec.deploy_lab(key, v, actor=actor, label_=_label(key, v, 1440), is_test=broker == "mock")
+    did = out["deployment_id"]
+    try:
+        pr.start(did)
+    except Exception as e:  # noqa: BLE001
+        audit(actor, role, "部署此版本", key, v["name"], did, None, v["id"], "启动失败", str(e))
+        raise
+    if broker == "alpaca_paper":
+        try:
+            evolve.rebalance()
+        except Exception:  # noqa: BLE001
+            log.exception("rebalance after us deploy failed")
+    res = {"result": "已启动", "deployment_id": did,
+           "message": f"已部署并启动 {registry.label(v)}（美股日线执行器，部署 #{did}，交易 {out['trade_symbol']}）"
+                      + ("，已重新加入组合" if was_offline else "")}
+    lk = lock_after_manual_deploy(did, actor)
+    if lk:
+        res["message"] += f"；已锁定 {lk['days']:g} 天，期间自动进化不会替换"
+    audit(actor, role, "部署此版本", key, v["name"], did, None, v["id"], res["result"],
+          "；".join(x for x in ("美股日线执行器", f"交易 {out['trade_symbol']}", "重新上线" if was_offline else "",
+                                f"锁定 {lk['days']:g} 天" if lk else "") if x))
     return res
 
 
@@ -988,6 +1104,11 @@ def etf_row(equity: float | None = None) -> dict:
     pos = stt.get("position") or {}
     status = etf_versions.status()
     try:
+        from .paper import us_exec
+        us_dep = us_exec.etf_deployment()
+    except Exception:  # noqa: BLE001
+        us_dep = None
+    try:
         from . import rhythm
         if status == "运行中" and rhythm.etf_long_paused():
             status = "暂停中"
@@ -1001,5 +1122,6 @@ def etf_row(equity: float | None = None) -> dict:
             "budget_pct": float(cfg["budget_pct"]), "pending_offline": bool(cfg.get("pending_offline")),
             "enabled": bool(cfg.get("enabled")), "why": etf_explain(equity),
             "trade_symbol": cfg["trade_symbol"], "signal_symbol": cfg["signal_symbol"], "lineage": lin,
+            "deployment_id": (us_dep or {}).get("id"),
             "exposed": exp, "validation_used": holdout.used(lin), "lend_pct": float(cfg.get("lend_pct", 50.0)),
             "lend_state": etf_trend.lend_state().get("state", "none")}

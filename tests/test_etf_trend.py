@@ -28,8 +28,8 @@ def test_signal_uses_only_completed_bars():
 
 
 def test_step_buys_when_bullish(env, monkeypatch):
-    et.ensure_tables()
-    db.set_setting("etf_trend_state", {})
+    from tests.us_fake import reset_us
+    reset_us()
     monkeypatch.setattr(et.http, "paper_orders_unlocked", lambda: True)
     monkeypatch.setattr(et, "_clock", lambda: {"is_open": True})
     days = pd.bdate_range("2026-01-01", periods=200).date
@@ -103,18 +103,18 @@ def test_us_daily_refresh_merges_and_redownloads(env, monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 
 def _setup_step(monkeypatch, regime_up=True, pos_qty=0.0):
+    from tests.us_fake import reset_us
     et.ensure_tables()
     db.ex("DELETE FROM etf_orders")
-    db.set_setting("etf_trend_state", {})
-    db.set_setting("etf_trend_why", None)
+    reset_us(pos_qty)
     monkeypatch.setattr(et.http, "paper_orders_unlocked", lambda: True)
     monkeypatch.setattr(et, "_clock", lambda: {"is_open": True})
     monkeypatch.setattr(et, "update_daily_csv", lambda *a, **k: {})
     days = pd.bdate_range("2026-01-01", periods=200).date
     closes = [100 + i * 0.2 for i in range(200)] if regime_up else [200 - i * 0.2 for i in range(200)]
     monkeypatch.setattr(et, "daily_bars", lambda sym, days_=420: pd.DataFrame({"date": days, "close": closes}))
-    monkeypatch.setattr(et, "_position", lambda sym: {"qty": pos_qty, "market_value": 0, "avg_entry_price": 0,
-                                                      "unrealized_pl": 0})
+    monkeypatch.setattr(et, "_position", lambda sym: {"qty": pos_qty, "market_value": pos_qty * 100.0,
+                                                      "avg_entry_price": 0, "unrealized_pl": 0})
     monkeypatch.setattr(et, "_account", lambda: {"equity": "100000", "cash": "90000"})
 
 
@@ -137,12 +137,9 @@ def test_rejected_order_not_retried_same_day(env, monkeypatch):
 
 
 def test_partial_fill_topped_up_next_day(env, monkeypatch):
-    _setup_step(monkeypatch, pos_qty=10.0)
+    _setup_step(monkeypatch, pos_qty=100.0)             # 目标 3 万，只成交了 100 股 × 100 = 1 万（台账里的本轮买入）
     db.set_setting("etf_trend_state", {"last_action_date": "2026-10-20",
                                        "entry": {"signal_date": "2026-10-19", "target": 30000.0}})
-    db.ex("INSERT INTO etf_orders(ts,symbol,side,notional,status,filled_qty,filled_price,client_order_id,signal_date) "
-          "VALUES(?,?,?,?,?,?,?,?,?)", ("2026-10-20T13:35:00Z", "QLD", "buy", 30000, "expired", 100, 100.0, "x-1",
-                                        "2026-10-19"))
     sent = []
     monkeypatch.setattr(et, "_submit", lambda sym, side, **kw: sent.append((side, kw)) or {})
     et.step(datetime(2026, 10, 21, 14, 0, tzinfo=timezone.utc))

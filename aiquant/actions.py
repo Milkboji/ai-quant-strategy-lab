@@ -35,6 +35,12 @@ def init() -> None:
     except Exception:  # noqa: BLE001
         import logging
         logging.getLogger("aiquant").exception("holdout migrate failed")
+    try:   # 美股 ETF 择时迁移为通用美股日线执行器上的普通部署（一次性、不下单），迁移报告在 settings.us_exec_migration
+        from .paper import us_exec
+        us_exec.ensure_migrated()
+    except Exception:  # noqa: BLE001
+        import logging
+        logging.getLogger("aiquant").exception("us exec migration failed")
     jobs.register("backtest", research.execute_backtest)
     jobs.register("final_test", research.execute_backtest)
     jobs.register("ai_analyze", optimizer.run_analyze)

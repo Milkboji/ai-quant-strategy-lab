@@ -534,7 +534,8 @@ def apply_pending(did: int) -> bool:
 
 def apply_all_pending() -> int:
     n = 0
-    for d in db.q("SELECT id FROM paper_deployments WHERE status IN ('running','paused_entries','configured')"):
+    for d in db.q("SELECT id FROM paper_deployments WHERE status IN ('running','paused_entries','configured') "
+                  "AND broker<>'alpaca_us'"):       # 美股部署的待切换由 us_exec 在空仓时处理
         try:
             n += apply_pending(d["id"])
         except Exception:  # noqa: BLE001
@@ -558,7 +559,7 @@ def run(job: dict, stage, should_stop) -> int:
     if not is_test:   # 先记下本轮开始时间，避免失败时被定时器反复提交
         db.set_setting("evolve_last_run", {"at": db.now_iso(), "run_id": rid, "status": "running"})
     deps = db.q("SELECT * FROM paper_deployments WHERE status IN ('running','paused_entries') AND is_test=? "
-                "ORDER BY id", (is_test,))
+                "AND broker<>'alpaca_us' ORDER BY id", (is_test,))   # 自动进化只针对 BTC 部署
     deps = [d for d in deps if not json.loads(d["config_json"] or "{}").get("pending_offline")]   # 待下线的不再进化
     r = research.get_research()
     if is_test:
@@ -768,7 +769,7 @@ def health_check(price: float | None = None) -> list[str]:
     c = get_config()
     out = []
     converted = False
-    for d in db.q("SELECT id FROM paper_deployments WHERE status IN ('running','paused_entries')"):
+    for d in db.q("SELECT id FROM paper_deployments WHERE status IN ('running','paused_entries') AND broker<>'alpaca_us'"):
         dep = pr.get_deployment(d["id"])
         cfg = dep["config"]
         if cfg.get("pending_offline"):   # 策略总台已下线、等待空仓：不自动恢复 / 暂停
@@ -861,12 +862,16 @@ def plan_budgets(equity: float, deps: list[dict], cfgv: dict | None = None) -> d
     """按实力分配额度。每个部署返回 budget / weight / why，以及 detail（公式代入的数值，供页面解释）和 share_pct。"""
     c = cfgv or get_config()
     other = 0.0
-    try:   # 美股 ETF 实际占用的资金比例（设定比例与持仓市值取大），从 BTC 策略可分配资金中扣除
-        from .paper import etf_trend
+    try:   # 第一层（市场之间）：加密货币可分配比例 = 100% − 现金保留 − 美股实际占用，再限制在加密货币上下限内
+        from .paper import etf_trend, us_exec
         other = etf_trend.capital_share(equity)
+        if us_exec.etf_deployment() is not None:
+            from . import allocation
+            total = equity * allocation.layer1(equity)["crypto_pct"] / 100
+        else:
+            total = equity * (1 - (float(c["reserve_pct"]) + other) / 100)
     except Exception:  # noqa: BLE001
-        pass
-    total = equity * (1 - (float(c["reserve_pct"]) + other) / 100)
+        total = equity * (1 - (float(c["reserve_pct"]) + other) / 100)
     paused = [d for d in deps if d["status"] == "paused_entries"]
     running = [d for d in deps if d["status"] == "running"]
     floor = equity * float(c["paused_floor_pct"]) / 100
@@ -945,5 +950,10 @@ def rebalance(equity: float | None = None) -> list[str]:
         _save_cfg(d["id"], cfg)
         pr.event(d["id"], "INFO", f"资金额度调整：{old:,} → {p['budget']:,} USD（{p['why']}）", False)
         out.append(f"#{d['id']} {old:,}→{p['budget']:,}")
+    try:   # 第二层（美股内部）：同一实力公式
+        from . import allocation
+        out += allocation.rebalance_us(equity)
+    except Exception:  # noqa: BLE001
+        log.exception("us rebalance failed")
     db.set_setting("evolve_last_rebalance", {"at": db.now_iso(), "equity": equity, "changes": out})
     return out

@@ -122,10 +122,12 @@ def merge(old: pd.DataFrame | None, new: pd.DataFrame, today: date) -> pd.DataFr
     return allv[COLS].reset_index(drop=True)
 
 
-def refresh(symbols: list[str] | None = None, now: datetime | None = None, days: int = 30) -> dict:
-    """每日增量更新：拉最近 days 天；复权口径变化的品种整只重下。返回 {sym: 结果说明}。"""
+def refresh(symbols: list[str] | None = None, now: datetime | None = None, days: int = 30,
+            closed_through: date | None = None) -> dict:
+    """每日增量更新：拉最近 days 天；复权口径变化的品种整只重下。返回 {sym: 结果说明}。
+    closed_through：收盘后检查用——这一天已收盘（收盘 15 分钟后），可以写入当天的日线；默认只写今天以前的。"""
     symbols = symbols or UNIVERSE
-    td = today_et(now)
+    td = today_et(now) if closed_through is None else closed_through + timedelta(days=1)
     start = ((now or datetime.now(timezone.utc)) - timedelta(days=days)).strftime("%Y-%m-%dT00:00:00Z")
     got = fetch(symbols, start)
     out = {}

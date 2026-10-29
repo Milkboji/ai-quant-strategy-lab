@@ -175,7 +175,7 @@ tests/                     pytest 单元/集成测试 + e2e_browser.py（Playwri
 - ETF 下单：被拒当天不重试（通知 order_failed）；部分成交次日补足（state.entry）；`etf_trend.set_why()` 结构化原因（WHY_CODES），
   策略总台 `console.etf_row / etf_explain`、模拟盘面板、首页卡片、每日摘要都读它。
 - 策略位指针：进化 / 挑战者晋级只在 `registry.slot_points_to(slot, 被替换版本)` 时移动指针。
-- 策略位里的美股版本（`research.version_market`）不能部署到 BTC 模拟盘；美股模拟盘目前只运行 ETF 择时（参数版本）。
+- 策略位里的美股版本（`research.version_market`）部署到通用美股日线执行器（2026-10-29 起，见最后一节）。
 
 ## 第六步后核对（2026-10-29，见 docs/第六步后核对报告.md）
 
@@ -214,4 +214,28 @@ tests/                     pytest 单元/集成测试 + e2e_browser.py（Playwri
   缩量发 `cash_short`）、`exposure` / `exposure_check` / `maybe_exposure_check`（>100% 或现金为负发 `exposure_high`，settings.account_exposure）。
   BTC（runner）与 ETF（etf_trend 买入、补足）下单前都调用 check_buy；服务循环写 settings.btc_last_price 供估算 BTC 未成交买单。
 - 通知事件新增：cash_short / exposure_high / long_hint / rhythm_review。
+
+## 通用美股日线执行器（2026-10-29，见 docs/通用美股执行器报告.md）
+
+- 部署：`paper_deployments` broker='alpaca_us'；config.kind = 'etf_sma'（原 ETF 择时迁移，参数仍读 etf_trend_config，
+  version_id = etf_versions.id）或 'lab'（strategy_versions，trade_symbol = 最近一次美股日线回测的标的，signal_symbol）。
+  BTC 专用的循环都按 broker 过滤（evolve.run / apply_all_pending / health_check、runner 的平仓 / 撤单 / 紧急停止对美股禁用）。
+- `aiquant/paper/us_exec.py`：`step(now)`（etf_trend.step 转调；规则同原 ETF：9:35 后 DAY 市价单、每部署每天一次、被拒不重试、
+  部分成交次日补足、per-deployment why：ETF 用 etf_trend_why，其他 us_why::{id}；状态 ETF 用 etf_trend_state，其他 us_state::{id}）；
+  `after_close(now)`（收盘 15 分钟后：先 `us_daily.refresh(closed_through=当天)`，再确认信号 → 借出转收回、偏离 → rebalance_due）；
+  `migrate_etf()` / `ensure_migrated()`（actions.init 调用，settings.us_exec_migration 为对照报告）；`deploy_lab` / `switch_version`；
+  `explain(dep)`；节奏 Gate 键 ETF = 'etf'，其他 'us:{id}'；实验室版本的止损 / 止盈 / 移动止损用入场后已收盘日线检查，下一开盘卖出。
+  券商调用经 etf_trend 的钩子：`_submit`（只提交，coid 由执行器给）、`_position`（404=空仓，其他错误带 error=True → 不下单）。
+- `aiquant/paper/us_ledger.py`：us_orders / us_order_allocs / us_ledger。`plan_net`（同标的净额）、`create_order`、`allocate`
+  （按金额 / 股数比例拆回，对冲部分 source='cross'，合计严格等于成交，幂等）、`position`（移动平均成本、已实现）、`reconcile`、
+  `record_opening`（迁移期初）、`entry_filled_usd`（补足用，含期初）。
+- `aiquant/allocation.py`：settings.capital_layers {us_equity: target/min/max, crypto: min/max, rebalance_pp}；target 为空时取
+  etf_trend_config.budget_pct（`etf_versions.set_budget_pct` 同步写）。`layer1(equity)`（steps 为计算过程）、`plan_us`（同一实力公式：
+  ETF 用 etf_long_metrics，实验室用 evolve._train_metrics；不取整）、`rebalance_us`（evolve.rebalance 末尾调用）、`explain`、
+  `set_config`（管理员 / 交易员，审计「修改资金分层」）。`etf_trend.capital_share` = layer1.us_deduct_pct；evolve.plan_budgets 的
+  加密货币总额 = layer1.crypto_pct（默认上下限时与原公式相同）。
+- 策略总台：`console._with_us` 把实验室美股部署并入策略位行（market / trade_symbol / value 来自台账），`_deploy_us`，
+  `is_flat` / `_ledger_qty` 按 broker 区分；页面「资金两层分配」面板（第一层步骤、第二层表格、上下限与阈值设置）。
+- 脚本：`scripts/migration_check.py`（数据库副本上的迁移前后对照）、`scripts/replay_us_week.py`（共用账户的多日回放）、
+  `scripts/etf_exec_regress.py`（旧 / 新 ETF 执行器逐日比对）。
 

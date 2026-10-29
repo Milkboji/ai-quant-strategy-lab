@@ -113,8 +113,21 @@ def test_lab_backtest_end_to_end_for_us(us_data):
         k, _ = research.chart_data(b)
         assert len(k) > 100
         assert research.version_market(v).key == "us_equity"
-        with pytest.raises(ValueError, match="美股"):
-            console.deploy_version("slot:4", v["id"], actor="t", role="trader", broker="mock")
+        # 策略位里的美股版本可以部署：部署到通用美股日线执行器（同一套显式部署 / 锁定 / 审计）
+        res = console.deploy_version("slot:4", v["id"], actor="t", role="trader", broker="mock")
+        assert res["result"] == "已启动", res
+        d = db.q1("SELECT * FROM paper_deployments WHERE id=?", (res["deployment_id"],))
+        cfg = __import__("json").loads(d["config_json"])
+        assert d["broker"] == "alpaca_us" and d["is_test"] == 1 and cfg["kind"] == "lab" and cfg["trade_symbol"] == "QLD"
+        assert cfg["signal_symbol"] == "QQQ" and d["status"] == "running"
+        assert console.active_deployment("slot:4", "mock")["id"] == d["id"]
+        assert any(a["action"] == "部署此版本" and "美股日线执行器" in (a["detail"] or "")
+                   for a in console.audit_log(20, key="slot:4"))
+        from aiquant.paper import runner as pr
+        with pytest.raises(ValueError, match="美股部署不支持"):
+            pr.flatten(d["id"], confirmed=True)                       # 共用账户：不能用 BTC 的平仓按钮
+        console.take_offline("slot:4", actor="t", role="trader", broker="mock")
+        assert db.q1("SELECT status FROM paper_deployments WHERE id=?", (d["id"],))["status"] == "stopped"
     finally:
         research.set_research({k: r0[k] for k in ("symbol", "source", "window_preset", "window_anchor")})
 

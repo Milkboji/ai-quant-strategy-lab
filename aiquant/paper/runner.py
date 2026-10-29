@@ -103,7 +103,7 @@ def set_status(did: int, status: str) -> None:
 
 def start(did: int) -> str:
     dep = get_deployment(did)
-    if dep["broker"] == "alpaca_paper":
+    if dep["broker"] == "alpaca_paper" or (dep["broker"] == "alpaca_us" and not dep["is_test"]):
         if not http.paper_orders_unlocked():
             event(did, "WARN", "启动被拒绝：PAPER_ORDERS=0，Paper 订单权限锁定", False)
             raise OrderPermissionLocked("Alpaca Paper 自动交易启动门禁锁定：用户尚未授权提交任何 Paper 订单。")
@@ -135,10 +135,17 @@ def stop(did: int) -> None:
     event(did, "INFO", "停止策略：不再产生新信号；持仓保持不变（未自动平仓）", _is_test(did))
 
 
+def _not_us(dep: dict, what: str) -> None:
+    """美股部署和 BTC 共用一个券商账户：这些按账户 / BTC 持仓操作的按钮不能用于美股部署（会动到其他策略）。"""
+    if dep["broker"] == "alpaca_us":
+        raise ValueError(f"美股部署不支持「{what}」：多个策略共用账户和标的，请在策略总台下线该策略（按信号卖出后停止）")
+
+
 def cancel_orders(did: int, confirmed: bool) -> str:
     if not confirmed:
         raise ValueError("撤单需要确认")
     dep = get_deployment(did)
+    _not_us(dep, "撤销未成交订单")
     make_broker(dep).cancel_open_orders()
     event(did, "INFO", "撤销未成交订单", bool(dep["is_test"]))
     return "ok"
@@ -148,6 +155,7 @@ def flatten(did: int, confirmed: bool, price: float | None = None) -> str:
     if not confirmed:
         raise ValueError("平仓需要用户确认")
     dep = get_deployment(did)
+    _not_us(dep, "平仓")
     br = make_broker(dep)
     if isinstance(br, MockBroker) and price:
         br.mark(price)
@@ -159,6 +167,10 @@ def flatten(did: int, confirmed: bool, price: float | None = None) -> str:
 def emergency_stop(did: int) -> None:
     dep = get_deployment(did)
     set_status(did, "emergency_stopped")
+    if dep["broker"] == "alpaca_us":
+        event(did, "ERROR", "紧急停止：美股策略已停止，不再下新单；持仓未自动平仓，未成交订单当天收盘自动失效（DAY 单）",
+              bool(dep["is_test"]))
+        return
     try:
         make_broker(dep).cancel_open_orders()
         msg = "紧急停止：已停止策略并撤销未成交订单；持仓未自动平仓"
