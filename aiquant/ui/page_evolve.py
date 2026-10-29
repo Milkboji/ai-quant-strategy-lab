@@ -175,7 +175,8 @@ def rhythm_panel() -> None:
             rules.append("美股 ETF（时长按交易日、年化 √252，节假日顺延）：" + "；".join(rus.describe(mk.US_EQUITY.unit_cn, "信号品种"))
                          + ("（当前为影子模式：只计算显示，不影响下单和回测）" if rhythm.is_shadow(mk.US_EQUITY) else ""))
             extra = [f"自动进化不再生成 {rc['min_signal_tf']} 分钟以下的版本（0.25% 单边手续费下，短周期长期被成本吃掉）",
-                     f"长周期体检（每天）：近 {rc['long_years']} 年平均年收益为负且盈利年份少于 {rc['long_min_pos_years']} 个 → 暂停新开仓并释放额度",
+                     f"长周期体检（每天）：近 {rc['long_years']} 年平均年收益为负且盈利年份少于 {rc['long_min_pos_years']} 个 → 暂停新开仓并释放额度"
+                     + ("（加密货币）；美股长周期体检仅作提示，不拦截开仓" if rhythm.us_long_hint_only() else ""),
                      "资金额度按长周期 年均收益 / 年均回撤 分配：长期最稳的日线趋势策略拿最多"]
             st.markdown("".join(f"<div>• {C.esc(x)}</div>" for x in rules + extra), unsafe_allow_html=True)
         with cols[1]:
@@ -198,6 +199,14 @@ def rhythm_panel() -> None:
                 except Exception as e:  # noqa: BLE001
                     flash("evolve", "error", str(e))
                 st.rerun()
+            try:
+                ps = rhythm.us_promotion_status()
+                if ps["shadow"]:
+                    (st.success if ps["ready"] else st.caption)(
+                        f"转正条件（只转连亏刹车）：{ps['text']}" if not ps["ready"] else
+                        f"可以确认转正：{ps['text']}")
+            except Exception:  # noqa: BLE001
+                pass
             last = db.get_setting("rhythm_long_refreshed") or {}
             st.caption(f"长周期体检：{_bj(last.get('at')) if last.get('at') else '尚未运行'}")
         rows = rhythm.status_rows()
@@ -227,7 +236,8 @@ def rhythm_panel() -> None:
                     "长周期年均": f"{lm['mean_ret']:+.1f}%" if lm else "--",
                     "年均回撤": f"{lm['mean_dd']:.1f}%" if lm else "--",
                     "盈利年份": f"{lm['pos_years']}/{lm['n_years']}" if lm else "--",
-                    "体检": ("✅ 达标" if lm.get("ok") else "❌ 不达标") if lm else "待计算",
+                    "体检": (("✅ 达标" if lm.get("ok") else ("💬 不达标（仅提示）" if r["id"] == "ETF" and rhythm.us_long_hint_only()
+                                                           else "❌ 不达标")) if lm else "待计算"),
                     "额度": r.get("budget_txt") or f"{float(r['budget'] or 0):,.0f}"})
             st.dataframe(pd.DataFrame(tbl), hide_index=True, use_container_width=True)
 

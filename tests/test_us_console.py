@@ -294,17 +294,23 @@ def test_idle_etf_budget_lent_to_btc_and_reclaimed(etf, monkeypatch):
     etf_trend.step(datetime(2026, 10, 20, 14, 0, tzinfo=timezone.utc))
     assert etf_trend.lend_state()["state"] == "lent" and etf_trend.capital_share(100_000) == 15
     assert _audit("临时借出额度")
-    # 2) 看多但现金不够（BTC 用掉了借来的额度）→ 收回：BTC 暂停新开仓，ETF 等待、当天不记已动作
+    # 2) 看多（开盘时才确认，收盘后检查没跑）→ 收回：BTC 按借用比例减仓、暂停新开仓；ETF 先等还款、当天不记已动作
     monkeypatch.setattr(etf_trend, "daily_bars", lambda sym, days_=420: up)
     monkeypatch.setattr(etf_trend, "_account", lambda: {"equity": "100000", "cash": "20000"})
+    budgets = iter([{"999": 40_000.0}, {"999": 30_000.0}])
+    monkeypatch.setattr(etf_trend, "_btc_budgets", lambda: next(budgets))
     st = etf_trend.step(datetime(2026, 10, 21, 14, 0, tzinfo=timezone.utc))
+    assert etf_trend.pending_cut(999)["frac"] == 0.25
     assert etf_trend.reclaim_active() and not sent and st.get("last_action_date") != "2026-10-21"
     assert etf_trend.get_why()["code"] == "reclaim" and _audit("收回临时借出的额度")
     assert etf_trend.capital_share(100_000) == 30
     expl = console.explain({"id": 1, "status": "running", "config": {}, "broker": "alpaca_paper", "is_test": 0,
                             "version_id": None})
     assert "收回" in expl["headline"]
-    # 3) BTC 卖出后现金够了 → 同一天买入，额度归还
+    # 3) BTC 按比例卖出后现金够了 → 同一天买入，额度归还
+    etf_trend.mark_cut_done(999, 0.1, "测试：已卖出")
+    assert etf_trend.reclaim_pending() == []
+    assert any(a["action"] == "BTC 归还借用额度" for a in console.audit_log(50))
     monkeypatch.setattr(etf_trend, "_account", lambda: {"equity": "100000", "cash": "60000"})
     etf_trend.step(datetime(2026, 10, 21, 15, 0, tzinfo=timezone.utc))
     assert sent and abs(sent[0]["notional"] - 30000) < 1

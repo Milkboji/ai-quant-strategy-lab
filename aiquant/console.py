@@ -760,8 +760,13 @@ def explain(dep: dict | None, plan: dict | None = None, price: float | None = No
         from .paper import etf_trend
         if dep.get("broker") == "alpaca_paper" and not dep.get("is_test") and etf_trend.reclaim_active():
             heads.append("美股 ETF 正在收回临时借出的额度：暂停新开仓")
-            items.append(("额度收回", "美股 ETF 空仓时，它的一部分额度临时给了 BTC；现在美股发出买入信号，BTC 暂停新开仓，"
-                                     "持仓照常按规则卖出，等现金够美股买入后恢复"))
+            c = etf_trend.pending_cut(dep["id"])
+            done = ((etf_trend.lend_state().get("cuts") or {}).get(str(dep["id"])) or {})
+            cut_txt = (f"按借用比例 {c['frac']:.1%} 减仓待执行（额度 {c['before']:,.0f}→{c['after']:,.0f} USD）" if c else
+                       (f"已归还：{done.get('note')}" if done.get("done") else "本策略没有用到借来的额度，无需减仓"))
+            items.append(("额度收回", "美股 ETF 空仓时，它的一部分额度临时给了 BTC；现在美股发出买入信号（ETF 买入优先），"
+                                     "BTC 在下一个美股开盘前卖出借用期间所开仓位的借用比例、暂停新开仓，等美股买入后恢复。"
+                                     + cut_txt))
     except Exception:  # noqa: BLE001
         pass
     # 长期体检 / 自动暂停
@@ -888,9 +893,14 @@ def etf_explain(equity: float | None = None) -> dict:
     lm = rhythm.etf_long_metrics()
     rc = rhythm.get_config()
     if lm:
-        items.append(("长期体检", f"{'达标' if lm.get('ok') else '不达标'}：{lm['n_years']} 年年均收益 {lm['mean_ret']:+.1f}%，"
+        hint_only = rhythm.us_long_hint_only()
+        items.append(("长期体检", (f"{rhythm.US_LONG_HINT_TEXT}（不拦截开仓）。" if hint_only else "")
+                                + f"{'达标' if lm.get('ok') else '不达标'}：{lm['n_years']} 年年均收益 {lm['mean_ret']:+.1f}%，"
                                 f"盈利 {lm['pos_years']}/{lm['n_years']} 年，年均回撤 {lm['mean_dd']:.1f}%"
-                                + ("" if lm.get("ok") else f"（年均收益为负且盈利年份少于 {rc['long_min_pos_years']} 年 → 暂停新开仓）")))
+                                + ("" if lm.get("ok") or hint_only else
+                                   f"（年均收益为负且盈利年份少于 {rc['long_min_pos_years']} 年 → 暂停新开仓）")))
+    else:
+        items.append(("长期体检", f"{rhythm.US_LONG_HINT_TEXT}（不拦截开仓）；尚未计算" if rhythm.us_long_hint_only() else "尚未计算"))
     g = db.get_setting(f"rhythm_state::{rhythm.ETF_KEY}") or {}
     bu = pd.Timestamp(g["block_until"]) if g.get("block_until") else None
     rh = rhythm.configured(mk.US_EQUITY)
@@ -900,6 +910,10 @@ def etf_explain(equity: float | None = None) -> dict:
                                    + (f"；最近一次：{sh['note']}（{_bj(sh.get('at'))}）" if sh.get("note") else "")))
         if bu is not None and bu > now:
             items.append(("影子冷却", f"如果生效：{g.get('block_why') or '交易节奏'}，到 {_bj(bu)} 北京时间"))
+        try:
+            items.append(("转正条件", rhythm.us_promotion_status()["text"]))
+        except Exception:  # noqa: BLE001
+            pass
         bu = None
     if bu is not None and bu > now:
         items.append(("冷却中", f"{g.get('block_why') or '交易节奏'}；剩余 {_dur(bu - now)}，到 {_bj(bu)} 北京时间（按交易日计算，节假日顺延）"))
@@ -917,7 +931,16 @@ def etf_explain(equity: float | None = None) -> dict:
     if ls.get("state") == "lent":
         items.append(("临时借出额度", f"美股空仓，BTC 最多临时使用美股额度的 {float(ls.get('lend_pct', 50)):g}%（{_bj(ls.get('since'))} 起）"))
     elif ls.get("state") == "reclaim":
-        items.append(("正在收回额度", f"美股发出买入信号，BTC 暂停新开仓，直到现金够买（{_bj(ls.get('since'))} 起）"))
+        cuts = ls.get("cuts") or {}
+        cut_txt = "；".join(f"#{k} 额度 {v['before']:,.0f}→{v['after']:,.0f}，按 {v['frac']:.1%} 减仓"
+                           + ("（已完成：" + str(v.get("note") or "") + "）" if v.get("done") else "（待执行）")
+                           for k, v in cuts.items()) or "BTC 没有用到借来的额度，无需减仓"
+        items.append(("正在收回额度", f"美股发出买入信号（ETF 买入优先）：BTC 在下一个美股开盘前按借用比例减仓、暂停新开仓，"
+                                   f"开盘后先还款再买入（{_bj(ls.get('since'))} 起）。{cut_txt}"))
+    ex = db.get_setting("account_exposure") or {}
+    if ex:
+        items.append(("账户杠杆", f"总持仓市值 ÷ 权益 = {float(ex.get('ratio') or 0):.1%}（超过 100% 或现金为负时告警；"
+                               "任何情况下都不使用券商保证金）" + ("⚠️" if ex.get("over") or ex.get("negative_cash") else "")))
     if equity:
         share = etf_trend.capital_share(equity)
         calc.append(("资金比例", f"固定 {pct:g}% × 账户权益 {equity:,.0f} = {equity * pct / 100:,.0f} USD（不参与 BTC 的按实力分配）"))

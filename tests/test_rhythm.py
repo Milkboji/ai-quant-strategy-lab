@@ -249,3 +249,33 @@ def test_calendar_refresh_uses_alpaca_and_backs_off(env, monkeypatch):
     assert mk.refresh_calendar() is False and mk.refresh_calendar() is False
     assert len(calls) == 2                                                                  # 失败后 6 小时内不再请求
     assert mk.is_trading_day(date(2030, 1, 3))                                              # 回到内置规则
+
+
+def test_us_loss_streak_pause_counts_trading_days_across_weekend_and_holidays(env, monkeypatch):
+    """美股连亏刹车「2 笔停 20」的单位是交易日（不是小时）：周末、感恩节、圣诞、元旦都不计入，
+    第 20 个交易日收盘后、下一个交易日开盘起恢复。回测（Gate）与模拟盘（live_on_exit）同一结果。"""
+    from aiquant import market as mk
+    rh = rhythm.RULES_US_V1
+    assert rh.loss_streak_n == 2 and rh.loss_streak_pause_hours == 20 and mk.US_EQUITY.duration_unit == "trading_days"
+    assert "20 个交易日" in "；".join(rh.describe(mk.US_EQUITY.unit_cn))
+    # 周五（2026-11-20）收盘后第 2 笔亏损离场：20 个交易日 = 11-23 … 12-21（跳过周末和 11-26 感恩节，11-27 半日市算 1 天）
+    g = Gate(rh, mk.US_EQUITY)
+    g.on_exit(pd.Timestamp("2026-11-19 21:05Z"), "信号离场", -1.0)
+    g.on_exit(pd.Timestamp("2026-11-20 21:05Z"), "信号离场", -1.0)
+    assert g.block_until == pd.Timestamp("2026-12-22 14:30Z")            # 12-22 美东 9:30 开盘起恢复
+    assert g.check(pd.Timestamp("2026-11-23 15:00Z"))                    # 若按 20 小时，周一早就恢复了
+    assert g.check(pd.Timestamp("2026-12-21 20:00Z"))                    # 第 20 个交易日仍暂停
+    assert g.check(pd.Timestamp("2026-12-22 14:30Z")) is None
+    # 跨圣诞（12-25）和元旦（2027-01-01）：12-11 离场 → 2027-01-13 开盘起恢复
+    assert mk.US_EQUITY.after(pd.Timestamp("2026-12-11 21:05Z"), 20) == pd.Timestamp("2027-01-13 14:30Z")
+    assert mk.CRYPTO.after(pd.Timestamp("2026-12-11 21:05Z"), 20) == pd.Timestamp("2026-12-12 17:05Z")   # 加密货币仍按小时
+    # 模拟盘路径（生效模式下）：同一个 Gate，结果一致
+    monkeypatch.setattr(rhythm, "us_mode", lambda: "active")
+    db.set_setting("rhythm_state::etf_unit_test", None)
+    rhythm.live_on_exit("etf_unit_test", datetime(2026, 11, 19, 21, 5, tzinfo=timezone.utc), "信号离场", -1.0, mk.US_EQUITY)
+    msg = rhythm.live_on_exit("etf_unit_test", datetime(2026, 11, 20, 21, 5, tzinfo=timezone.utc), "信号离场", -1.0,
+                              mk.US_EQUITY)
+    assert msg and "连亏" in msg
+    s = db.get_setting("rhythm_state::etf_unit_test")
+    assert pd.Timestamp(s["block_until"]) == pd.Timestamp("2026-12-22 14:30Z")
+    db.set_setting("rhythm_state::etf_unit_test", None)

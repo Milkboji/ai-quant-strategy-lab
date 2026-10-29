@@ -313,6 +313,38 @@ class PaperRunner:
             event(self.did, "ERROR", f"订单被拒绝：{e}", self.is_test)
         return None
 
+    def _reclaim_cut(self, my_qty: float, price: float, now: datetime) -> dict | None:
+        """美股 ETF 收回临时借出的额度：卖出借用期间所开仓位的「借用比例」（1 − 收回后额度 / 收回前额度）。
+        借出之前就开的仓没有用到借来的额度，不卖；没有持仓或卖出额不足 10 USD 时直接记为完成。返回本步动作或 None。"""
+        try:
+            from . import etf_trend
+            cut = etf_trend.pending_cut(self.did)
+        except Exception:  # noqa: BLE001
+            return None
+        if not cut:
+            return None
+        if my_qty <= 1e-9:
+            etf_trend.mark_cut_done(self.did, 0.0, "没有持仓，无需减仓")
+            return None
+        le = self.last_entry()
+        since = cut.get("lent_since")
+        if since and le and pd.Timestamp(le["created_at"]) < pd.Timestamp(since):
+            etf_trend.mark_cut_done(self.did, 0.0, "持仓在借出额度之前开的，没有用到借来的额度，无需减仓")
+            return None
+        qty = float(f"{my_qty * float(cut['frac']):.6f}")
+        if qty * price < 10:
+            etf_trend.mark_cut_done(self.did, 0.0, f"按借用比例 {cut['frac']:.1%} 应卖 {qty:.6f} BTC，不足 10 USD，不卖")
+            return None
+        ts = pd.Timestamp(now).floor("min").isoformat()
+        res = self._order("sell", qty, ts, price)
+        why = (f"美股 ETF 买入优先：额度 {cut['before']:,.0f}→{cut['after']:,.0f} USD，按借用比例 {cut['frac']:.1%} "
+               f"卖出 {qty:.6f} BTC 归还额度")
+        if res is None:
+            return {"action": "blocked", "reason": why + "（卖单未成功，下一轮重试）"}
+        etf_trend.mark_cut_done(self.did, qty, why)
+        event(self.did, "INFO", why, self.is_test)
+        return {"action": "sell", "reason": why}
+
     def _rhythm_exit(self, now: datetime, reason: str, pnl_est: float) -> None:
         try:
             from .. import rhythm
@@ -377,6 +409,11 @@ class PaperRunner:
             self.broker.mark(price)
         my_qty = min(self.ledger_qty(), pos["qty"])
         out["position_qty"] = my_qty
+        if self.broker.name == "alpaca_paper":   # 美股 ETF 买入优先：收回期间按借用比例减仓（下一个美股开盘前）
+            cut = self._reclaim_cut(my_qty, price, now)
+            if cut:
+                out.update(cut)
+                return out
         if my_qty > 1e-9:
             le = self.last_entry()
             ep = (le or {}).get("filled_price") or price
@@ -452,16 +489,25 @@ class PaperRunner:
             budget_pct = float(dep["config"].get("alloc_pct", 100)) * self.schema.alloc_pct / 100
             usd = acct.cash * budget_pct / 100 * 0.99
             if dep["config"].get("budget_usd"):
-                usd = min(float(dep["config"]["budget_usd"]) * 0.99, acct.cash * 0.98)
+                usd = float(dep["config"]["budget_usd"]) * 0.99
             cap = dep["config"].get("max_position_usd")
             if cap:
                 usd = min(usd, float(cap))
             if vmult < 0.999:
                 usd *= vmult
                 out["rhythm_size"] = round(vmult, 3)
+            # 下单前现金检查：不超过（现金 − 其他未成交买单占用）× 98%，不使用券商保证金；不足时缩量并通知
+            from . import cash_guard
+            reserved = cash_guard.reserved_cash(None, exclude="btc") if self.broker.name == "alpaca_paper" else 0.0
+            usd, short = cash_guard.check_buy(usd, acct.cash, who=dep_label(self.did), symbol="BTC/USD", reserved=reserved,
+                                              dedupe=f"cash-btc-{self.did}-{pd.Timestamp(now):%Y-%m-%d}"
+                                              if not self.is_test else f"cash-test-{self.did}-{sig_ts}")
+            if short:
+                out["cash_note"] = short
+                self._note("WARN", short)
             qty = float(f"{usd / price:.6f}")
             if qty * price < 10:
-                out.update(action="blocked", reason="可用资金不足最小下单额")
+                out.update(action="blocked", reason=short or "可用资金不足最小下单额")
                 return out
             res = self._order("buy", qty, sig_ts, price)
             out.update(action="buy", reason="入场规则" + (f"（波动率定仓 {vmult:.0%}）" if vmult < 0.999 else ""))

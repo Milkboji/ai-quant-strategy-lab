@@ -105,7 +105,8 @@ def test_events_switches_skip_and_dedupe(nt, monkeypatch):
     with pytest.raises(PermissionError):
         notify.send_test("telegram", actor="t", role="viewer")
     assert set(notify.EVENTS) == {"promotion", "awaiting", "auto_pause", "loss_streak", "watchdog_restart",
-                                  "tunnel_down", "daily_summary", "order_failed"}
+                                  "tunnel_down", "daily_summary", "order_failed", "cash_short", "exposure_high",
+                                  "long_hint", "rhythm_review"}
 
 
 def test_failed_sends_are_retried_then_marked_failed(nt, monkeypatch):

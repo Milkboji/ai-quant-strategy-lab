@@ -34,7 +34,8 @@ DEFAULTS = {
     "rules": RULES_V1.to_dict(),
     "rules_us": RULES_US_V1.to_dict(),   # 美股节奏规则（时长单位：交易日；年化 √252），见 docs/trading_rhythm.md
     "min_signal_tf": 60,          # 自动进化不再生成 1 小时以下的版本（0.25% 单边手续费下，短周期长期被成本吃掉）
-    "long_veto": True,            # 长周期体检不达标 → 暂停新开仓
+    "long_veto": True,            # 长周期体检不达标 → 暂停新开仓（加密货币）
+    "long_us": "hint",            # 美股长周期体检：hint = 仅作提示、不拦截（2026-10-29 用户决定；GLD→UGL 上会长期误拦）
     "long_min_pos_years": 3,
     "long_years": 6,
 }
@@ -103,7 +104,9 @@ def rules_hash(market=None) -> str:
 
 
 def set_us_mode(mode: str, *, actor: str | None, role: str | None) -> dict:
-    """切换美股节奏 影子 / 生效（管理员、交易员），写审计。"""
+    """切换美股节奏 影子 / 生效（管理员、交易员），写审计。
+    转为生效的前提（2026-10-29 用户决定）：影子模式已记录满 SHADOW_MIN_DAYS 个交易日、影子日志没有计算错误或异常；
+    生效时只启用连亏刹车（RULES_US_V1），波动率定仓不启用，长周期体检仍只作提示。"""
     from . import console
     console.require_role(role)
     if mode not in US_MODES:
@@ -111,9 +114,16 @@ def set_us_mode(mode: str, *, actor: str | None, role: str | None) -> dict:
     old = us_mode()
     if old == mode:
         return {"result": "无变化", "message": f"美股节奏已是{US_MODES[mode]}"}
+    extra = ""
+    if mode == "active":
+        ps = us_promotion_status()
+        if not ps["ready"]:
+            raise ValueError(f"还不能转为生效：{ps['text']}")
+        set_config(rules_us=RULES_US_V1.to_dict(), long_us="hint")
+        extra = f"；只启用连亏刹车（{'；'.join(RULES_US_V1.describe('个交易日'))}），波动率定仓不启用，长周期体检仅作提示；{ps['text']}"
     set_config(us_mode=mode, us_mode_by=actor or "用户", us_mode_at=db.now_iso())
     console.audit(actor, role, "美股节奏模式", "rhythm_us", "美股交易节奏", None, None, None, US_MODES[mode],
-                  f"{US_MODES[old]} → {US_MODES[mode]}")
+                  f"{US_MODES[old]} → {US_MODES[mode]}{extra}")
     from .paper import runner as pr
     pr.event(None, "INFO", f"[ETF趋势] {actor or '用户'} 把美股交易节奏改为：{US_MODES[mode]}")
     return {"result": "已切换", "message": f"美股交易节奏：{US_MODES[mode]}"}
@@ -131,6 +141,123 @@ def ensure_us_shadow_default() -> None:
                       "训练期重做研究前，美股节奏改为影子模式：只计算显示，不影响下单和回测")
     except Exception:  # noqa: BLE001
         log.exception("us shadow audit failed")
+
+
+# ---------------------------------------------------------------------------
+# 美股影子模式：每个交易日记录一次计算结果并自检；满 SHADOW_MIN_DAYS 个交易日且无异常 → 提醒管理员确认转正
+# ---------------------------------------------------------------------------
+
+SHADOW_MIN_DAYS = 20
+SHADOW_LOG_KEY = "us_shadow_log"
+
+
+def shadow_count_from() -> str:
+    """转正计数起点（美东日期）：2026-10-29 核对节奏单位之后首次运行的那天，一次性写入。"""
+    d = db.get_setting("us_shadow_count_from")
+    if not d:
+        from . import market as mk
+        d = str(datetime.now(timezone.utc).astimezone(mk.ET).date())
+        db.set_setting("us_shadow_count_from", d)
+    return d
+
+
+def shadow_log() -> list[dict]:
+    return list(db.get_setting(SHADOW_LOG_KEY) or [])
+
+
+def _save_shadow(rec: dict) -> None:
+    rows = [r for r in shadow_log() if r.get("date") != rec["date"]] + [rec]
+    db.set_setting(SHADOW_LOG_KEY, sorted(rows, key=lambda r: r["date"])[-400:])
+
+
+def shadow_error(day: str, msg: str) -> None:
+    """影子模式计算中出现的错误（离场记账、开仓判断异常等），记到当天的影子日志里，阻止转正。"""
+    rec = next((r for r in shadow_log() if r.get("date") == day), None) or {"date": day, "at": db.now_iso(), "errors": []}
+    rec["errors"] = list(rec.get("errors") or []) + [msg[:300]]
+    _save_shadow(rec)
+    log.error("us shadow error %s: %s", day, msg)
+
+
+def shadow_record(day: str, now) -> dict | None:
+    """每个交易日一次：用设置里的美股规则计算「如果生效会怎样」，并自检（连亏计数范围、冷却结束时刻必须是交易日开盘）。
+    只在美股影子模式下记录。"""
+    from . import market as mk
+    if not is_shadow(mk.US_EQUITY):
+        return None
+    old = next((r for r in shadow_log() if r.get("date") == day), None)
+    if old and ("streak" in old or old.get("note")):
+        return old
+    rec = {"date": day, "at": db.now_iso(), "errors": list((old or {}).get("errors") or [])}
+    try:
+        rh = configured(mk.US_EQUITY)
+        if rh is None:
+            rec["note"] = "交易节奏总开关关闭，本日不计算"
+        else:
+            g = load_gate(ETF_KEY, rh, mk.US_EQUITY)
+            t = pd.Timestamp(now)
+            t = t.tz_localize("UTC") if t.tzinfo is None else t.tz_convert("UTC")
+            rec.update(block=g.check(t) or "", streak=int(g.streak),
+                       until=g.block_until.isoformat() if g.block_until is not None else None)
+            if g.streak < 0 or (rh.loss_streak_n and g.streak >= rh.loss_streak_n):
+                rec["errors"].append(f"连亏计数越界：{g.streak}（规则 {rh.loss_streak_n} 笔）")
+            if g.block_until is not None:
+                bu = pd.Timestamp(g.block_until)
+                bu = bu.tz_localize("UTC") if bu.tzinfo is None else bu.tz_convert("UTC")
+                d = bu.tz_convert(mk.ET).date()
+                if not mk.is_trading_day(d) or pd.Timestamp(mk.session_open(d)) != bu:
+                    rec["errors"].append(f"冷却结束时刻 {bu.isoformat()} 不是某个交易日的开盘时刻（单位或日历有误）")
+    except Exception as e:  # noqa: BLE001
+        rec["errors"].append(f"计算异常：{type(e).__name__}: {str(e)[:200]}")
+    _save_shadow(rec)
+    try:
+        _maybe_review_notice()
+    except Exception:  # noqa: BLE001
+        log.exception("shadow review notice failed")
+    return rec
+
+
+def us_promotion_status() -> dict:
+    """美股节奏能否从影子模式转为生效（只转连亏刹车）：影子日志满 SHADOW_MIN_DAYS 个交易日，且没有计算错误或异常。"""
+    from . import market as mk
+    start = shadow_count_from()
+    recs = [r for r in shadow_log() if r.get("date", "") >= start]
+    errs = [(r["date"], e) for r in recs for e in (r.get("errors") or [])]
+    days = sum(1 for r in recs if "streak" in r or r.get("note"))
+    today = datetime.now(timezone.utc).astimezone(mk.ET).date()
+    try:
+        from datetime import date as _d
+        expected = [str(x) for x in mk.trading_days(_d.fromisoformat(start), today)]
+    except Exception:  # noqa: BLE001
+        expected = []
+    seen = {r["date"] for r in recs}
+    missing = [x for x in expected[:-1] if x not in seen]     # 今天可能还没运行，不算缺
+    shadow = us_mode() == "shadow"
+    ready = shadow and days >= SHADOW_MIN_DAYS and not errs
+    if not shadow:
+        text = "美股节奏已生效（只启用连亏刹车）"
+    elif errs:
+        text = f"影子日志有 {len(errs)} 处计算错误或异常（最近：{errs[-1][0]} {errs[-1][1]}），需要先查明"
+    elif days < SHADOW_MIN_DAYS:
+        text = f"影子模式已记录 {days}/{SHADOW_MIN_DAYS} 个交易日（{start} 起），没有异常"
+    else:
+        text = f"影子模式已记录 {days} 个交易日（{start} 起），没有计算错误或异常：可以把连亏刹车切为生效（需管理员确认）"
+    if missing and shadow:
+        text += f"；服务未运行、没有记录的交易日 {len(missing)} 个（不计入天数）"
+    return {"ready": ready, "days": days, "need": SHADOW_MIN_DAYS, "errors": errs, "missing": missing, "start": start,
+            "text": text, "shadow": shadow}
+
+
+def _maybe_review_notice() -> None:
+    ps = us_promotion_status()
+    if not ps["ready"] or db.get_setting("us_shadow_review_notified"):
+        return
+    db.set_setting("us_shadow_review_notified", db.now_iso())
+    from .paper import runner as pr
+    pr.event(None, "INFO", f"[ETF趋势] {ps['text']}")
+    from . import notify
+    notify.event("rhythm_review", "美股交易节奏：影子模式已满 20 个交易日，待确认转正",
+                 ps["text"] + "\n请到「自动进化 → 交易节奏」确认是否把连亏刹车切为生效（波动率定仓不启用，长周期体检仅作提示）。",
+                 dedupe="us-shadow-review")
 
 
 # ---------------------------------------------------------------------------
@@ -306,12 +433,27 @@ def etf_long_metrics(compute: bool = False) -> dict | None:
     return out
 
 
+def us_long_hint_only() -> bool:
+    """美股长周期体检只作提示（不拦截回测和模拟盘）。"""
+    return (get_config().get("long_us") or "hint") == "hint"
+
+
+US_LONG_HINT_TEXT = "美股长周期体检仅作提示"
+
+
+def etf_long_hint() -> dict | None:
+    """美股 ETF 长周期体检不达标时返回体检结果（只用于提示，不拦截）；达标或尚未计算时返回 None。"""
+    m = etf_long_metrics()
+    return m if (m and not m.get("ok")) else None
+
+
 def etf_long_paused(include_shadow: bool = False) -> bool:
     """长周期体检不达标且开启了「体检不达标暂停」→ 美股 ETF 不开新仓（持仓照常按信号离场）。
-    影子模式下返回 False（不影响下单）；include_shadow=True 时返回「如果生效是否会暂停」。"""
+    美股长周期体检只作提示时（默认）恒为 False；影子模式下返回 False（不影响下单）；
+    include_shadow=True 时返回「如果生效是否会暂停」。"""
     from . import market as mk
     c = get_config()
-    if not c.get("enabled") or not c.get("long_veto"):
+    if not c.get("enabled") or not c.get("long_veto") or us_long_hint_only():
         return False
     if is_shadow(mk.US_EQUITY) and not include_shadow:
         return False
@@ -325,10 +467,20 @@ def _etf_long_refresh() -> str | None:
     if not m:
         return None
     paused = etf_long_paused()
+    hint_before = bool((db.get_setting("etf_long_state") or {}).get("hint"))
+    hint = not m.get("ok") and us_long_hint_only()
     db.set_setting("etf_long_state", {"paused": paused, "would_pause": etf_long_paused(include_shadow=True),
-                                      "at": db.now_iso()})
+                                      "hint": hint, "at": db.now_iso()})
     from .paper import runner as pr
     txt = f"年均 {m['mean_ret']:+.1f}% 回撤 {m['mean_dd']:.1f}% 盈利 {m['pos_years']}/{m['n_years']} 年"
+    if hint and not hint_before:
+        pr.event(None, "INFO", f"[ETF趋势] {US_LONG_HINT_TEXT}：不达标（{txt}），不拦截开仓")
+        try:
+            from . import notify
+            notify.event("long_hint", "美股 ETF 择时：长周期体检不达标（仅作提示）", f"{txt}\n{US_LONG_HINT_TEXT}，不拦截开仓。",
+                         dedupe=f"etf-long-hint-{m['hist_end']}")
+        except Exception:  # noqa: BLE001
+            pass
     if paused and not before:
         pr.event(None, "WARN", f"[ETF趋势] 长周期体检不达标，暂停新开仓（{txt}）")
         try:

@@ -197,3 +197,21 @@ tests/                     pytest 单元/集成测试 + e2e_browser.py（Playwri
 - 美股空仓额度借用：etf_trend 配置 lend_pct（默认 50，`etf_versions.set_lend_pct`）；状态 settings.etf_lend（none/lent/reclaim）；
   `capital_share` 借出时只扣未借部分；收回时 `runner` 拦截 BTC 新开仓（reclaim_active），ETF 现金不够时不记当天已动作；
   每次状态切换写策略审计并 rebalance。
+
+## 第六步后核对 · 用户决定（2026-10-29 16:41，见 docs/第六步后核对报告.md D 节）
+
+- 美股长周期体检只提示：`rhythm.DEFAULTS["long_us"]="hint"`、`us_long_hint_only()`、`etf_long_hint()`、常量 `US_LONG_HINT_TEXT`；
+  `etf_long_paused()` 在只提示时恒为 False；`_etf_long_refresh` 第一次不达标发 `long_hint` 通知（etf_long_state.hint）。
+- 美股时长单位：`Rhythm.*_hours` 字段在美股按 `Market.duration_unit="trading_days"` 解释（`Market.after`）；连亏刹车 = 20 个交易日。
+- 影子日志与转正：`rhythm.shadow_record(day, now)`（etf_trend.step 每个交易日调用一次）、`shadow_error(day, msg)`、
+  `us_promotion_status()`（SHADOW_MIN_DAYS=20、自 settings.us_shadow_count_from 起、无异常）、`_maybe_review_notice`（`rhythm_review` 通知一次）；
+  `set_us_mode("active")` 条件不满足时 ValueError，转正时 rules_us=RULES_US_V1、long_us=hint。
+- 借出收回：`etf_trend.after_close(now)`（服务循环调用；收盘后 15 分钟起确认下一交易日信号，settings.etf_after_close 每个收盘日一次）；
+  `_set_lend("reclaim")` 记 cuts{部署: before/after/frac/done} 与 lent_since；`pending_cut(did)` / `mark_cut_done` / `reclaim_pending()`；
+  `PaperRunner._reclaim_cut` 卖出借用期间所开仓位的 frac；ETF 开盘后先等 cuts 完成（最晚美东 10:30，RECLAIM_DEADLINE_MIN），
+  然后按可用现金买入，缩量时保持 reclaim，直到补足。
+- 现金与杠杆：`aiquant/paper/cash_guard.py`：`reserved_cash`（未成交买单占用）、`check_buy`（≤ (现金−占用)×98%，不用 buying_power，
+  缩量发 `cash_short`）、`exposure` / `exposure_check` / `maybe_exposure_check`（>100% 或现金为负发 `exposure_high`，settings.account_exposure）。
+  BTC（runner）与 ETF（etf_trend 买入、补足）下单前都调用 check_buy；服务循环写 settings.btc_last_price 供估算 BTC 未成交买单。
+- 通知事件新增：cash_short / exposure_high / long_hint / rhythm_review。
+

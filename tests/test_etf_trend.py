@@ -1,5 +1,5 @@
 """美股 ETF 趋势择时：信号缓冲逻辑、只用已收盘日线、下单决策。"""
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
 import pytest
@@ -241,7 +241,43 @@ def test_live_step_vol_sizing_and_long_pause(env, monkeypatch):
     monkeypatch.setattr(rhythm, "etf_long_metrics", lambda compute=False: {"ok": False, "mean_ret": -3.0,
                                                                           "pos_years": 1, "n_years": 6})
     et.step(datetime(2026, 10, 21, 14, 0, tzinfo=timezone.utc))
-    assert not sent and et.get_why()["code"] == "long_pause"
+    # 美股长周期体检仅作提示（2026-10-29 决定）：不达标也照常买入，「为什么」里写明
+    assert sent and abs(sent[0]["notional"] - 30000) < 1 and et.get_why()["code"] == "bought"
+    assert not rhythm.etf_long_paused() and rhythm.etf_long_hint()
+    # 只有把美股体检改回「拦截」时才会暂停开仓（同一套代码）
+    monkeypatch.undo()
+    _setup_step(monkeypatch)
+    monkeypatch.setattr(rhythm, "us_mode", lambda: "active")
+    rhythm.set_config(long_us="veto")
+    try:
+        sent.clear()
+        monkeypatch.setattr(et, "_submit", lambda sym, side, **kw: sent.append(kw) or {})
+        monkeypatch.setattr(rhythm, "etf_long_metrics", lambda compute=False: {"ok": False, "mean_ret": -3.0,
+                                                                              "pos_years": 1, "n_years": 6})
+        db.set_setting("etf_trend_state", None)
+        et.step(datetime(2026, 10, 22, 14, 0, tzinfo=timezone.utc))
+        assert not sent and et.get_why()["code"] == "long_pause"
+    finally:
+        rhythm.set_config(long_us="hint")
+
+
+def test_us_long_check_hint_only_text_and_notice(env, monkeypatch):
+    """美股长周期体检只提示：策略总台写明「美股长周期体检仅作提示」，不达标时发一次提示通知、不暂停。"""
+    from aiquant import console, rhythm
+    m = {"ok": False, "mean_ret": -3.0, "mean_dd": 10.0, "pos_years": 1, "n_years": 6, "hist_end": "2026-10-28"}
+    monkeypatch.setattr(rhythm, "etf_long_metrics", lambda compute=False: m)
+    db.set_setting("etf_long_state", None)
+    sent = []
+    import aiquant.notify as nt
+    monkeypatch.setattr(nt, "event", lambda kind, title, body="", dedupe=None: sent.append(kind) or 1)
+    rhythm._etf_long_refresh()
+    st = db.get_setting("etf_long_state")
+    assert st["hint"] and not st["paused"] and sent == ["long_hint"]
+    rhythm._etf_long_refresh()
+    assert sent == ["long_hint"]                                    # 状态没变不重复通知
+    ex = console.etf_explain(100_000)
+    assert any(rhythm.US_LONG_HINT_TEXT in v for _, v in ex["items"])
+    assert console.etf_row(100_000)["status"] != "暂停中"
 
 
 def test_etf_long_metrics_yearly(env, monkeypatch):
@@ -287,7 +323,49 @@ def test_us_rhythm_shadow_mode_never_blocks_but_records(env, monkeypatch):
     assert challenger.etf_backtest(df, 20, 0.0, "2020-01-01", "2021-12-31")["blocked"] == 0
     with pytest.raises(PermissionError):
         rhythm.set_us_mode("active", actor="g", role="viewer")
+    with pytest.raises(ValueError, match="还不能转为生效"):              # 影子日志不满 20 个交易日
+        rhythm.set_us_mode("active", actor="t", role="trader")
+    monkeypatch.setattr(rhythm, "us_promotion_status", lambda: {"ready": True, "text": "测试：已满 20 个交易日"})
     assert rhythm.set_us_mode("active", actor="t", role="trader")["result"] == "已切换"
-    assert rhythm.current(mk.US_EQUITY) is not None
+    assert rhythm.current(mk.US_EQUITY) == rhythm.RULES_US_V1               # 只转正连亏刹车，波动率定仓不启用
+    assert not rhythm.current(mk.US_EQUITY).vol_target_pct and rhythm.us_long_hint_only()
     rhythm.set_us_mode("shadow", actor="t", role="trader")
+    rhythm.reset_gate(rhythm.ETF_KEY)
+
+
+def test_us_shadow_log_counts_trading_days_and_flags_errors(env, monkeypatch):
+    """影子日志：每个交易日记录一次并自检；满 20 个交易日且没有异常 → 可以转正，并通知一次；有异常 → 不能转正。"""
+    from aiquant import market as mk
+    from aiquant import rhythm
+    import aiquant.notify as nt
+    from datetime import date
+    monkeypatch.setattr(rhythm, "us_mode", lambda: "shadow")
+    sent = []
+    monkeypatch.setattr(nt, "event", lambda kind, title, body="", dedupe=None: sent.append(kind) or 1)
+    db.set_setting(rhythm.SHADOW_LOG_KEY, None)
+    db.set_setting("us_shadow_review_notified", None)
+    db.set_setting("us_shadow_count_from", "2026-11-02")
+    rhythm.reset_gate(rhythm.ETF_KEY)
+    days = mk.trading_days(date(2026, 11, 2), date(2026, 12, 31))[:21]
+    for i, d in enumerate(days[:19]):
+        rhythm.shadow_record(str(d), datetime.combine(d, datetime.min.time(), tzinfo=timezone.utc) + timedelta(hours=15))
+    ps = rhythm.us_promotion_status()
+    assert ps["days"] == 19 and not ps["ready"] and not sent
+    rhythm.shadow_record(str(days[19]), datetime.combine(days[19], datetime.min.time(), tzinfo=timezone.utc)
+                         + timedelta(hours=15))
+    rhythm.shadow_record(str(days[19]), datetime.combine(days[19], datetime.min.time(), tzinfo=timezone.utc)
+                         + timedelta(hours=16))                       # 同一天重复调用只记一次
+    ps = rhythm.us_promotion_status()
+    assert ps["days"] == 20 and ps["ready"] and sent == ["rhythm_review"]
+    # 冷却结束时刻不在交易日开盘（单位 / 日历出错）→ 记为异常，不能转正
+    db.set_setting(f"rhythm_state::{rhythm.ETF_KEY}", {"block_until": "2026-12-05T03:00:00+00:00", "block_why": "x",
+                                                       "streak": 0})
+    rhythm.shadow_record(str(days[20]), datetime.combine(days[20], datetime.min.time(), tzinfo=timezone.utc)
+                         + timedelta(hours=15))
+    ps = rhythm.us_promotion_status()
+    assert not ps["ready"] and ps["errors"] and "不是某个交易日的开盘" in ps["errors"][0][1]
+    rhythm.shadow_error(str(days[20]), "离场记账异常：测试")
+    assert len(rhythm.us_promotion_status()["errors"]) == 2
+    db.set_setting(rhythm.SHADOW_LOG_KEY, None)
+    db.set_setting("us_shadow_review_notified", None)
     rhythm.reset_gate(rhythm.ETF_KEY)

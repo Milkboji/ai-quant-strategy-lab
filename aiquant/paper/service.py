@@ -53,6 +53,8 @@ def tick(now: datetime | None = None) -> list[dict]:
     except Exception as e:  # noqa: BLE001
         log.warning("实时5分钟K线获取失败: %s", e)
     df5 = df5.reset_index(drop=True)
+    if len(df5):   # 最新 BTC 价格：估算未成交买单占用的现金（下单前现金检查用）
+        db.set_setting("btc_last_price", {"price": float(df5["close"].iloc[-1]), "at": db.now_iso()})
     try:   # 自动进化产生的新版本：空仓时切换
         from .. import evolve
         if evolve.apply_all_pending():
@@ -107,6 +109,16 @@ def _loop() -> None:
                 etf_trend.step()
             except Exception:  # noqa: BLE001
                 log.error("etf trend error: %s", traceback.format_exc())
+            try:   # 美股收盘后确认下一交易日信号：买入信号 → 收回借给 BTC 的额度（BTC 开盘前按借用比例减仓）
+                from . import etf_trend
+                etf_trend.after_close()
+            except Exception:  # noqa: BLE001
+                log.error("etf after-close error: %s", traceback.format_exc())
+            try:   # 杠杆告警：账户总持仓市值 ÷ 权益 > 100% 或现金为负（每 5 分钟检查一次）
+                from . import cash_guard
+                cash_guard.maybe_exposure_check()
+            except Exception:  # noqa: BLE001
+                log.error("exposure check error: %s", traceback.format_exc())
             try:   # 美股交易日历（节假日 / 半日市），每周从 Alpaca 刷新一次
                 from .. import market
                 market.refresh_calendar()
