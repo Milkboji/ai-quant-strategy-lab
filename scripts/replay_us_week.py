@@ -208,6 +208,8 @@ db.set_setting("etf_trend_state", {"last_action_date": "2026-10-21", "signal": {
 rhythm.set_config(us_mode="shadow", us_mode_at=db.now_iso(), us_mode_by="回放")
 actions.init()                                              # 启动时的一次性迁移（与电脑上安全重启后相同）
 mig = db.get_setting("us_exec_migration")
+if os.environ.get("REPLAY_CRYPTO_MAX"):          # 腾出现金层给试用部署（新部署不摊薄现有策略）
+    db.set_setting("capital_layers", {"crypto": {"max": float(os.environ["REPLAY_CRYPTO_MAX"])}})
 rhythm.etf_long_metrics(compute=True)                       # 美股内部按实力分配时 ETF 用长周期结果
 
 # 现有 BTC 策略（电脑上运行中的 6 个部署：版本与配置原样）
@@ -318,6 +320,7 @@ out = {"window": [d_start, d_end], "migration_checks": mig["checks"], "etf_deplo
        "max_exposure": broker.max_ratio, "final_equity": broker.equity(end_t), "btc_steps": BTC_STEPS,
        "btc_budgets": {d: pr.get_deployment(d)["config"].get("budget_usd") for d in btc_deps},
        "alloc_explain": allocation.explain(broker.equity(end_t)),
+       "trial": {d: allocation.trial_status(pr.get_deployment(d))["text"] for d in [etf_dep["id"], *lab_deps, *btc_deps]},
        "events": [e for e in events if any(k in e["message"] for k in ("[美股]", "[ETF趋势]", "买入", "卖出", "成交", "额度",
                                                                       "现金", "杠杆", "节奏", "对账", "借"))]}
 Path(out_dir).mkdir(parents=True, exist_ok=True)

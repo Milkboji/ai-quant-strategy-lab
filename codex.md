@@ -239,3 +239,35 @@ tests/                     pytest 单元/集成测试 + e2e_browser.py（Playwri
 - 脚本：`scripts/migration_check.py`（数据库副本上的迁移前后对照）、`scripts/replay_us_week.py`（共用账户的多日回放）、
   `scripts/etf_exec_regress.py`（旧 / 新 ETF 执行器逐日比对）。
 
+
+## 服务中断、试用期、持仓上限、券商止损单（2026-10-30，见 docs/服务中断与风控决定报告.md）
+
+- `aiquant/uptime.py`：后台循环每轮 `beat(now)`。与上次心跳 `paper_loop_heartbeat` 间隔超过 3 分钟就 `record`：
+  写 `service_outages` 表、事件、通知（watchdog_restart），并设 `catchup_pending`。
+  `missed_checks`：BTC 各部署收盘 K 线数、美股开盘 / 收盘后检查日。
+  `catchup_signals(df5)`：恢复后第一次 tick 列出中断期间的入场信号，不补单。
+  `full_run_day`：开盘前 10 分钟到收盘后 30 分钟无中断。`rhythm.us_promotion_status` 只计这样的交易日。
+  `backfill_from_snapshots`：一次性，用快照空档超过 2 小时补记。
+  `write_health`：`static/health.json` = {status, ts}；`.streamlit/config.toml` 开启 `enableStaticServing`，
+  对外地址 `/app/static/health.json`。
+- `tools/cloudflare_worker/quant-guard.js`：`scheduled` 每 5 分钟 `heartbeat`。每次检查内部重试 3 次；
+  文件超过 600 秒没更新也算失败；连续 2 次失败发 Telegram，恢复再发一条。
+  KV `GUARD_KV` 键 `health`；Secret `TG_TOKEN` / `TG_CHAT`。测试 `test_guard.mjs`（node）。
+- `power_setup.bat` / `tools/power_setup.ps1`：默认只显示；`apply` 时提权，设置不睡眠、不休眠、合盖不操作、
+  更新活动时段 12→6、登录时不自动重启。
+- `allocation.py` 配置新增 `add_pp`（替代 rebalance_pp）、`trial_pct` / `trial_total_pct` / `trial_days`、`position_cap_pct`。
+  - 试用：`start_trial` 写 `dep.config.trial`；只有新部署进入试用，换版本仍为正式。
+  - `trial_plan`：额度 = min(合计上限, 现金 − 保留)，先部署的先分；转正由 `graduate_trials` 处理（evolve.rebalance 调用）。
+  - 试用部署不参与按实力分配，也不计入 `us_held_value` / `_us_running`。
+  - `position_cap(equity)`；`backtest_cap_frac(share)` = cap / share，≥ 1 时为 None。
+- 美股执行器
+  - 删除偏离再平衡。持仓时：超过上限 → purpose 'cap' 减仓；目标比 `entry.target_pct` 提高 ≥ add_pp → 'add' 加仓；降低不卖。
+  - 止损：`stop_plan`（按天推进的止损 / 移动止损 / 止盈）。`maintain_stops` 挂 DAY 止损单（purpose 'stop'），
+    收盘后挂下一交易日的；股数或价格变了就重挂。券商拒绝 → `stop_mode=poll`，改由 `intraday_guard` 每 5 分钟用最新价检查
+    （purpose 'guard'）；止盈总是轮询。`_place` 卖出前先撤止损单；`sync_orders` 中保护单成交走 `_on_protect_fill`。
+- BTC：`PaperRunner._position_cap` 卖出超过权益 50% 的部分。新部署 `start_trial`，`budget_usd=0`，额度由 `plan_budgets` 给；
+  `deploy_all` 保留已运行部署的额度，最后调用 `evolve.rebalance`。
+- 回测：`BTConfig.position_cap_frac`（开仓限额；超过 → 下一根开盘减仓，exit_reason「仓位上限减仓」）；
+  `regime_bt.simulate(cap_frac=)`；`research.bt_config(..., account_share_pct=)`。为 None 时代码路径完全跳过。
+  跳空止损按 `min(开盘, 止损价)` 成交，测试锁定。
+- 脚本：`scripts/us_stop_regress.py`（美股止损回测 30 组新旧比对）。

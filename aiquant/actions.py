@@ -35,6 +35,13 @@ def init() -> None:
     except Exception:  # noqa: BLE001
         import logging
         logging.getLogger("aiquant").exception("holdout migrate failed")
+    try:   # 服务运行记录：建表、用账户快照补记上线前的中断（影子模式转正只计完整运行的交易日）
+        from . import uptime
+        uptime.ensure_tables()
+        uptime.backfill_from_snapshots()
+    except Exception:  # noqa: BLE001
+        import logging
+        logging.getLogger("aiquant").exception("uptime init failed")
     try:   # 美股 ETF 择时迁移为通用美股日线执行器上的普通部署（一次性、不下单），迁移报告在 settings.us_exec_migration
         from .paper import us_exec
         us_exec.ensure_migrated()

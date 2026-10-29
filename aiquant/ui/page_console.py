@@ -109,6 +109,8 @@ def _card(r: dict, actor: str, rl: str, focus: bool) -> None:
             pills += " " + C.pill("刚从实验室跳转", "blue")
         if r.get("market") == "us_equity":
             pills += " " + C.pill(f"美股日线 · {r.get('trade_symbol') or ''}", "blue")
+        if dep and r.get("trial"):
+            pills += " " + C.pill(r["trial"], "orange" if r["trial"].startswith("试用") else "green")
         st.markdown(f'<div class="aq-slothead"><div><span class="aq-slotname">{C.esc(r["name"])}</span> '
                     f'<span class="aq-meta">{C.esc(r["origin"])} · 来源：{C.esc(r["source_cn"])}</span></div>'
                     f'<div>{pills}</div></div>', unsafe_allow_html=True)
@@ -245,8 +247,7 @@ def _etf_card(r: dict, actor: str, rl: str, focus: bool) -> None:
             pills += " " + C.pill("验证/测试数据已暴露", "orange")
         if focus:
             pills += " " + C.pill("刚从实验室跳转", "blue")
-        if r.get("market") == "us_equity":
-            pills += " " + C.pill(f"美股日线 · {r.get('trade_symbol') or ''}", "blue")
+        pills += " " + C.pill("正式", "green")
         st.markdown(f'<div class="aq-slothead"><div><span class="aq-slotname">{C.esc(r["name"])}</span> '
                     f'<span class="aq-meta">{C.esc(r["signal_symbol"])} → {C.esc(r["trade_symbol"])} · 来源：策略实验室参数版本'
                     f'</span></div><div>{pills}</div></div>',
@@ -383,31 +384,41 @@ def _capital_panel(eq: float | None, actor: str, rl: str) -> None:
                      f"现金 {l1['cash_pct']:.1f}%（账户权益 {C.usd(eq) if eq else '--'}）"):
         st.markdown("**第一层：市场之间（上下限可配置）**")
         st.markdown("".join(f"<div>• {C.esc(x)}</div>" for x in l1["steps"]), unsafe_allow_html=True)
-        st.markdown("**第二层：市场内部按实力公式**（长周期 年均收益 / 年均回撤，没有长周期结果时用训练集 收益 / 回撤；权重有上下限）")
+        st.markdown("**第二层：市场内部按实力公式**（只在「正式」策略之间分配：长周期 年均收益 / 年均回撤，没有长周期结果时用训练集 "
+                    "收益 / 回撤；权重有上下限）。新部署的策略先「试用」：固定额度从现金层出，满期后转正式")
         if ex["us"]:
-            st.dataframe(pd.DataFrame([{"美股部署": f"#{x['deployment']} {x['label']}", "额度": C.usd(x["budget"]),
+            st.dataframe(pd.DataFrame([{"美股部署": f"#{x['deployment']} {x['label']}", "状态": x.get("status") or "--",
+                                        "额度": C.usd(x["budget"]),
                                         "美股内占比": C.pct(x["share_pct"], sign=False, digits=1) if x["share_pct"] is not None else "--",
                                         "目标 / 实际（占权益）": (f"{x['target_pct']:.1f}% / {x['actual_pct']:.1f}%"
                                                          if x["target_pct"] is not None else "--"),
                                         "依据": x["why"]} for x in ex["us"]]), hide_index=True, use_container_width=True)
         if ex["crypto"]:
-            st.dataframe(pd.DataFrame([{"加密货币部署": f"#{x['deployment']} {x['label']}", "额度": C.usd(x["budget"]),
+            st.dataframe(pd.DataFrame([{"加密货币部署": f"#{x['deployment']} {x['label']}", "状态": x.get("status") or "--",
+                                        "额度": C.usd(x["budget"]),
                                         "加密内占比": C.pct(x["share_pct"], sign=False, digits=1) if x.get("share_pct") is not None else "--",
                                         "依据": x["why"]} for x in ex["crypto"]]), hide_index=True, use_container_width=True)
-        st.caption(f"美股策略实际仓位偏离目标超过 {l1['rebalance_pp']:g} 个百分点时，收盘后记下、下一个交易日开盘后再平衡；"
-                   "加密货币按信号逐笔开仓，额度变化在下一次开仓时生效。")
+        st.caption(f"额度调整不强制卖出已有持仓，新的目标在下一次开仓时生效；美股持仓中目标比例提高 {l1['add_pp']:g} 个百分点以上时，"
+                   "下一个交易日按差额加仓（只加不减，价格涨跌不调整）。"
+                   f"单个策略持仓超过账户权益的 {l1['position_cap_pct']:g}% 时减到上限（美股和 BTC 都适用）。")
         c = allocation.get_config()
         cols = st.columns(3)
         us_min = cols[0].number_input("美股下限 %", 0.0, 100.0, float(c["us_equity"]["min"]), 5.0, key="cap_us_min")
         us_max = cols[1].number_input("美股上限 %", 0.0, 100.0, float(c["us_equity"]["max"]), 5.0, key="cap_us_max")
-        rpp = cols[2].number_input("再平衡阈值（百分点）", 1.0, 50.0, float(c["rebalance_pp"]), 1.0, key="cap_rpp")
+        app = cols[2].number_input("加仓阈值（百分点）", 0.5, 50.0, float(c["add_pp"]), 0.5, key="cap_add_pp")
         cols = st.columns(3)
         cr_min = cols[0].number_input("加密货币下限 %", 0.0, 100.0, float(c["crypto"]["min"]), 5.0, key="cap_cr_min")
         cr_max = cols[1].number_input("加密货币上限 %", 0.0, 100.0, float(c["crypto"]["max"]), 5.0, key="cap_cr_max")
-        if cols[2].button("保存资金分层", key="cap_save", use_container_width=True):
+        pcap = cols[2].number_input("单个策略持仓上限 %", 5.0, 100.0, float(c["position_cap_pct"]), 5.0, key="cap_pos")
+        cols = st.columns(3)
+        tp = cols[0].number_input("试用额度（每个）%", 0.0, 20.0, float(c["trial_pct"]), 1.0, key="cap_trial")
+        tt = cols[1].number_input("试用额度合计上限 %", 0.0, 50.0, float(c["trial_total_pct"]), 5.0, key="cap_trial_total")
+        td = cols[2].number_input("试用期（交易日 / 天）", 1, 365, int(c["trial_days"]), 5, key="cap_trial_days")
+        if st.button("保存资金分层", key="cap_save", use_container_width=True):
             try:
                 res = allocation.set_config(actor=actor, role=rl, us_min=us_min, us_max=us_max, crypto_min=cr_min,
-                                            crypto_max=cr_max, rebalance_pp=rpp)
+                                            crypto_max=cr_max, add_pp=app, position_cap_pct=pcap, trial_pct=tp,
+                                            trial_total_pct=tt, trial_days=td)
                 flash("console", "ok", res["message"])
             except Exception as e:  # noqa: BLE001
                 flash("console", "err", str(e))

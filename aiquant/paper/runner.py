@@ -113,7 +113,7 @@ def start(did: int) -> str:
                       "AND status IN ('running','paused_entries') AND id<>?", (did,))
         used = sum(float(json.loads(o["config_json"]).get("budget_usd") or 0) for o in others)
         mine = float(dep["config"].get("budget_usd") or 0)
-        if not mine and others:
+        if not mine and others and not dep["config"].get("trial"):
             raise ValueError("多个策略共用账户时，每个部署必须设置资金额度 budget_usd")
         acct = make_broker(dep).account()
         if acct is not None and mine and used + mine > acct.equity * 1.0001:
@@ -357,6 +357,26 @@ class PaperRunner:
         event(self.did, "INFO", why, self.is_test)
         return {"action": "sell", "reason": why}
 
+    def _position_cap(self, my_qty: float, price: float, equity: float, now: datetime) -> dict | None:
+        """风控上限：本策略持仓市值超过账户权益的 position_cap_pct（默认 50%）→ 卖出超出部分。额度调整本身不强制卖出。"""
+        if my_qty <= 1e-9 or not equity:
+            return None
+        from .. import allocation
+        cap = allocation.position_cap(equity)
+        val = my_qty * price
+        if val <= cap * 1.005:
+            return None
+        qty = float(f"{(val - cap) / price:.6f}")
+        if qty * price < 10:
+            return None
+        why = (f"风控上限：持仓 {val:,.0f} USD 超过账户权益 {equity:,.0f} 的 "
+               f"{allocation.get_config()['position_cap_pct']:g}%，卖出 {qty:.6f} BTC 减到上限")
+        res = self._order("sell", qty, pd.Timestamp(now).floor("min").isoformat(), price)
+        if res is None:
+            return {"action": "blocked", "reason": why + "（卖单未成功，下一轮重试）"}
+        event(self.did, "WARN", why, self.is_test)
+        return {"action": "sell", "reason": why}
+
     def _rhythm_exit(self, now: datetime, reason: str, pnl_est: float) -> None:
         try:
             from .. import rhythm
@@ -425,6 +445,10 @@ class PaperRunner:
             cut = self._reclaim_cut(my_qty, price, now)
             if cut:
                 out.update(cut)
+                return out
+            capped = self._position_cap(my_qty, price, acct.equity, now)
+            if capped:
+                out.update(capped)
                 return out
         if my_qty > 1e-9:
             le = self.last_entry()

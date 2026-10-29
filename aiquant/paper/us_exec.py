@@ -332,37 +332,83 @@ def lab_signal(dep: dict, today, holding: bool) -> dict:
             if n >= obj.max_hold_bars:
                 want, stop = False, "最长持仓"
         if want and (obj.stop_loss_pct or obj.take_profit_pct or obj.trailing):
-            stop = _stop_hit(dep, obj, e["trade_symbol"], since, today)
-            if stop:
-                want = False
+            sp = stop_plan(dep, today)          # 兜底：券商止损单没有成交（例如没挂上）但收盘日线已触发 → 今天开盘卖出
+            if sp and sp.get("hit"):
+                want, stop = False, sp["hit"] + "，券商止损单没有成交，今天开盘卖出"
     return {"date": last, "regime": int(want), "entry": bool(ent[i]), "exit": bool(ex[i]),
             "close": float(frame["close"].iloc[i]), "rule": "实验室版本（主引擎信号）", "stop": stop}
 
 
-def _stop_hit(dep: dict, obj, sym: str, since: str | None, today) -> str | None:
-    """止损 / 止盈 / 移动止损：用入场后已收盘的交易品种日线（最低价 / 最高价）检查，触发则下一交易日开盘卖出。
-    与回测的差异：回测在触发当天按止损价成交，模拟盘每天只在开盘后动作一次，所以在下一个开盘成交（写在「为什么」里）。"""
+def _rules(dep: dict):
+    """实验室版本的止损 / 止盈 / 移动止损规则（ETF 择时没有）。没有任何一项时返回 None。"""
+    if kind(dep) != "lab":
+        return None
+    from ..strategy import registry
+    from ..strategy.schema import validate
+    v = registry.get_version(dep["version_id"])
+    obj, errs = validate(v["schema"]) if v else (None, ["missing"])
+    if errs or not (obj.stop_loss_pct or obj.take_profit_pct or obj.trailing):
+        return None
+    return obj
+
+
+def _session_for(now: datetime):
+    """下单所属的交易日：交易时段内 / 开盘前 = 今天；收盘后 / 休市日 = 下一个交易日。"""
+    from .. import market as mk
+    d = now.astimezone(ET).date()
+    if mk.is_trading_day(d) and now < mk.session_close(d):
+        return d
+    return mk.trading_days_after(d, 1)[0]
+
+
+def stop_plan(dep: dict, session=None) -> dict | None:
+    """该策略在交易日 session 应挂的止损价，与回测（engine/backtest.py）同一套计算、按路径逐日推进：
+    入场价 ep = 台账平均成本；第 j 天的止损 = max(ep × (1 − 止损%)，移动止损：峰值 × (1 − 回撤%)，峰值达到激活线后才启用)，
+    峰值只用第 j 天之前已收盘的最高价（含入场价）；第 j 天最低价 ≤ 止损 → 触发（回测在当天按 min(开盘, 止损价) 成交）。
+    返回 {stop, tp, hit, poll, why}；没有止损规则或没有持仓时返回 None。"""
+    obj = _rules(dep)
+    if obj is None:
+        return None
+    e = effective(dep)
+    sym = e["trade_symbol"]
     p = us_ledger.position(dep["id"], sym)
     ep = float(p["avg_cost"] or 0)
-    if ep <= 0:
+    if p["qty"] <= us_ledger.QTY_EPS or ep <= 0:
         return None
-    b = lab_bars(sym)
-    dd = pd.to_datetime(b["close_time"], utc=True).dt.tz_convert(ET).dt.date
-    b = b[(dd < today) & ((dd.astype(str) > since) if since else True)]
-    if not len(b):
-        return None
-    lo, hi = float(b["low"].min()), float(b["high"].max())
-    stop_px = ep * (1 - obj.stop_loss_pct / 100) if obj.stop_loss_pct else None
-    why = "止损"
-    if obj.trailing and hi >= ep * (1 + obj.trailing.activate_pct / 100):
-        tpx = hi * (1 - obj.trailing.trail_pct / 100)
-        if stop_px is None or tpx > stop_px:
-            stop_px, why = tpx, "移动止损"
-    if stop_px is not None and lo <= stop_px:
-        return f"{why}（触发价 {stop_px:,.2f}，入场后最低 {lo:,.2f}；模拟盘在下一交易日开盘卖出）"
-    if obj.take_profit_pct and hi >= ep * (1 + obj.take_profit_pct / 100):
-        return f"止盈（目标 {ep * (1 + obj.take_profit_pct / 100):,.2f}，入场后最高 {hi:,.2f}；模拟盘在下一交易日开盘卖出）"
-    return None
+    session = session or _session_for(datetime.now(timezone.utc))
+    since = ((dep_state(dep).get("entry") or {}).get("signal_date")) or ""
+    try:
+        b = lab_bars(sym)
+        dd = pd.to_datetime(b["close_time"], utc=True).dt.tz_convert(ET).dt.date
+        b = b[(dd < session) & (dd.astype(str) > since)]
+    except Exception:  # noqa: BLE001
+        b = pd.DataFrame(columns=["low", "high"])
+    sl = ep * (1 - obj.stop_loss_pct / 100) if obj.stop_loss_pct else None
+    tp = ep * (1 + obj.take_profit_pct / 100) if obj.take_profit_pct else None
+
+    def stop_at(peak):
+        px, why = sl, "止损"
+        if obj.trailing and peak >= ep * (1 + obj.trailing.activate_pct / 100):
+            t = peak * (1 - obj.trailing.trail_pct / 100)
+            if px is None or t > px:
+                px, why = t, "移动止损"
+        return px, why
+    peak, hit = ep, None
+    for lo, hi in zip(b["low"].astype(float), b["high"].astype(float)):
+        px, why = stop_at(peak)
+        if px is not None and lo <= px:
+            hit = f"{why}（{px:,.2f}）已在收盘日线上触发"
+            break
+        if tp is not None and hi >= tp:
+            hit = f"止盈（{tp:,.2f}）已在收盘日线上触发"
+            break
+        peak = max(peak, hi)
+    px, why = stop_at(peak)
+    poll = (dep.get("config") or {}).get("stop_mode") == "poll"
+    txt = (f"{why} {px:,.2f}（入场均价 {ep:,.2f}" + (f"，峰值 {peak:,.2f}" if why == "移动止损" else "") + "）"
+           if px is not None else "没有止损价") + (f"；止盈 {tp:,.2f}（交易时段内每 5 分钟检查最新价）" if tp else "")
+    return {"stop": round(px, 2) if px is not None else None, "tp": round(tp, 2) if tp else None, "hit": hit,
+            "poll": poll, "why": txt, "qty": p["qty"], "symbol": sym, "session": str(session)}
 
 
 def signal_for(dep: dict, today, holding: bool) -> dict:
@@ -416,6 +462,12 @@ def sync_orders() -> list[dict]:
     for o in us_ledger.unallocated_final():
         res = us_ledger.allocate(o["id"])
         out.extend(res)
+        for r in res:
+            if r["purpose"] in ("stop", "guard") and r["qty"] > us_ledger.QTY_EPS:
+                try:
+                    _on_protect_fill(dict(r, symbol=o["symbol"]), o)
+                except Exception:  # noqa: BLE001
+                    log.exception("protect fill handling failed")
         if res:
             fq = float(o["filled_qty"] or 0) if o["status"] != "internal" else 0
             _log(None if not res else _dep_for(res[0]["deployment_id"]), "INFO",
@@ -423,6 +475,157 @@ def sync_orders() -> list[dict]:
                  + "；".join(f"#{r['deployment_id']} {'买' if r['side'] == 'buy' else '卖'} {r['qty']:.4f} 股"
                             f"（{'券商成交' if r['source'] == 'fill' else '内部对冲'}）" for r in res))
     return out
+
+
+def _cancel_stop(did: int) -> bool:
+    """撤掉该策略挂着的止损单（卖出前必须先撤，否则券商会因为股数被占用而拒绝）。没有 → True。"""
+    ex = us_ledger.open_stop(did)
+    if not ex:
+        return True
+    ok = bool(ex.get("broker_id")) and etf_trend._cancel(ex["broker_id"])
+    if not ok and ex.get("client_order_id"):        # 没有券商 id：按 client_order_id 查一次
+        code, b = alpaca.paper_get("/v2/orders:by_client_order_id", {"client_order_id": ex["client_order_id"]})
+        if code == 200 and isinstance(b, dict):
+            if b.get("status") in us_ledger.FINAL:
+                us_ledger.update_order(ex["order_id"], b["status"], float(b.get("filled_qty") or 0),
+                                       float(b.get("filled_avg_price") or 0) or None, b)
+                sync_orders()
+                return b.get("status") != "filled" and float(b.get("filled_qty") or 0) == 0
+            ok = bool(b.get("id")) and etf_trend._cancel(b["id"])
+    if ok:
+        us_ledger.update_order(ex["order_id"], "canceled", 0, None)
+        us_ledger.allocate(ex["order_id"])
+    return ok
+
+
+def maintain_stops(now: datetime | None = None) -> list[str]:
+    """给有止损规则的持仓挂好当日（收盘后 = 下一交易日）的 DAY 止损单；股数或止损价变了就撤掉重挂。
+    券商不支持（例如碎股止损单被拒）时，该策略改为交易时段内每 5 分钟检查最新价（stop_mode=poll），并通知一次。"""
+    now = now or datetime.now(timezone.utc)
+    if not http.paper_orders_unlocked():
+        return []
+    sess = _session_for(now)
+    out = []
+    for dep in deployments():
+        sp = stop_plan(dep, sess)
+        if sp is None:
+            continue
+        if sp["poll"] or sp["stop"] is None or sp["hit"]:
+            continue
+        ex = us_ledger.open_stop(dep["id"])
+        if ex and ex["trade_date"] == str(sess) and abs(float(ex["qty"] or 0) - sp["qty"]) < 1e-6 \
+                and abs(float(ex["stop_price"] or 0) - sp["stop"]) < 0.005:
+            continue
+        if us_ledger.has_open(dep["id"]):
+            continue                       # 买卖单还没完成：完成后再按新的股数挂
+        if ex and not _cancel_stop(dep["id"]):
+            continue
+        st = dep_state(dep)
+        if st.get("stop_retry_after") and now.isoformat() < st["stop_retry_after"]:
+            continue
+        sym = sp["symbol"]
+        its = [{"deployment_id": dep["id"], "side": "sell", "qty": round(sp["qty"], 9), "purpose": "stop",
+                "reason": sp["why"]}]
+        coid = f"us-{sym.lower()}-stop-{sess}-{uuid.uuid4().hex[:6]}"
+        oid = us_ledger.create_order(sym, {"side": "sell", "qty": round(sp["qty"], 9)}, its, str(sess), sp["stop"], coid)
+        try:
+            info = etf_trend._submit(sym, "sell", qty=round(sp["qty"], 9), coid=coid, order_type="stop",
+                                     stop_price=sp["stop"]) or {}
+            us_ledger.update_order(oid, info.get("status") or "accepted", float(info.get("filled_qty") or 0),
+                                   float(info.get("filled_avg_price") or 0) or None, info)
+            out.append(f"#{dep['id']} {sym} 止损单 {sp['qty']:.4f} 股 @ {sp['stop']:,.2f}（{sess}）")
+            _log(dep, "INFO", f"挂止损单（{sess} 当日有效）：{sp['qty']:.4f} 股 {sym} @ {sp['stop']:,.2f}；{sp['why']}")
+        except RuntimeError as e:
+            us_ledger.update_order(oid, "rejected", 0, None, {"error": str(e)[:300]})
+            us_ledger.allocate(oid)
+            msg = str(e).lower()
+            if any(k in msg for k in ("fraction", "not supported", "not allowed", "stop orders")):
+                cfg = dict(dep["config"], stop_mode="poll")
+                _save_cfg(dep["id"], cfg)
+                _log(dep, "WARN", f"券商不接受止损单（{str(e)[:120]}），改为交易时段内每 5 分钟检查最新价、触发后立即下市价单")
+                _notify_once("order_failed", f"美股止损改为轮询：{label(dep)}", f"券商拒绝止损单：{str(e)[:200]}\n"
+                             "已改为交易时段内每 5 分钟检查最新价，触发后立即下市价单。", f"us-stop-poll-{dep['id']}")
+            else:
+                st["stop_retry_after"] = (now + timedelta(minutes=30)).isoformat()
+                _save_state(dep, st)
+                _log(dep, "WARN", f"止损单被拒：{str(e)[:160]}（30 分钟后重试）")
+    return out
+
+
+GUARD_EVERY_MIN = 5
+
+
+def intraday_guard(now: datetime | None = None) -> list[str]:
+    """交易时段内每 5 分钟：止盈（券商同一股数不能同时挂止损和限价）以及止损改为轮询的策略，读最新价，触发后撤止损单、立即下市价单。"""
+    from .. import market as mk
+    now = now or datetime.now(timezone.utc)
+    d = now.astimezone(ET).date()
+    if not (mk.is_trading_day(d) and mk.session_open(d) <= now < mk.session_close(d)) or not http.paper_orders_unlocked():
+        return []
+    last = db.get_setting("us_guard_last")
+    if last and (now - datetime.fromisoformat(last)).total_seconds() < GUARD_EVERY_MIN * 60 - 5:
+        return []
+    db.set_setting("us_guard_last", now.isoformat())
+    out = []
+    for dep in deployments():
+        sp = stop_plan(dep, d)
+        if not sp or not (sp["tp"] or sp["poll"]) or us_ledger.has_open(dep["id"]):
+            continue
+        px = etf_trend._latest_price(sp["symbol"])
+        if not px:
+            continue
+        why = None
+        if sp["poll"] and sp["stop"] is not None and px <= sp["stop"]:
+            why = f"最新价 {px:,.2f} ≤ 止损价 {sp['stop']:,.2f}"
+        elif sp["tp"] and px >= sp["tp"]:
+            why = f"最新价 {px:,.2f} ≥ 止盈价 {sp['tp']:,.2f}"
+        if not why or not _cancel_stop(dep["id"]):
+            continue
+        sym = sp["symbol"]
+        its = [{"deployment_id": dep["id"], "side": "sell", "qty": round(sp["qty"], 9), "purpose": "guard", "reason": why}]
+        coid = f"us-{sym.lower()}-guard-{d}-{uuid.uuid4().hex[:6]}"
+        oid = us_ledger.create_order(sym, {"side": "sell", "qty": round(sp["qty"], 9)}, its, str(d), px, coid)
+        try:
+            info = etf_trend._submit(sym, "sell", qty=round(sp["qty"], 9), coid=coid) or {}
+            us_ledger.update_order(oid, info.get("status") or "accepted", float(info.get("filled_qty") or 0),
+                                   float(info.get("filled_avg_price") or 0) or None, info)
+            _log(dep, "WARN", f"交易时段内检查：{why}，立即卖出 {sp['qty']:.4f} 股 {sym}")
+            out.append(f"#{dep['id']} {why}")
+        except RuntimeError as e:
+            us_ledger.update_order(oid, "rejected", 0, None, {"error": str(e)[:300]})
+            us_ledger.allocate(oid)
+            _log(dep, "WARN", f"{why}，但卖单被拒：{str(e)[:160]}")
+    return out
+
+
+def _on_protect_fill(r: dict, o: dict) -> None:
+    """止损单 / 交易时段内检查的卖单成交后：记离场（交易节奏）、清掉入场记录、写「为什么」。"""
+    dep = _dep_for(r["deployment_id"])
+    if not dep:
+        return
+    sym = r.get("symbol") or o["symbol"]
+    st = dep_state(dep)
+    pos = us_ledger.position(dep["id"], sym)
+    gone = pos["qty"] <= us_ledger.QTY_EPS
+    pnl = 0.0
+    try:
+        trades = db.q("SELECT side, qty, price FROM us_ledger WHERE deployment_id=? AND symbol=? ORDER BY id", (dep["id"], sym))
+        cost = qty = 0.0
+        for t in trades[:-1]:
+            if t["side"] == "buy":
+                cost += t["qty"] * t["price"]
+                qty += t["qty"]
+        pnl = (r["price"] - (cost / qty if qty else r["price"])) * r["qty"]
+    except Exception:  # noqa: BLE001
+        pass
+    what = "止损单成交" if r["purpose"] == "stop" else "交易时段内检查触发卖出"
+    if gone:
+        st["entry"] = None
+        _save_state(dep, dict(st, action=f"{what}：卖出 {r['qty']:.4f} 股 {sym} @ {r['price']:,.2f}",
+                              position=with_price(pos, r["price"])))
+        _on_exit(dep, datetime.now(timezone.utc), pnl)
+    set_why(dep, "stopped", f"{what}：卖出 {r['qty']:.4f} 股 {sym} @ {r['price']:,.2f}（约 {pnl:+,.2f} USD）")
+    _log(dep, "WARN", f"{what}：卖出 {r['qty']:.4f} 股 {sym} @ {r['price']:,.2f}（约 {pnl:+,.2f} USD）")
 
 
 def _dep_for(did: int) -> dict | None:
@@ -518,6 +721,11 @@ def step(now: datetime | None = None) -> dict:
     today = now_et.date()
     todo = [d for d in deps if dep_state(d).get("last_action_date") != str(today)]
     if not todo:
+        try:   # 当天已动作完：维护止损单（新买入的仓位挂单、股数变化重挂）+ 每 5 分钟的止盈 / 轮询止损检查
+            maintain_stops(now)
+            intraday_guard(now)
+        except Exception:  # noqa: BLE001
+            log.warning("stop maintenance failed", exc_info=True)
         return out
     if now_et.hour * 60 + now_et.minute < OPEN_MIN:
         _all_why(todo, "pre_open", "已开盘，等到美东 9:35（开盘 5 分钟后）再按前一日收盘信号决定")
@@ -564,7 +772,7 @@ def _decide(todo: list[dict], deps: list[dict], now: datetime, today, out: dict)
     lend_wait = _lending(deps, sigs, holding, now, cash, equity, plan)
     intents: dict[str, list[dict]] = {}
     decided: dict[int, dict] = {}
-    rbp = float(ab.layer1(equity, deps)["rebalance_pp"])
+    add_pp = float(ab.get_config()["add_pp"])
     for d in todo:
         if d["id"] not in sigs:
             continue
@@ -617,38 +825,51 @@ def _decide(todo: list[dict], deps: list[dict], now: datetime, today, out: dict)
                 set_why(d, "long_pause" if block.startswith("长周期体检") else "rhythm", f"看多，但{block}，暂不买入")
                 continue
             target = budget * vm
+            if equity and target > ab.position_cap(equity):          # 单个策略持仓上限
+                target = ab.position_cap(equity)
             why = _entry_reason(d, sig) + (f"；波动率定仓 {vm:.0%}" if vm < 1 else "")
+            if target < 10:
+                set_why(d, "small", f"看多，但本策略额度为 0（{(plan.get(d['id']) or {}).get('why') or '等待分配'}），暂不买入")
+                continue
             intents.setdefault(sym, []).append({"deployment_id": d["id"], "side": "buy", "notional": target,
-                                                "purpose": "entry", "reason": why, "target": target})
+                                                "purpose": "entry", "reason": why, "target": target,
+                                                "target_pct": round(budget / equity * 100, 4) if equity else None})
             res.update(action="买入", target=target, why=why)
         elif sig["regime"] == 1:
             need = 0.0
             if entry and entries_ok:
                 need = etf_trend.topup_needed(entry["target"], us_ledger.entry_filled_usd(d["id"], sym, entry["signal_date"]))
-            due = st.get("rebalance_due")
             mv = qty * px_now
-            dev_pp = (mv - budget) / equity * 100 if equity else 0.0
-            if need >= 10:
+            cap_usd = ab.position_cap(equity) if equity else 0.0
+            cur_pct = budget / equity * 100 if equity else 0.0
+            if entry is not None and entry.get("target_pct") is None:      # 迁移 / 旧状态：以当前目标为起点，不加仓
+                entry = dict(entry, target_pct=round(cur_pct, 4))
+                res["entry_new"] = entry
+            add_pct = (cur_pct - float(entry["target_pct"])) if entry else 0.0
+            if equity and mv > cap_usd * 1.005:
+                q = round((mv - cap_usd) / px_now, 6) if px_now else 0.0
+                intents.setdefault(sym, []).append({"deployment_id": d["id"], "side": "sell", "qty": min(q, qty),
+                                                    "purpose": "cap",
+                                                    "reason": f"风控上限：持仓 {mv / equity:.1%} 超过账户权益的 "
+                                                              f"{ab.get_config()['position_cap_pct']:g}%，减到上限"})
+                res.update(action="减到上限")
+            elif need >= 10:
                 intents.setdefault(sym, []).append({"deployment_id": d["id"], "side": "buy", "notional": need,
                                                     "purpose": "topup", "reason": f"上次买入只部分成交，补足到目标 "
                                                     f"{entry['target']:,.0f} USD"})
                 res.update(action="补足", need=need)
-            elif due and due.get("date") != str(today) and abs(dev_pp) > rbp and budget > 0 and entries_ok:
-                if dev_pp > 0:
-                    q = round((mv - budget) / px_now, 6) if px_now else 0.0
-                    intents.setdefault(sym, []).append({"deployment_id": d["id"], "side": "sell", "qty": min(q, qty),
-                                                        "purpose": "rebalance_sell",
-                                                        "reason": f"再平衡：实际 {mv / equity:.1%}、目标 {budget / equity:.1%}，"
-                                                                  f"高出 {dev_pp:.1f} 个百分点（阈值 {rbp:g}）"})
+            elif entry and entries_ok and add_pct >= add_pp and equity:
+                amt = min(add_pct * equity / 100, max(0.0, cap_usd - mv))
+                if amt >= 10:
+                    intents.setdefault(sym, []).append({
+                        "deployment_id": d["id"], "side": "buy", "notional": round(amt, 2), "purpose": "add",
+                        "new_target_pct": round(cur_pct, 4),
+                        "reason": f"目标比例从 {float(entry['target_pct']):.1f}% 提高到 {cur_pct:.1f}%（高出 {add_pct:.1f} 个百分点，"
+                                  f"阈值 {add_pp:g}），按差额加仓；目标降低时不卖出，价格涨跌不调整"})
+                    res.update(action="加仓", add=amt)
                 else:
-                    intents.setdefault(sym, []).append({"deployment_id": d["id"], "side": "buy", "notional": budget - mv,
-                                                        "purpose": "rebalance_buy",
-                                                        "reason": f"再平衡：实际 {mv / equity:.1%}、目标 {budget / equity:.1%}，"
-                                                                  f"低了 {-dev_pp:.1f} 个百分点（阈值 {rbp:g}）"})
-                res.update(action="再平衡", dev_pp=dev_pp)
+                    set_why(d, "hold", f"看多且已持有 {sym}，保持不动{band_txt}")
             else:
-                if due and abs(dev_pp) <= rbp:
-                    res["clear_rebalance"] = True
                 set_why(d, "hold", f"看多且已持有 {sym}，保持不动{band_txt}")
         elif qty > us_ledger.QTY_EPS:
             why = _exit_reason(d, sig)
@@ -676,8 +897,7 @@ def _decide(todo: list[dict], deps: list[dict], now: datetime, today, out: dict)
         pos = with_price(us_ledger.position(d["id"], sym), res.get("px"))
         new = dict(st, signal=res["signal"], action=res["action"], position=pos, budget=res["budget"],
                    checked_at=db.now_iso(), entry=res.get("entry_new", res.get("entry")))
-        if res.get("clear_rebalance"):
-            new.pop("rebalance_due", None)
+        new.pop("rebalance_due", None)
         if not res.get("nolast"):
             new["last_action_date"] = str(today)
         _save_state(d, new)
@@ -733,7 +953,15 @@ def _place(sym: str, its: list[dict], decided: dict, today, now: datetime, avail
             res = decided[i["deployment_id"]]
             set_why(_dep_for(i["deployment_id"]), "small", (short or "可用资金不足 10 USD") + "，暂不买入")
             res["action"] = "保持"
-    its = [i for i in its if i["side"] == "sell"] + buys
+    sells = []
+    for i in [x for x in its if x["side"] == "sell"]:
+        if _cancel_stop(i["deployment_id"]):
+            sells.append(i)
+        else:                                   # 止损单撤不掉（可能刚成交）：这次不卖，下一轮再看
+            res = decided[i["deployment_id"]]
+            res.update(action="等待止损单状态", nolast=True)
+            set_why(_dep_for(i["deployment_id"]), "pending", "挂着的止损单还没撤掉（可能刚成交），稍后重试")
+    its = sells + buys
     if not its:
         return avail
     plan = us_ledger.plan_net(its, ref)
@@ -786,7 +1014,8 @@ def _after_submit(sym: str, its: list[dict], decided: dict, now: datetime, short
         res = decided[i["deployment_id"]]
         tag = "（与其他策略内部对冲）" if internal else ""
         if i["purpose"] == "entry":
-            res["entry_new"] = {"signal_date": res["signal"]["date"], "target": round(res.get("target", i["notional"]), 2)}
+            res["entry_new"] = {"signal_date": res["signal"]["date"], "target": round(res.get("target", i["notional"]), 2),
+                                "target_pct": i.get("target_pct")}
             res["action"] = f"买入 {sym} {i['notional']:,.0f} USD{tag}"
             set_why(d, "bought", f"看多：{i['reason']}，已下单 {res['action']}" + (f"；{short}；差额下一个交易日补足" if short else ""))
             _on_entry(d, now)
@@ -795,11 +1024,15 @@ def _after_submit(sym: str, its: list[dict], decided: dict, now: datetime, short
             res["action"] = f"补足 买入 {sym} {i['notional']:,.0f} USD{tag}"
             set_why(d, "topup", f"上次买入只部分成交，今天补买 {i['notional']:,.0f} USD" + (f"（{short}）" if short else ""))
             _lend_done_if_bought(short)
-        elif i["purpose"] in ("rebalance_buy", "rebalance_sell"):
-            res["action"] = (f"再平衡 {'买入' if i['side'] == 'buy' else '卖出'} {sym} "
-                             + (f"{i['notional']:,.0f} USD" if i["side"] == "buy" else f"{i['qty']:.4f} 股") + tag)
-            res["clear_rebalance"] = True
-            set_why(d, "rebalance", f"{i['reason']}，已下单 {res['action']}")
+        elif i["purpose"] == "add":
+            e0 = dict(res.get("entry_new") or res.get("entry") or {})
+            e0.update(target=round(float(e0.get("target") or 0) + i["notional"], 2), target_pct=i["new_target_pct"])
+            res["entry_new"] = e0
+            res["action"] = f"加仓 买入 {sym} {i['notional']:,.0f} USD{tag}"
+            set_why(d, "add", f"{i['reason']}，已下单 {res['action']}" + (f"；{short}" if short else ""))
+        elif i["purpose"] == "cap":
+            res["action"] = f"减到上限 卖出 {sym} {i['qty']:.4f} 股{tag}"
+            set_why(d, "cap", f"{i['reason']}，已下单 {res['action']}")
         else:
             res["action"] = f"卖出全部 {sym}{tag}"
             res["entry_new"] = None
@@ -881,8 +1114,8 @@ def _lending(deps: list[dict], sigs: dict, holding: dict, now: datetime, cash: f
 def after_close(now: datetime | None = None) -> dict | None:
     """美股收盘后（收盘 15 分钟起，含周末、节假日）：用刚收盘的日线确认下一交易日信号。
     - 借出中且有空仓部署确认买入 → 进入收回（BTC 下一个美股开盘前按借用比例减仓）。
-    - 每个持仓部署：实际仓位与目标的偏离超过阈值 → 记 rebalance_due，下一交易日开盘后再平衡。
-    每个收盘日只确认一次。"""
+    - 有止损规则的持仓：挂好下一交易日的 DAY 止损单。
+    价格涨跌造成的偏离不再再平衡（2026-10-30 决定）。每个收盘日只确认一次。"""
     from .. import market as mk
     from .. import allocation as ab
     ensure_migrated()
@@ -941,30 +1174,14 @@ def after_close(now: datetime | None = None) -> dict | None:
             for dep in buyers:
                 set_why(dep, "reclaim", f"{last} 收盘后确认买入信号：BTC 在 {nxt} 美股开盘前按借用比例减仓，开盘后先还款再买入 "
                                         f"{effective(dep)['trade_symbol']}")
-    # 偏离目标 → 下一交易日再平衡
-    acct = etf_trend._account() or {}
-    equity = float(acct.get("equity") or 0)
-    plan = ab.plan_us(equity, deps)
-    rbp = float(ab.layer1(equity, deps)["rebalance_pp"])
     for dep in deps:
-        s, held, sym = sigs[dep["id"]]
-        info = {"regime": s["regime"], "held": held}
-        if held and s["regime"] == 1 and equity > 0:
-            q = us_ledger.position(dep["id"], sym)["qty"]
-            mv = q * float(_close_of(sym, last) or 0)
-            budget = float((plan.get(dep["id"]) or {}).get("budget") or 0)
-            dev = (mv - budget) / equity * 100
-            info.update(actual_pct=round(mv / equity * 100, 2), target_pct=round(budget / equity * 100, 2), dev_pp=round(dev, 2))
-            st = dep_state(dep)
-            if abs(dev) > rbp and budget > 0:
-                st["rebalance_due"] = {"date": str(last), "dev_pp": round(dev, 2), "threshold": rbp}
-                _save_state(dep, st)
-                _log(dep, "INFO", f"{last} 收盘：实际仓位 {mv / equity:.1%}、目标 {budget / equity:.1%}，偏离 {dev:+.1f} 个百分点"
-                                  f"（阈值 {rbp:g}）→ {nxt} 开盘后再平衡")
-            elif st.get("rebalance_due"):
-                st.pop("rebalance_due", None)
-                _save_state(dep, st)
-        out["deployments"][dep["id"]] = info
+        s_, held, sym = sigs[dep["id"]]
+        out["deployments"][dep["id"]] = {"regime": s_["regime"], "held": held}
+    # 有止损规则的持仓：挂好下一交易日的 DAY 止损单（开盘就生效，跳空低开时按开盘价附近成交，与回测一致）
+    try:
+        out["stops"] = maintain_stops(now)
+    except Exception:  # noqa: BLE001
+        log.warning("after-close stop placement failed", exc_info=True)
     db.set_setting("us_after_close", out)
     return out
 
@@ -1010,9 +1227,17 @@ def explain(dep: dict, equity: float | None = None) -> dict:
     if equity:
         pl = ab.plan_us(equity, deployments()).get(dep["id"]) or {}
         calc.append(("资金额度（第二层）", f"{pl.get('budget', 0):,.0f} USD：{pl.get('why', '--')}"))
-    if st.get("rebalance_due"):
-        rd = st["rebalance_due"]
-        items.append(("待再平衡", f"{rd['date']} 收盘偏离 {rd['dev_pp']:+.1f} 个百分点（阈值 {rd['threshold']:g}），下一交易日开盘后调整"))
+    try:
+        from .. import allocation
+        ts = allocation.trial_status(dep)
+        items.append(("试用期", ts["text"] + ("：固定额度从现金层出，满期后参与按实力分配" if ts["trial"] else "")))
+    except Exception:  # noqa: BLE001
+        pass
+    sp = stop_plan(dep)
+    if sp:
+        os_ = us_ledger.open_stop(dep["id"])
+        items.append(("止损", f"{sp['why']}；" + (f"券商止损单 {os_['qty']:.4f} 股 @ {os_['stop_price']:,.2f}（{os_['trade_date']}）"
+                                                if os_ else ("交易时段内每 5 分钟检查最新价" if sp.get("poll") else "下一次检查时挂单"))))
     if dep["config"].get("pending_switch"):
         items.append(("待切换", "有持仓或未完成订单，空仓后切换到新版本"))
     if e.get("pending_offline"):

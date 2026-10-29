@@ -415,7 +415,9 @@ def etf_backtest(df: pd.DataFrame, sma: int, band: float, start: str, end: str) 
     from . import market as mk
     from . import rhythm
     from .engine import regime_bt
-    return regime_bt.backtest(df, sma, band, start, end, market=mk.US_EQUITY, rhythm=rhythm.current(mk.US_EQUITY))
+    from . import allocation
+    return regime_bt.backtest(df, sma, band, start, end, market=mk.US_EQUITY, rhythm=rhythm.current(mk.US_EQUITY),
+                              cap_frac=allocation.backtest_cap_frac(allocation.get_config()["us_equity"]["target"]))
 
 
 def etf_round(run_id: int | None = None) -> dict:

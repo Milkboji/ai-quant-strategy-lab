@@ -5,6 +5,8 @@ headless = true
 runOnSave = false
 # 不监视源码文件：避免运行中更新代码时部分模块被热重载，导致前后台使用不同版本的类
 fileWatcherType = "none"
+# 健康检查文件 static/health.json（只有状态和时间戳），外部心跳监控通过 /app/static/health.json 读取
+enableStaticServing = true
 
 [browser]
 gatherUsageStats = false

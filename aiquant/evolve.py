@@ -872,11 +872,23 @@ def plan_budgets(equity: float, deps: list[dict], cfgv: dict | None = None) -> d
             total = equity * (1 - (float(c["reserve_pct"]) + other) / 100)
     except Exception:  # noqa: BLE001
         total = equity * (1 - (float(c["reserve_pct"]) + other) / 100)
+    plan: dict[int, dict] = {}
+    try:   # 试用期部署：固定额度从现金层出，不参与按实力分配（allocation.trial_plan）
+        from . import allocation
+        tr = [d for d in deps if not d.get("is_test") and allocation.is_trial(d)]
+        if tr:
+            tp = allocation.trial_plan(equity)
+            for d in tr:
+                t = tp.get(d["id"]) or {"budget": 0.0, "why": "试用中", "pct": 0.0}
+                plan[d["id"]] = {"budget": int(t["budget"] // 100 * 100), "weight": None, "why": t["why"],
+                                 "detail": {"method": "trial", "pct": t.get("pct")}, "share_pct": None, "trial": True}
+            deps = [d for d in deps if d["id"] not in plan]
+    except Exception:  # noqa: BLE001
+        log.exception("trial plan failed")
     paused = [d for d in deps if d["status"] == "paused_entries"]
     running = [d for d in deps if d["status"] == "running"]
     floor = equity * float(c["paused_floor_pct"]) / 100
     wmin, wmax = float(c["weight_min"]), float(c["weight_max"])
-    plan: dict[int, dict] = {}
     n_floor = 0
     for d in paused:
         if ((d.get("config") or {}).get("auto_pause") or {}).get("kind") == "long":
@@ -929,7 +941,9 @@ def rebalance(equity: float | None = None) -> list[str]:
     deps = [pr.get_deployment(d["id"]) for d in db.q(
         "SELECT id FROM paper_deployments WHERE broker='alpaca_paper' AND is_test=0 "
         "AND status IN ('running','paused_entries') ORDER BY id")]
-    if not deps:
+    n_us = db.q1("SELECT COUNT(*) AS n FROM paper_deployments WHERE broker='alpaca_us' AND is_test=0 "
+                 "AND status IN ('running','paused_entries')")["n"]
+    if not deps and not n_us:
         return []
     if equity is None:
         from .paper.brokers import AlpacaPaperAdapter
@@ -937,7 +951,7 @@ def rebalance(equity: float | None = None) -> list[str]:
         if a is None:
             return []
         equity = a.equity
-    plan = plan_budgets(equity, deps, c)
+    plan = plan_budgets(equity, deps, c) if deps else {}
     out = []
     for d in deps:
         p = plan[d["id"]]
@@ -950,8 +964,9 @@ def rebalance(equity: float | None = None) -> list[str]:
         _save_cfg(d["id"], cfg)
         pr.event(d["id"], "INFO", f"资金额度调整：{old:,} → {p['budget']:,} USD（{p['why']}）", False)
         out.append(f"#{d['id']} {old:,}→{p['budget']:,}")
-    try:   # 第二层（美股内部）：同一实力公式
+    try:   # 第二层（美股内部）：同一实力公式；试用期满的先转为正式
         from . import allocation
+        out += allocation.graduate_trials()
         out += allocation.rebalance_us(equity)
     except Exception:  # noqa: BLE001
         log.exception("us rebalance failed")

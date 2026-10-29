@@ -37,12 +37,17 @@ class FakeUS:
         self.sent: list[dict] = []
         self.fill_ratio: dict[str, float] = {}
         self.reject: set[str] = set()
+        self.reject_stops: str | None = None
+        self.resting: dict[str, dict] = {}
+        self.canceled: list[str] = []
         self.min_cash = cash
 
     def install(self, monkeypatch, bars: dict | None = None) -> "FakeUS":
         from aiquant.paper import etf_trend as et
         from aiquant.paper import us_exec
         monkeypatch.setattr(et, "_submit", self.submit)
+        monkeypatch.setattr(et, "_cancel", self.cancel)
+        monkeypatch.setattr(et, "_latest_price", lambda sym: self.prices.get(sym))
         monkeypatch.setattr(et, "_position", self.position)
         monkeypatch.setattr(et, "_account", self.account)
         monkeypatch.setattr(et, "_clock", lambda: {"is_open": True})
@@ -63,9 +68,23 @@ class FakeUS:
         q = self.pos.get(sym, 0.0)
         return {"qty": q, "market_value": q * self.prices.get(sym, 0), "avg_entry_price": 0, "unrealized_pl": 0}
 
-    def submit(self, sym, side, notional=None, qty=None, coid=None, **kw):
-        if sym in self.reject:
-            raise RuntimeError("Alpaca Paper 拒绝订单 403: test reject")
+    def submit(self, sym, side, notional=None, qty=None, coid=None, order_type="market", stop_price=None, **kw):
+        if sym in self.reject or (order_type == "stop" and self.reject_stops):
+            raise RuntimeError(self.reject_stops if order_type == "stop" and self.reject_stops
+                               else "Alpaca Paper 拒绝订单 403: test reject")
+        if order_type == "stop":          # 止损单：挂着，等 trigger_stops 按价格触发
+            assert side == "sell" and qty is not None and stop_price is not None
+            reserved = sum(o["qty"] for o in self.resting.values() if o["symbol"] == sym)
+            assert reserved + float(qty) <= self.pos.get(sym, 0.0) + 1e-9, "止损单股数超过可用持仓"
+            oid = f"stop-{len(self.orders) + 1}"
+            self.resting[oid] = {"id": oid, "symbol": sym, "qty": float(qty), "stop": float(stop_price), "coid": coid}
+            self.orders[coid] = {"id": oid, "client_order_id": coid, "status": "accepted", "filled_qty": "0",
+                                 "filled_avg_price": None}
+            self.sent.append({"symbol": sym, "side": side, "qty": qty, "coid": coid, "type": "stop", "stop": stop_price})
+            return dict(self.orders[coid])
+        if side == "sell":                # 普通卖单：已被止损单占用的股数不能卖
+            reserved = sum(o["qty"] for o in self.resting.values() if o["symbol"] == sym)
+            assert float(qty) <= self.pos.get(sym, 0.0) - reserved + 1e-9, "卖出股数被挂着的止损单占用（应先撤单）"
         px = self.prices[sym]
         ratio = self.fill_ratio.get(sym, 1.0)
         want = notional / px if notional is not None else float(qty)
@@ -83,6 +102,27 @@ class FakeUS:
                              "filled_qty": str(q), "filled_avg_price": str(px)}
         self.sent.append({"symbol": sym, "side": side, "notional": notional, "qty": qty, "coid": coid, "filled": q})
         return {"status": "accepted", "client_order_id": coid}
+
+    def cancel(self, order_id):
+        o = self.resting.pop(order_id, None)
+        if o is None:
+            return False
+        self.orders[o["coid"]]["status"] = "canceled"
+        self.canceled.append(order_id)
+        return True
+
+    def trigger_stops(self, sym: str, low: float, open_px: float | None = None) -> list[str]:
+        """当天最低价 low 触及止损价 → 按 min(开盘价, 止损价) 成交（跳空低开时按开盘价）。"""
+        hit = []
+        for oid, o in list(self.resting.items()):
+            if o["symbol"] == sym and low <= o["stop"]:
+                px = min(open_px if open_px is not None else o["stop"], o["stop"])
+                self.pos[sym] -= o["qty"]
+                self.cash += o["qty"] * px
+                self.orders[o["coid"]].update(status="filled", filled_qty=str(o["qty"]), filled_avg_price=str(px))
+                del self.resting[oid]
+                hit.append(oid)
+        return hit
 
     def paper_get(self, path, params=None):
         if path == "/v2/orders:by_client_order_id":

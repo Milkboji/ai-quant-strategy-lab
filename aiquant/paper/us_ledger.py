@@ -121,9 +121,10 @@ def reconcile(broker_positions: dict[str, float], symbols: list[str] | None = No
     return out
 
 
-def has_open(did: int | None = None, symbol: str | None = None) -> bool:
+def has_open(did: int | None = None, symbol: str | None = None, include_stops: bool = False) -> bool:
+    """有没有还没终结的订单份额。挂着的保护性止损单（purpose='stop'）默认不算（它们每天都挂着，不能挡住正常动作）。"""
     ensure_tables()
-    sql = ("SELECT a.id FROM us_order_allocs a WHERE a.status='open'"
+    sql = ("SELECT a.id FROM us_order_allocs a WHERE a.status='open'" + ("" if include_stops else " AND COALESCE(a.purpose,'')<>'stop'")
            + (" AND a.deployment_id=?" if did is not None else "") + (" AND a.symbol=?" if symbol else ""))
     args = tuple(x for x in (did, symbol) if x is not None)
     return db.q1(sql + " LIMIT 1", args) is not None
@@ -267,6 +268,21 @@ def unallocated_final() -> list[dict]:
     ensure_tables()
     return db.q("SELECT * FROM us_orders WHERE allocated=0 AND status NOT IN "
                 f"({','.join('?' * len(OPEN))}) ORDER BY id", OPEN)
+
+
+def open_stop(did: int) -> dict | None:
+    """该策略挂在券商的止损单（未终结）：{alloc_id, order_id, client_order_id, broker_id, qty, stop_price, trade_date}。"""
+    ensure_tables()
+    r = db.q1("SELECT a.id AS alloc_id, a.req_qty AS qty, a.trade_date, o.id AS order_id, o.client_order_id, o.raw_json, "
+              "o.ref_price AS stop_price, o.status FROM us_order_allocs a JOIN us_orders o ON o.id=a.order_id "
+              "WHERE a.deployment_id=? AND a.purpose='stop' AND a.status='open' ORDER BY a.id DESC LIMIT 1", (did,))
+    if not r:
+        return None
+    try:
+        r["broker_id"] = (json.loads(r.pop("raw_json") or "{}") or {}).get("id")
+    except ValueError:
+        r["broker_id"] = None
+    return r
 
 
 def allocs_for(did: int, limit: int = 50) -> list[dict]:

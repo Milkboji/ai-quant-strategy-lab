@@ -302,6 +302,7 @@ def rows(broker: str = "alpaca_paper", price: float | None = None) -> list[dict]
             "challenger": _challenger_for(dep["id"] if dep else None),
             "awaiting": _awaiting_for(dep["id"] if dep else None),
             "lock": lock_state(dep), "block": promotion_block(dep) if dep else None,
+            "trial": _trial_text(dep),
             "market": "us_equity" if is_us else "crypto",
             "trade_symbol": dep["config"].get("trade_symbol") if is_us else ("BTC/USD" if dep else None),
             "qty": qty, "value": us_value if is_us else (qty * price if price else None),
@@ -312,6 +313,16 @@ def rows(broker: str = "alpaca_paper", price: float | None = None) -> list[dict]
                     explain(dep, plans.get(dep["id"]) if dep else None, price, vol)) if dep else None,
         })
     return out
+
+
+def _trial_text(dep: dict | None) -> str | None:
+    if not dep:
+        return None
+    try:
+        from . import allocation
+        return allocation.trial_status(dep)["text"]
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _us_explain(dep: dict, equity: float | None) -> dict:
@@ -420,9 +431,10 @@ def deploy_version(key: str, version_id: int, *, actor: str | None, role: str | 
         return res
     cfg = {"label": _label(key, v, tf), "strategy_key": key, "signal_tf": tf, "aux_tf": aux,
            "alloc_pct": 100, "portfolio": True, "stop_mode": "keep", "deployed_by": actor or "用户"}
-    budget = _initial_budget(broker)
-    if budget is not None:
-        cfg["budget_usd"] = budget
+    if broker == "alpaca_paper":   # 新部署进入试用期：固定额度从现金层出，不摊薄正式策略（evolve.rebalance 分配）
+        from . import allocation
+        cfg = allocation.start_trial(cfg, "crypto")
+        cfg["budget_usd"] = 0
     if broker == "mock":
         from . import research
         cfg["fee_bps"] = research.get_research()["fee_bps"]
@@ -486,6 +498,8 @@ def _deploy_us(key: str, v: dict, *, actor: str | None, role: str | None, broker
               "；".join(["美股日线执行器"] + notes))
         return res
     out = us_exec.deploy_lab(key, v, actor=actor, label_=_label(key, v, 1440), is_test=broker == "mock")
+    from . import allocation
+    _save_cfg(out["deployment_id"], allocation.start_trial(pr.get_deployment(out["deployment_id"])["config"], "us_equity"))
     did = out["deployment_id"]
     try:
         pr.start(did)

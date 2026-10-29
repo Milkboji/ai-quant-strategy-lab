@@ -22,3 +22,5 @@ config/cloudflared.yml
 tools/cloudflared.exe
 config/auth.json.bak
 BUILD_INFO.json
+static/health.json
+static/health.tmp

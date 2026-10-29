@@ -379,3 +379,61 @@ def test_cash_guard_never_uses_margin_and_exposure_alert(env, monkeypatch):
     assert x["over"] and x["negative_cash"] and sent == ["exposure_high"]
     cg.exposure_check({"equity": 100_000, "long_market_value": 130_000, "cash": -30_000})
     assert sent == ["exposure_high"]                                         # 每天只告警一次
+
+
+def test_btc_position_cap_trims_to_50pct_of_equity(live, monkeypatch):
+    """BTC 同样受单个策略持仓上限约束：持仓市值超过账户权益的 50% → 卖出超出部分；额度调整本身不强制卖出。"""
+    fake, did0 = live
+    d0 = db.q1("SELECT * FROM paper_deployments WHERE id=?", (did0,))
+    did = db.ex("INSERT INTO paper_deployments(version_id,config_json,broker,status,created_at,updated_at,is_test) "
+                "VALUES(?,?,?,?,?,?,1)", (d0["version_id"], d0["config_json"], "alpaca_paper", "configured",
+                                          db.now_iso(), db.now_iso()))
+    pr.start(did)
+    end = datetime(2026, 1, 10, tzinfo=UTC)
+    df = _bars(end, days=10, trend=0.0003)
+    fake.price = float(df["close"].iloc[-1])
+    run = pr.PaperRunner(did)
+    base = run.ledger_qty_all()
+    try:
+        q = 0.9 * 100_000 / fake.price                    # 本策略持有约 90% 权益的 BTC（台账与券商一致）
+        db.ex("INSERT INTO paper_orders(deployment_id,client_order_id,broker,side,qty,status,filled_qty,filled_price,"
+              "created_at,updated_at,is_test) VALUES(?,?,?,?,?,?,?,?,?,?,1)",
+              (did, f"cap-test-{did}", "alpaca_paper", "buy", q, "filled", q, fake.price, db.now_iso(), db.now_iso()))
+        fake.qty, fake.cash = base + q, 100_000 - q * fake.price - base * fake.price
+        r = run.step(df, end + timedelta(minutes=5))
+        assert r["action"] == "sell" and "风控上限" in r["reason"], r
+        eq = fake.cash + fake.qty * fake.price
+        assert run.ledger_qty() * fake.price <= 0.5 * eq * 1.01
+    finally:
+        pr.stop(did)
+
+
+def test_new_btc_deployment_enters_trial_with_cash_layer_budget(env, monkeypatch):
+    """策略总台部署一个之前没在运行的 BTC 策略 → 试用期，额度先为 0，由按实力分配从现金层给固定试用额度。"""
+    from aiquant import allocation
+    from aiquant import console
+    cfg = allocation.start_trial({"label": "x"}, "crypto", datetime(2026, 10, 1, tzinfo=UTC))
+    assert cfg["trial"]["unit"] == "days"
+    st = allocation.trial_status({"config": cfg}, datetime(2026, 11, 15, tzinfo=UTC))
+    assert st["trial"] and st["text"] == "试用中（45/60）"
+    assert not allocation.trial_status({"config": cfg}, datetime(2026, 11, 30, 1, tzinfo=UTC))["trial"]
+    from aiquant import evolve
+    from aiquant.paper import runner as pr2
+    mk_dep = lambda c: db.ex("INSERT INTO paper_deployments(version_id,config_json,broker,status,created_at,updated_at,"  # noqa: E731
+                             "is_test) VALUES(1,?,?,?,?,?,0)", (json.dumps(c, ensure_ascii=False), "alpaca_paper", "running",
+                                                                 db.now_iso(), db.now_iso()))
+    formal = mk_dep({"label": "正式", "budget_usd": 50_000})
+    trial = mk_dep(allocation.start_trial({"label": "试用", "budget_usd": 0}, "crypto"))
+    try:
+        deps = [pr2.get_deployment(formal), pr2.get_deployment(trial)]
+        p0 = evolve.plan_budgets(100_000, [deps[0]])
+        p1 = evolve.plan_budgets(100_000, deps)
+        assert p1[trial]["trial"] and p1[trial]["budget"] == 0 and "现金层没有空余" in p1[trial]["why"]
+        assert p1[formal]["budget"] == p0[formal]["budget"]                   # 新部署不摊薄正式策略
+        allocation.set_config(actor="t", role="trader", crypto_max=50)
+        p2 = evolve.plan_budgets(100_000, [pr2.get_deployment(formal), pr2.get_deployment(trial)])
+        assert p2[trial]["budget"] == 5_000 and "从现金层出" in p2[trial]["why"]
+        assert console._trial_text(pr2.get_deployment(trial)).startswith("试用中（0/60）")
+    finally:
+        allocation.set_config(actor="t", role="trader", crypto_max=100)
+        db.ex("UPDATE paper_deployments SET status='stopped' WHERE id IN (?,?)", (formal, trial))

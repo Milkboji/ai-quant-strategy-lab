@@ -55,6 +55,11 @@ def tick(now: datetime | None = None) -> list[dict]:
     df5 = df5.reset_index(drop=True)
     if len(df5):   # 最新 BTC 价格：估算未成交买单占用的现金（下单前现金检查用）
         db.set_setting("btc_last_price", {"price": float(df5["close"].iloc[-1]), "at": db.now_iso()})
+    try:   # 恢复后第一次检查：列出中断期间出现过的 BTC 入场信号（不补单）
+        from .. import uptime
+        uptime.catchup_signals(df5)
+    except Exception:  # noqa: BLE001
+        log.error("catchup signals error: %s", traceback.format_exc())
     try:   # 自动进化产生的新版本：空仓时切换
         from .. import evolve
         if evolve.apply_all_pending():
@@ -101,6 +106,11 @@ def tick(now: datetime | None = None) -> list[dict]:
 def _loop() -> None:
     while True:
         t0 = time.time()
+        try:   # 中断检测（距上次心跳超过 3 分钟 → 记录中断、写明错过的检查、本轮立即补检查）+ 健康检查文件
+            from .. import uptime
+            uptime.beat()
+        except Exception:  # noqa: BLE001
+            log.error("uptime beat error: %s", traceback.format_exc())
         try:
             if http.paper_orders_unlocked():
                 tick()

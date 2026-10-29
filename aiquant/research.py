@@ -182,15 +182,18 @@ def cost_model(r: dict, market=None) -> CostModel:
                      spread_bps=float(r["spread_bps"]), spread_source="冻结代理模型（未使用历史逐笔报价）")
 
 
-def bt_config(start: datetime, end: datetime, r: dict, market=None) -> bt.BTConfig:
+def bt_config(start: datetime, end: datetime, r: dict, market=None, account_share_pct: float | None = None) -> bt.BTConfig:
     """唯一的回测配置入口：策略实验室、自动进化、挑战者检验、长周期体检都从这里构造，
-    成本按市场、交易节奏按当前规则（与模拟盘一致）。"""
+    成本按市场、交易节奏按当前规则（与模拟盘一致）。
+    单个策略持仓上限按账户口径换算：上限% ÷ 该策略额度占账户的比例（account_share_pct；为空按新部署的试用额度）。"""
     from . import market as mk
     from . import rhythm
     m = market or mk.of_symbol(r.get("symbol"))
+    from . import allocation
     return bt.BTConfig(start=start, end=end, initial_cash=float(r["initial_cash"]),
                        max_alloc_pct=float(r["max_alloc_pct"]), cost=cost_model(r, m),
-                       rhythm=rhythm.current(m), market=m)
+                       rhythm=rhythm.current(m), market=m,
+                       position_cap_frac=allocation.backtest_cap_frac(account_share_pct))
 
 
 def effective_tf(slot: dict, schema: dict, r: dict) -> tuple[int, int | None]:

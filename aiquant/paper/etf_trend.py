@@ -226,10 +226,14 @@ def _account() -> dict | None:
 
 
 def _submit(sym: str, side: str, *, notional: float | None = None, qty: float | None = None,
-            signal_date: str | None = None, reason: str | None = None, coid: str | None = None) -> dict:
-    """向 Alpaca Paper 提交当日有效（DAY）市价单。迁移后由通用美股执行器调用（订单与分账记在 us_orders / us_order_allocs）。"""
+            signal_date: str | None = None, reason: str | None = None, coid: str | None = None,
+            order_type: str = "market", stop_price: float | None = None) -> dict:
+    """向 Alpaca Paper 提交当日有效（DAY）订单：市价单，或止损单（order_type="stop"，碎股只支持 DAY）。
+    迁移后由通用美股执行器调用（订单与分账记在 us_orders / us_order_allocs）。"""
     coid = coid or f"etf-{sym.lower()}-{side}-{signal_date}-{uuid.uuid4().hex[:6]}"
-    body = {"symbol": sym, "side": side, "type": "market", "time_in_force": "day", "client_order_id": coid}
+    body = {"symbol": sym, "side": side, "type": order_type, "time_in_force": "day", "client_order_id": coid}
+    if order_type == "stop":
+        body["stop_price"] = f"{float(stop_price):.2f}"
     if notional is not None:
         body["notional"] = f"{notional:.2f}"
     else:
@@ -239,6 +243,27 @@ def _submit(sym: str, side: str, *, notional: float | None = None, qty: float | 
     if r.status_code not in (200, 201):
         raise RuntimeError(f"Alpaca Paper 拒绝订单 {r.status_code}: {r.text[:160]}")
     return info
+
+
+def _cancel(order_id: str) -> bool:
+    """撤销一笔券商订单（美股止损单）。成功或订单已不存在 → True；已成交、不能撤 → False。"""
+    r = http.request("DELETE", f"{config.ALPACA_PAPER_URL}/v2/orders/{order_id}", headers=alpaca._paper_headers())
+    if r.status_code in (200, 204, 404):
+        return True
+    log.warning("cancel %s failed %s %s", order_id, r.status_code, r.text[:160])
+    return False
+
+
+def _latest_price(sym: str) -> float | None:
+    """最新成交价（IEX，免费行情）：用于交易时段内每 5 分钟检查止盈 / 轮询止损。取不到返回 None。"""
+    try:
+        r = http.request("GET", f"{config.ALPACA_DATA_URL}/v2/stocks/{sym}/trades/latest",
+                         headers=alpaca._data_headers(), params={"feed": "iex"}, timeout=10)
+        if r.status_code == 200:
+            return float((r.json().get("trade") or {}).get("p") or 0) or None
+    except Exception:  # noqa: BLE001
+        log.warning("latest price %s failed", sym, exc_info=True)
+    return None
 
 
 def sync_orders() -> None:

@@ -173,8 +173,11 @@ def test_deploy_all_keeps_running_version(clean, monkeypatch):
         d = pr.get_deployment(did)
         assert d["version_id"] == v1["id"]
         assert d["config"]["label"] == cfg["label"] and d["config"]["signal_tf"] == 60
-        assert d["config"]["budget_usd"] == 96_000
-        assert any("未自动替换" in m for m in res)
+        # 已在运行的策略：不按「一键部署」平均分配重置额度（新部署不得摊薄现有策略），额度仍由按实力分配决定
+        from aiquant import evolve
+        assert d["config"]["budget_usd"] != 96_000
+        assert d["config"]["budget_usd"] == evolve.plan_budgets(100_000.0, [d])[d["id"]]["budget"]
+        assert any("未自动替换" in m for m in res) and any("保持不变" in m for m in res)
         r = _row("slot:3", broker="alpaca_paper")
         assert r["mismatch"] and r["lab"]["id"] == v2["id"] and r["weight_pct"] is not None
         assert any("周期" in k or "signal_tf" in k for k, _, _ in r["diff"])

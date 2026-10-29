@@ -107,14 +107,18 @@ def deploy_all(reserve_pct: float = 4.0, *, actor: str | None = None, role: str 
                        (v["lineage_id"],))
             if ex:
                 ex = pr.get_deployment(ex["id"])
-        if ex:
+        if ex:   # 已在运行：保持原额度（新部署不得摊薄现有策略，额度由按实力分配决定）
             cfg = ex["config"]
-            cfg.update({"budget_usd": budget, "alloc_pct": 100, "portfolio": True, "strategy_key": t["key"]})
+            first = not cfg.get("portfolio")
+            cfg.update({"alloc_pct": 100, "portfolio": True, "strategy_key": t["key"]})
+            if first and not cfg.get("budget_usd"):
+                cfg["budget_usd"] = budget
             cfg.setdefault("stop_mode", "keep")
             db.ex("UPDATE paper_deployments SET config_json=?, updated_at=? WHERE id=?",
                   (json.dumps(cfg, ensure_ascii=False), db.now_iso(), ex["id"]))
             did = ex["id"]
-            pr.event(did, "INFO", f"加入策略组合，资金额度 {budget:,} USD")
+            if first:
+                pr.event(did, "INFO", f"加入策略组合，资金额度 {float(cfg.get('budget_usd') or 0):,.0f} USD")
             if ex["version_id"] != v["id"]:
                 run = registry.get_version(ex["version_id"])
                 out.append(f"ℹ {t['label']}：实验室有新版本，运行中的仍是 {registry.label(run)}，"
@@ -127,8 +131,10 @@ def deploy_all(reserve_pct: float = 4.0, *, actor: str | None = None, role: str 
             continue
         b = (research.latest_backtest_for_version(v["id"], kind_split="训练集")
              or research.latest_backtest_for_version(v["id"]))
-        cfg = {"label": t["label"], "budget_usd": budget, "alloc_pct": 100, "signal_tf": b["signal_tf"],
+        from .. import allocation
+        cfg = {"label": t["label"], "budget_usd": 0, "alloc_pct": 100, "signal_tf": b["signal_tf"],
                "aux_tf": b["aux_tf"], "portfolio": True, "stop_mode": "keep", "strategy_key": t["key"]}
+        cfg = allocation.start_trial(cfg, "crypto")     # 新部署进入试用期：固定额度从现金层出
         t["did"] = pr.save_deployment(v["id"], cfg, "alpaca_paper")
         t["new"] = True
     for t in ts:
@@ -136,17 +142,22 @@ def deploy_all(reserve_pct: float = 4.0, *, actor: str | None = None, role: str 
             continue
         d = pr.get_deployment(t["did"])
         if d["status"] in ("running", "paused_entries"):
-            out.append(f"✓ {t['label']}：运行中（部署 #{t['did']}，额度 {budget:,} USD）")
+            out.append(f"✓ {t['label']}：运行中（部署 #{t['did']}，额度 {float(d['config'].get('budget_usd') or 0):,.0f} USD，保持不变）")
             continue
         try:
             pr.start(t["did"])
-            out.append(f"✓ {t['label']}：已启动（部署 #{t['did']}，额度 {budget:,} USD）")
+            out.append(f"✓ {t['label']}：已启动（部署 #{t['did']}，试用期，额度从现金层出）")
             console.audit(actor, role, "一键部署", t["key"], t["version"]["name"], t["did"], None, d["version_id"],
                           "已启动")
         except Exception as e:  # noqa: BLE001
             out.append(f"✗ {t['label']}：{e}")
             console.audit(actor, role, "一键部署", t["key"], t["version"]["name"], t["did"], None, d["version_id"],
                           "启动失败", str(e))
+    try:   # 新部署的试用额度、正式部署按实力的额度（不强制卖出）
+        from .. import evolve
+        evolve.rebalance(acct.equity)
+    except Exception:  # noqa: BLE001
+        pass
     return out
 
 

@@ -57,6 +57,7 @@ class BTConfig:
     reserve_pct: float = 0.5
     rhythm: Rhythm | None = None
     market: object = None          # aiquant.market.Market；None = 加密货币
+    position_cap_frac: float | None = None   # 单个策略持仓上限（占本回测权益的比例，按账户口径换算；None = 不限）
 
 
 ASSUMPTIONS_DAILY = [
@@ -142,6 +143,10 @@ def run(df5: pd.DataFrame, s: StrategySchema, signal_tf: int, aux_tf: int | None
             events[fi] = int(mi)  # 多根主K线落在同一执行K线时保留最新一根
 
     alloc = min(s.alloc_pct, cfg.max_alloc_pct)
+    cap = cfg.position_cap_frac if (cfg.position_cap_frac is not None and cfg.position_cap_frac < 1.0) else None
+    if cap is not None:
+        alloc = min(alloc, cap * 100)
+    trim_next = False
     rh = cfg.rhythm if (cfg.rhythm is not None and cfg.rhythm.active) else None
     gate = Gate(rh, cfg.market) if rh else None
     if rh and (rh.regime_sma_days or rh.vol_target_pct):
@@ -184,9 +189,36 @@ def run(df5: pd.DataFrame, s: StrategySchema, signal_tf: int, aux_tf: int | None
         if gate is not None:
             gate.on_exit(pd.Timestamp(ts[i]).tz_localize("UTC"), reason, pnl)
 
+    def do_trim(i, target_qty):
+        """风控上限减仓：在第 i 根 K 线开盘卖出超出上限的部分，按比例拆出一笔成交记录（剩余仓位的成本同比例保留）。"""
+        nonlocal cash, qty, entry_fill
+        q = qty - target_qty
+        if q <= 1e-12:
+            return
+        f = fill("sell", o[i], q, cm)
+        cash += f.notional - f.fee
+        totals["fee"] += f.fee; totals["spread"] += f.spread_cost; totals["slip"] += f.slippage_cost
+        ef = entry_fill
+        p = q / qty
+        trades.append({
+            "entry_signal_ts": ef["signal_ts"], "entry_fill_ts": ef["ts"], "entry_price": ef["price"],
+            "exit_signal_ts": None, "exit_fill_ts": _iso(ts[i]), "exit_price": f.price, "qty": f.qty,
+            "fee": ef["fee"] * p + f.fee, "spread_cost": ef["spread"] * p + f.spread_cost,
+            "slippage_cost": ef["slip"] * p + f.slippage_cost, "exit_reason": "仓位上限减仓",
+            "pnl": (f.notional - f.fee) - (ef["notional"] + ef["fee"]) * p, "equity_after": cash,
+        })
+        entry_fill = dict(ef, notional=ef["notional"] * (1 - p), fee=ef["fee"] * (1 - p), spread=ef["spread"] * (1 - p),
+                          slip=ef["slip"] * (1 - p))
+        qty = target_qty
+
     for k, i in enumerate(range(i0, n)):
         if should_stop is not None and k % 4000 == 0 and should_stop():
             raise Cancelled()
+        if trim_next and qty > 0:     # 上一根 K 线收盘时超过上限 → 本根开盘减到上限
+            eq_open = cash + qty * o[i]
+            if qty * o[i] > cap * eq_open:
+                do_trim(i, cap * eq_open / o[i])
+        trim_next = False
         mi = events.get(i)
         exited_this_bar = False
         if mi is not None:
@@ -236,6 +268,8 @@ def run(df5: pd.DataFrame, s: StrategySchema, signal_tf: int, aux_tf: int | None
             else:
                 peak = max(peak, h[i])
         eq[k] = cash + qty * c[i]
+        if cap is not None and qty > 0 and qty * c[i] > cap * eq[k] * 1.005:
+            trim_next = True
         if cash < -1e-6:
             raise AssertionError("出现负现金，回测终止")
 

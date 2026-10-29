@@ -30,8 +30,9 @@ def _side_cost(market, side: str) -> float:
     return bps / 1e4
 
 
-def simulate(df: pd.DataFrame, sma: int, band: float, *, market=None, rhythm: Rhythm | None = None) -> pd.DataFrame:
-    """逐日模拟。df：index=美东交易日（naive Timestamp），列 sig_close / open / close（交易品种）。
+def simulate(df: pd.DataFrame, sma: int, band: float, *, market=None, rhythm: Rhythm | None = None,
+             cap_frac: float | None = None) -> pd.DataFrame:
+    """逐日模拟。cap_frac：单个策略持仓上限（占本策略资金的比例，按账户口径换算；None 或 ≥ 1 = 不限）。df：index=美东交易日（naive Timestamp），列 sig_close / open / close（交易品种）。
     返回每日一行：size（当日开盘后持有的仓位比例）、cost、r（开盘→次日开盘收益）、pr（净收益）、event、blocked。"""
     from .. import market as mk
     m = market or mk.US_EQUITY
@@ -65,6 +66,8 @@ def simulate(df: pd.DataFrame, sma: int, band: float, *, market=None, rhythm: Rh
             why = gate.check(t_open[i]) if gate else None
             if why is None:
                 cur = float(vmult[i])
+                if cap_frac is not None and cap_frac < 1.0:
+                    cur = min(cur, float(cap_frac))
                 cost[i] = cur * c_buy
                 eq_entry = eq
                 eq *= 1 - cost[i]
@@ -101,18 +104,18 @@ def metrics(sim: pd.DataFrame, start: str, end: str, periods_per_year: int = 252
 
 
 def backtest(df: pd.DataFrame, sma: int, band: float, start: str, end: str, *, market=None,
-             rhythm: Rhythm | None = None) -> dict:
+             rhythm: Rhythm | None = None, cap_frac: float | None = None) -> dict:
     from .. import market as mk
     m = market or mk.US_EQUITY
-    return metrics(simulate(df, sma, band, market=m, rhythm=rhythm), start, end, m.periods_per_year)
+    return metrics(simulate(df, sma, band, market=m, rhythm=rhythm, cap_frac=cap_frac), start, end, m.periods_per_year)
 
 
 def yearly(df: pd.DataFrame, sma: int, band: float, first_year: int, last_year: int, *, market=None,
-           rhythm: Rhythm | None = None) -> list[dict]:
+           rhythm: Rhythm | None = None, cap_frac: float | None = None) -> list[dict]:
     """逐个自然年的结果（长周期体检用）：一次模拟，按年切片。"""
     from .. import market as mk
     m = market or mk.US_EQUITY
-    sim = simulate(df, sma, band, market=m, rhythm=rhythm)
+    sim = simulate(df, sma, band, market=m, rhythm=rhythm, cap_frac=cap_frac)
     out = []
     for y in range(first_year, last_year + 1):
         k = metrics(sim, f"{y}-01-01", f"{y}-12-31", m.periods_per_year)

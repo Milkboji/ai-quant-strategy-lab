@@ -219,10 +219,16 @@ def shadow_record(day: str, now) -> dict | None:
 def us_promotion_status() -> dict:
     """美股节奏能否从影子模式转为生效（只转连亏刹车）：影子日志满 SHADOW_MIN_DAYS 个交易日，且没有计算错误或异常。"""
     from . import market as mk
+    from datetime import date as _date
+
+    from . import uptime
     start = shadow_count_from()
     recs = [r for r in shadow_log() if r.get("date", "") >= start]
     errs = [(r["date"], e) for r in recs for e in (r.get("errors") or [])]
-    days = sum(1 for r in recs if "streak" in r or r.get("note"))
+    out_rows = uptime.outages(f"{start}T00:00:00+00:00")
+    done = [r for r in recs if "streak" in r or r.get("note")]
+    broken = [r["date"] for r in done if not uptime.full_run_day(_date.fromisoformat(r["date"]), out_rows)]
+    days = len(done) - len(broken)     # 只计服务完整运行的交易日（开盘前 10 分钟到收盘后 30 分钟没有中断）
     today = datetime.now(timezone.utc).astimezone(mk.ET).date()
     try:
         from datetime import date as _d
@@ -243,8 +249,10 @@ def us_promotion_status() -> dict:
         text = f"影子模式已记录 {days} 个交易日（{start} 起），没有计算错误或异常：可以把连亏刹车切为生效（需管理员确认）"
     if missing and shadow:
         text += f"；服务未运行、没有记录的交易日 {len(missing)} 个（不计入天数）"
+    if broken and shadow:
+        text += f"；交易时段内服务中断过的交易日 {len(broken)} 个（{', '.join(broken[-5:])}，不计入天数）"
     return {"ready": ready, "days": days, "need": SHADOW_MIN_DAYS, "errors": errs, "missing": missing, "start": start,
-            "text": text, "shadow": shadow}
+            "text": text, "shadow": shadow, "interrupted": broken}
 
 
 def _maybe_review_notice() -> None:
@@ -418,8 +426,10 @@ def etf_long_metrics(compute: bool = False) -> dict | None:
     end = str(df.index[-1].date())
     if cached and cached.get("rules") == sig and cached.get("params") == p and cached.get("hist_end") == end:
         return cached
+    from . import allocation
     years = regime_bt.yearly(df, p["sma"], p["band"], max(2017, df.index[0].year + 1), df.index[-1].year,
-                             market=mk.US_EQUITY, rhythm=configured(mk.US_EQUITY))
+                             market=mk.US_EQUITY, rhythm=configured(mk.US_EQUITY),
+                             cap_frac=allocation.backtest_cap_frac(allocation.get_config()["us_equity"]["target"]))
     if not years:
         return None
     mr = sum(y["ret"] for y in years) / len(years)
