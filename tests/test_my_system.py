@@ -158,6 +158,7 @@ def sys_env(env, monkeypatch):
         db.ex(f"DELETE FROM {t}")
     db.set_setting("capital_layers", None)
     db.set_setting("upgrade::my_system_v1_deploy", None)
+    db.set_setting("upgrade::my_system_adjust_1030", None)
 
 
 def test_freeze_dedupes_validates_and_audits(sys_env):
@@ -173,7 +174,7 @@ def test_freeze_dedupes_validates_and_audits(sys_env):
     assert a and "卖一半的倍数" in a["detail"]
 
 
-def test_initial_deploy_lowers_crypto_cap_and_starts_two_trials(sys_env, monkeypatch):
+def test_initial_deploy_lowers_crypto_cap_and_starts_crypto_trial_only(sys_env, monkeypatch):
     from aiquant import allocation, console
     from aiquant.data import http
     S = sys_env
@@ -182,19 +183,64 @@ def test_initial_deploy_lowers_crypto_cap_and_starts_two_trials(sys_env, monkeyp
     out = S.initial_deploy()
     assert float(allocation.get_config()["crypto"]["max"]) == 56.0
     deps = S.deployments()
-    assert {d["config"]["market"] for d in deps} == {"crypto", "us_equity"}
-    for d in deps:
-        assert allocation.trial_status(d)["trial"] and d["broker"] == "alpaca_us"
+    assert [d["config"]["market"] for d in deps] == ["crypto"]           # 美股 v1 不部署（10-30 下午）
+    assert deps[0]["config"]["symbols"] == ["BTC/USD", "ETH/USD"]
+    v = S.get_version(deps[0]["version_id"])
+    assert v["params"]["be_r"] == 0.0 and v["params"]["add_rule"] == "quiet3"   # 保本止损关闭
+    assert allocation.trial_status(deps[0])["trial"] and deps[0]["broker"] == "alpaca_us"
     tp = allocation.trial_plan(100_000)
-    assert sum(tp[d["id"]]["budget"] for d in deps) == pytest.approx(10_000, rel=0.05)   # 现金层腾出的 10%
+    assert tp[deps[0]["id"]]["budget"] == pytest.approx(5_000, rel=0.05)   # 只占一个 5%，另外 5% 留在现金层
     assert db.q("SELECT * FROM strategy_audit WHERE action='部署' AND strategy_key LIKE 'my_system:%'")
-    assert "crypto" in out and "us_equity" in out
-    # 再执行一次不会重复部署
+    assert "crypto" in out and "不部署" in out["us_equity"]
     S.initial_deploy()
-    assert len(S.deployments()) == 2
-    # 观察员不能部署
+    assert len(S.deployments()) == 1
     with pytest.raises(console.ConsolePermissionError):
         S.deploy(deps[0]["version_id"], actor="v", role="viewer")
+
+
+def test_adjust_1030_stops_us_trims_symbols_and_turns_off_breakeven(sys_env, monkeypatch):
+    """模拟旧部署（美股 + 加密货币 5 个币、保本 1 倍），调整后：美股下线、加密只剩 BTC/ETH、新版本保本关闭。幂等。"""
+    from aiquant.data import http
+    from aiquant.paper import us_ledger
+    S = sys_env
+    monkeypatch.setattr(http, "paper_orders_unlocked", lambda: True)
+    old = dict(S.default_params("crypto"), be_r=1.0)
+    vc = S.freeze("crypto", old, actor="t")
+    S.deploy(vc["id"], actor="t", role="admin")
+    vu = S.freeze("us_equity", S.default_params("us_equity"), actor="t")
+    S.deploy(vu["id"], actor="t", role="admin")
+    dc = S.deployments("crypto")[0]
+    cfg = dc["config"]
+    cfg["symbols"] = ["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "DOGE/USD"]
+    db.ex("UPDATE paper_deployments SET config_json=? WHERE id=?", (json.dumps(cfg), dc["id"]))
+    us_ledger.record_opening(dc["id"], "SOL/USD", 2.0, 150.0, "测试")
+    out = S.adjust_1030()
+    assert not S.deployments("us_equity") and "已下线" in out["us_equity"]
+    dc = S.deployments("crypto")[0]
+    assert dc["config"]["symbols"] == ["BTC/USD", "ETH/USD", "SOL/USD"]   # SOL 有持仓：只卖不买，离场后移除
+    assert dc["config"]["drop_symbols"] == ["SOL/USD"] and dc["config"]["rebase"]
+    assert dc["config"]["pending_switch"]                                  # 持仓中：空仓后切到保本关闭的新版本
+    nv = S.get_version(dc["config"]["pending_switch"]["version_id"])
+    assert nv["params"]["be_r"] == 0.0
+    assert db.q("SELECT * FROM strategy_audit WHERE action='调整标的'")
+    S.adjust_1030()                                                        # 幂等
+    assert len(S.versions("crypto")) == 2
+
+
+def test_candidate_study_and_add_symbol(sys_env, monkeypatch):
+    from aiquant.data import http
+    S = sys_env
+    monkeypatch.setattr(http, "paper_orders_unlocked", lambda: True)
+    S.initial_deploy()
+    short = _bars(_flat(100))
+    monkeypatch.setattr(S, "crypto_daily", lambda sym, now=None, fetch=True: short)
+    r = S.study_candidate("SOL/USD", fetch=False)
+    assert not r["pass"] and "至少两年" in r["why"]                       # 数据不足：不加入
+    assert S.add_symbol("SOL/USD", "测试") is True
+    dep = S.deployments("crypto")[0]
+    assert dep["config"]["symbols"][-1] == "SOL/USD" and dep["config"]["rebase"]
+    assert db.q("SELECT * FROM strategy_audit WHERE action='加入标的'")
+    assert S.add_symbol("SOL/USD", "测试") is False                        # 不重复加入
 
 
 def test_executor_follows_engine_proportionally(sys_env, monkeypatch):

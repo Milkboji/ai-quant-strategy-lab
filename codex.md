@@ -325,10 +325,10 @@ tests/                     pytest 单元/集成测试 + e2e_browser.py（Playwri
 ## 我的交易系统 v1（2026-10-30，见 docs/my_system.md）
 
 - **引擎** `aiquant/engine/my_system.py`（独立模块，主引擎未改）
-  - `Params`（8 个可调参数，`PARAM_LABELS`），`describe()` 用大白话复述规则，`indicators()`，`regime_series()`。
+  - `Params`（9 个可调参数，`PARAM_LABELS`；含 `be_r` 保本触发倍数，0 = 关闭；另有 `add_rule` = quiet3 / a / b，研究用，`_add_ok()`），`describe()` 用大白话复述规则，`indicators()`，`regime_series()`。
   - `run(bars, bench, p, cost, start, end, ...)`：多品种日线，每个品种 `Pos` 内分 `Tranche`（各自的入场价 / 止损 / 是否保本）。
     - 当天的处理顺序：开盘执行挂单 → 盘中止损和目标（先止损；跳空按开盘价）→ 收盘决定，下一根开盘成交。
-    - 返回 metrics / trades（按批次）/ events / equity / yearly。
+    - 返回 metrics / trades（按批次）/ events / equity / yearly；metrics 含 `adds`、`avg_round_peak_pct`、`avg_held_pct`（仓位统计）。
     - `off=`：研究用的逐条开关。
     - `live=True`：最后一根是今天的部分日线，不做收盘决定、不平仓，返回分批 `state` 和 `pending`。
   - 成本用 `execution.fill`，交易节奏用 `Gate`（只用冷却和连亏刹车；大势过滤用本系统自己的 200 日均线）。
@@ -339,12 +339,20 @@ tests/                     pytest 单元/集成测试 + e2e_browser.py（Playwri
   - 数据：`crypto_daily()` 由 5 分钟 K 线聚合成 UTC 日线，缓存在 `data/my_system/`；第一次从 `data/history` 生成，缺的天用 Alpaca 补。
     `us_daily_bars()` 读本地美股日线。
   - `backtest()`：训练期回测（策略实验室模板用）。
-  - `initial_deploy()`：一次性升级 `my_system_v1_deploy`。加密货币上限改为 56%，冻结两个市场的选定参数并部署（试用期）。
+  - `initial_deploy()`：一次性升级 `my_system_v1_deploy`。加密货币上限改为 56%，只冻结并部署加密货币（BTC、ETH，保本关闭）；美股不部署。
+  - `adjust_1030()`：一次性升级 `my_system_adjust_1030`（幂等）。下线美股 v1（有持仓 `pending_offline`）；加密货币标的只留 BTC/ETH
+    （去掉的币有持仓 → 留在 `symbols` 并记入 `drop_symbols`，只卖不买）；当前版本保本没关 → 冻结 `be_r=0` 新版本并部署。
+  - 候选币 `CANDIDATES`（SOL/XRP/DOGE）：`maybe_candidates()` 由后台循环调用，每天最多一次、单独线程；`study_candidate()` 用当前版本参数
+    在训练期比较「只有该币」和「BTC + ETH」的收益回撤比（≥ 才过，另需 ≥ 5 轮、≥ 2 年数据）；`add_symbol()` 写审计「加入标的」。
+    结果存 `my_system_candidate::<币>`。下载起点 `HISTORY_START` = 2021-01-01。
+  - 以上都只在模拟盘下单锁开启时执行（公开版默认什么都不做）。
 - **执行器** `aiquant/paper/my_system_exec.py`（后台循环每轮调用，每个部署每 5 分钟检查一次）
   - `engine_state()` 从 `live_since` 重放引擎。今天这根部分日线存在 `config.today`，开盘价为今天第一次看到的价格。
   - 和 `config.engine_state` 比较：引擎增加持仓 → 按「增加量 × 价格 × 额度 / 10000」买入（金额）；减少持仓 → 卖出同样比例的台账持仓。
   - 订单走 `us_ledger`（purpose 为 system），加密货币用 GTC。`_fee_adjust` 给加密货币买入补记手续费卖出行。
   - 额度：试用期内按 `allocation.trial_plan` 计算；转正后保持最后一次的额度（还没接入按实力分配）。
+  - `config.rebase`：标的组合变了（加入候选币 / 移出 drop_symbols），下一次检查直接把 `engine_state` 对齐到新的引擎持仓，不下单。
+  - `drop_symbols`：只卖不买；台账清零后从 `symbols` 移除。
 - **与其他模块的边界**
   - 部署的 broker 为 `alpaca_us`，`config.kind` 为 `my_system`，`config.market` 为 `crypto` 或 `us_equity`。
   - 不参与以下模块：`us_exec.deployments`、`allocation.us_deployments`、成绩单、点差对比报告。
@@ -353,5 +361,6 @@ tests/                     pytest 单元/集成测试 + e2e_browser.py（Playwri
   - `etf_trend._submit(tif=)` 支持 GTC。
 - **页面**
   - 策略实验室「示例模板」里的「我的交易系统 v1」（`page_lab._system_template`）：复述规则，训练期回测，按批次的明细。
-  - 策略总台 `_my_system_cards`：两张卡片，参数面板冻结新版本并部署，另有下线按钮。
+  - 策略总台 `_my_system_cards`：每个市场一张卡片（美股已下线），参数面板冻结新版本并部署，另有下线按钮。
 - **研究脚本** `scripts/my_system_research.py <数据目录> <输出.json>`：27 组参数网格、对照组、逐条规则开关，只读本地文件。
+  `scripts/my_system_followup.py`：保本触发倍数 1 / 2 / 关闭、加仓定义原 / a / b 的对比和仓位统计。

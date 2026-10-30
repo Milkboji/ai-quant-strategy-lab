@@ -122,9 +122,11 @@ def _loop() -> None:
                 etf_trend.step()
             except Exception:  # noqa: BLE001
                 log.error("etf trend error: %s", traceback.format_exc())
-            try:   # 我的交易系统 v1（加密货币 + 美股，日线，分批仓位）：每 5 分钟跟随引擎
+            try:   # 我的交易系统 v1（加密货币 BTC/ETH，日线，分批仓位）：每 5 分钟跟随引擎
                 from . import my_system_exec
                 my_system_exec.step()
+                from .. import my_system
+                my_system.maybe_candidates()      # 候选币（SOL/XRP/DOGE）：后台下载 + 训练期研究，每天最多一次
             except Exception:  # noqa: BLE001
                 log.error("my system error: %s", traceback.format_exc())
             try:   # 美股收盘后确认下一交易日信号：买入信号 → 收回借给 BTC 的额度（BTC 开盘前按借用比例减仓）

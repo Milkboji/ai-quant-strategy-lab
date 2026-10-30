@@ -75,12 +75,19 @@ def _bb_mid_exit() -> dict:
 
 
 def _my_system_v1() -> dict:
-    """我的交易系统 v1（10-30 研究结论：两个市场的最大回撤都不比现役主力策略差）：加密货币上限 → 56%，部署加密货币和美股各一个（试用期）。"""
+    """我的交易系统 v1：加密货币上限 → 56%，部署加密货币（试用期）。美股按 10-30 下午指令不部署（收益回撤比 0.15 vs ETF 择时 1.02）。"""
     from . import my_system
     return my_system.initial_deploy()
 
 
-UPGRADES = [("bb_mid_exit_v1", _bb_mid_exit), ("my_system_v1_deploy", _my_system_v1)]
+def _my_system_adjust_1030() -> dict:
+    """10-30 下午：下线美股 v1（如已部署；有持仓等离场后停）、加密货币只保留 BTC/ETH、关闭保本止损（冻结新版本部署）。"""
+    from . import my_system
+    return my_system.adjust_1030()
+
+
+UPGRADES = [("bb_mid_exit_v1", _bb_mid_exit), ("my_system_v1_deploy", _my_system_v1),
+            ("my_system_adjust_1030", _my_system_adjust_1030)]
 
 
 def run_pending() -> list[str]:

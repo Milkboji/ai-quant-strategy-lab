@@ -212,6 +212,15 @@ def _step_one(dep: dict, now: datetime) -> str | None:
         pr.set_status(dep["id"], "stopped")
         _log(dep, "INFO", "空仓，已下线")
         return "已下线"
+    # 待移除的标的（10-30 调整：去掉的币有持仓时先留着，只卖不买），离场后移除并重新对齐
+    for s_ in list(cfg.get("drop_symbols") or []):
+        if us_ledger.position(dep["id"], s_)["qty"] <= us_ledger.QTY_EPS:
+            cfg["symbols"] = [x for x in cfg.get("symbols") or [] if x != s_]
+            cfg["drop_symbols"] = [x for x in cfg["drop_symbols"] if x != s_]
+            cfg["rebase"] = True
+            _log(dep, "INFO", f"{s_} 已离场，移出标的")
+    if not cfg.get("drop_symbols"):
+        cfg.pop("drop_symbols", None)
     syms = cfg.get("symbols") or _sys().universe(mkey)
     prices = {}
     for s in syms:
@@ -224,6 +233,11 @@ def _step_one(dep: dict, now: datetime) -> str | None:
     res = engine_state(dep, now, prices)
     eng = {s: float(v["qty"]) for s, v in (res.get("state") or {}).items()}
     prev = {s: float(q) for s, q in (cfg.get("engine_state") or {}).items()}
+    if cfg.pop("rebase", False):
+        # 标的组合变了：引擎按新组合重放后，持仓口径重新对齐（不补加入之前的历史信号），下一轮起正常跟随
+        prev = dict(eng)
+        _log(dep, "INFO", "标的变化：按新组合重新对齐引擎持仓（" + "、".join(syms) + "）")
+    drop = set(cfg.get("drop_symbols") or [])
     cfg["engine_view"] = {s: {"qty": v["qty"], "tranches": v["tranches"], "half_sold": v["half_sold"]}
                           for s, v in (res.get("state") or {}).items()}
     acct = etf_trend._account() or {}
@@ -240,7 +254,8 @@ def _step_one(dep: dict, now: datetime) -> str | None:
         if not px:
             continue
         if e_new > e_old:
-            if dep["status"] != "running" or cfg.get("pending_offline"):
+            if dep["status"] != "running" or cfg.get("pending_offline") or s in drop:
+                prev[s] = e_new if s in drop else prev.get(s, 0.0)
                 continue
             usd = (e_new - e_old) * px * scale
             if usd < MIN_USD:
@@ -255,7 +270,7 @@ def _step_one(dep: dict, now: datetime) -> str | None:
             acts.append((s, "buy", round(usd, 2)))
         else:
             q = have if e_new <= 1e-12 else have * (e_old - e_new) / e_old
-            if q * px < 1.0 and e_new <= 1e-12:
+            if have <= us_ledger.QTY_EPS or (q * px < 1.0 and e_new <= 1e-12):
                 prev[s] = e_new
                 continue
             acts.append((s, "sell", q))

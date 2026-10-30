@@ -23,11 +23,13 @@ from .engine import my_system as ms
 log = logging.getLogger("aiquant.my_system")
 KIND = "my_system"
 NAME = "我的交易系统"
-CRYPTO_UNIVERSE = ["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "DOGE/USD"]   # BTC、ETH + Alpaca 流动性最好的 3 个主流币
+CRYPTO_UNIVERSE = ["BTC/USD", "ETH/USD"]          # 10-30 下午：先只保留 BTC、ETH
+CANDIDATES = ["SOL/USD", "XRP/USD", "DOGE/USD"]   # 下载数据后只用训练期研究，收益回撤比不低于 BTC/ETH 才逐个加入（写审计）
+HISTORY_START = "2021-01-01"                      # 候选币第一次下载的起点（训练期从 2022-01 起，留一年预热）
 US_UNIVERSE = ["QQQ", "SPY", "IWM"]
 BENCH = {"crypto": "BTC/USD", "us_equity": "SPY"}
 # 研究选定的参数（训练期，见 docs/my_system.md 第三节；只在规则给出的几档里选）
-CHOSEN = {"crypto": {"box_days": 30, "half_r": 5.0, "time_stop": 10},
+CHOSEN = {"crypto": {"box_days": 30, "half_r": 5.0, "time_stop": 10, "be_r": 0.0, "add_rule": "quiet3"},
           "us_equity": {"box_days": 60, "half_r": 5.0, "time_stop": 20}}
 TRAIN = {"crypto": ("2022-01-01", None), "us_equity": ("2017-01-01", None)}   # 结束 = 验证集开始（按数据分区）
 SCHEMA_SQL = """
@@ -239,7 +241,7 @@ def crypto_daily(sym: str, now: datetime | None = None, fetch: bool = True) -> p
     last = d["ts"].max() if d is not None and len(d) else None
     if fetch and (last is None or last < today - pd.Timedelta(days=1)):
         from .data import alpaca
-        start = (last + pd.Timedelta(days=1)) if last is not None else today - pd.Timedelta(days=500)
+        start = (last + pd.Timedelta(days=1)) if last is not None else pd.Timestamp(HISTORY_START, tz="UTC")
         x = alpaca.fetch_bars_5m(sym, start.to_pydatetime(), today.to_pydatetime())
         if len(x):
             x["ts"] = pd.to_datetime(x["ts"], utc=True)
@@ -321,13 +323,14 @@ def default_params(market_key: str) -> dict:
 # ---------------------------------------------------------------------------
 
 RESEARCH_SUMMARY = {
-    "crypto": {"v1": {"cagr": 4.06, "dd": -5.26, "ret_dd": 0.77}, "main": {"cagr": 8.2, "dd": -43.21, "ret_dd": 0.19}},
+    "crypto": {"v1": {"cagr": 5.61, "dd": -5.26, "ret_dd": 1.07}, "main": {"cagr": 8.2, "dd": -43.21, "ret_dd": 0.19}},
     "us_equity": {"v1": {"cagr": 0.89, "dd": -6.09, "ret_dd": 0.15}, "main": {"cagr": 34.88, "dd": -34.21, "ret_dd": 1.02}},
 }
 
 
 def initial_deploy() -> dict:
-    """资金分层：加密货币上限 → 56%（腾出 10% 给试用）；冻结两个版本并部署（各进入试用期），写审计。只执行一次（upgrades）。"""
+    """资金分层：加密货币上限 → 56%（腾出 10% 给试用）；冻结加密货币版本并部署（试用期），写审计。只执行一次（upgrades）。
+    美股 v1 不部署（10-30 下午：收益回撤比 0.15，远低于 ETF 择时的 1.02）。"""
     from . import allocation
     from .data import http
     if not http.paper_orders_unlocked():          # 只在用户自己的模拟盘上执行（公开版默认下单锁关闭，不改资金分层、不部署）
@@ -337,15 +340,145 @@ def initial_deploy() -> dict:
     if float(cfg["crypto"]["max"]) != 56.0:
         allocation.set_config(actor="系统（按 10-30 指令）", role="admin", crypto_max=56.0)
         out["crypto_max"] = "→ 56%"
-    for mkey in ("crypto", "us_equity"):
-        r = RESEARCH_SUMMARY[mkey]
-        if r["v1"]["dd"] < r["main"]["dd"]:
-            out[mkey] = "最大回撤比主力策略差，不部署"
-            continue
-        if deployments(mkey):
-            out[mkey] = "已有部署"
-            continue
-        v = freeze(mkey, default_params(mkey), actor="系统（按 10-30 指令）",
-                   note=f"训练期研究选定：最大回撤 {r['v1']['dd']}% vs 主力 {r['main']['dd']}%")
-        out[mkey] = deploy(v["id"], actor="系统（按 10-30 指令）", role="admin")["message"]
+    out["us_equity"] = "不部署：收益回撤比 0.15，远低于 ETF 择时的 1.02"
+    if deployments("crypto"):
+        out["crypto"] = "已有部署"
+        return out
+    r = RESEARCH_SUMMARY["crypto"]
+    v = freeze("crypto", default_params("crypto"), actor="系统（按 10-30 指令）",
+               note=f"训练期研究选定：最大回撤 {r['v1']['dd']}% vs 主力 {r['main']['dd']}%；保本止损关闭")
+    out["crypto"] = deploy(v["id"], actor="系统（按 10-30 指令）", role="admin")["message"]
     return out
+
+
+def adjust_1030() -> dict:
+    """10-30 下午的调整（幂等）：下线美股 v1（有持仓等离场后停，额度退回现金层）；加密货币 v1 只保留 BTC、ETH；
+    关闭保本止损，冻结新版本并部署（持仓中则空仓后切换）。"""
+    from .data import http
+    if not http.paper_orders_unlocked():
+        return {"skipped": "模拟盘下单锁未开启"}
+    out = {}
+    actor = "系统（按 10-30 下午指令）"
+    for d in deployments("us_equity"):
+        out["us_equity"] = stop(d["id"], actor=actor, role="admin") + "（收益回撤比 0.15，远低于 ETF 择时的 1.02；额度退回现金层）"
+    for d in deployments("crypto"):
+        cfg = d["config"]
+        keep = [x for x in cfg.get("symbols") or [] if x in CRYPTO_UNIVERSE] or list(CRYPTO_UNIVERSE)
+        if keep != cfg.get("symbols"):
+            removed = [x for x in cfg.get("symbols") or [] if x not in keep]
+            from .paper import my_system_exec as mx
+            held = [x for x in removed
+                    if mx.us_ledger.position(d["id"], x)["qty"] > mx.us_ledger.QTY_EPS]
+            cfg["symbols"] = keep + held          # 已有持仓的先保留（不再加仓），离场后由执行器移除
+            cfg["drop_symbols"] = held
+            cfg["rebase"] = True                  # 标的变了：下一次检查按新组合重放引擎、重新对齐，不补单
+            db.ex("UPDATE paper_deployments SET config_json=?, updated_at=? WHERE id=?",
+                  (json.dumps(cfg, ensure_ascii=False), db.now_iso(), d["id"]))
+            from . import console
+            console.audit(actor, "admin", "调整标的", key_of("crypto"), cfg.get("label"), d["id"], d["version_id"],
+                          d["version_id"], "只保留 BTC、ETH", "去掉：" + "、".join(removed))
+            out["symbols"] = "只保留 BTC、ETH（去掉 " + "、".join(removed) + "）"
+        cur = get_version(d["version_id"])
+        want = dict(cur["params"], be_r=0.0, add_rule=CHOSEN["crypto"]["add_rule"])
+        if cur["params"] != validate_params(want).to_dict():
+            v = freeze("crypto", want, actor=actor, note="保本止损关闭（训练期：1 倍 0.77、2 倍 0.77、关闭 1.07）")
+            out["crypto"] = deploy(v["id"], actor=actor, role="admin")["message"]
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 候选币：下载数据 → 训练期研究 → 收益回撤比不低于 BTC/ETH 才加入
+# ---------------------------------------------------------------------------
+
+def candidate_status() -> dict:
+    return {c: db.get_setting(f"my_system_candidate::{c}") for c in CANDIDATES}
+
+
+def study_candidate(sym: str, *, fetch: bool = True) -> dict:
+    """用加密货币部署当前版本的参数，在训练期分别回测「只有该币」和「BTC + ETH」；该币的收益回撤比不低于 BTC/ETH 才通过。
+    交易少于 5 轮、或训练期数据不足两年，不通过。"""
+    from . import rhythm
+    from . import research
+    deps = deployments("crypto")
+    v = get_version(deps[0]["version_id"]) if deps else None
+    p = validate_params(v["params"] if v else default_params("crypto"))
+    m = market_obj("crypto")
+    s, e = train_window("crypto")
+    d = crypto_daily(sym, fetch=fetch)
+    bench = crypto_daily("BTC/USD", fetch=fetch)
+    base_bars = {x: crypto_daily(x, fetch=fetch) for x in ("BTC/USD", "ETH/USD")}
+    cost = research.base_cost_model(research.get_research(), m)
+    rh = rhythm.current(m)
+    have = d[(d["ts"] >= s) & (d["ts"] < e)] if len(d) else d
+    if len(have) < 730:
+        return {"symbol": sym, "pass": False, "why": f"训练期日线只有 {len(have)} 根（需要至少两年）"}
+    c = ms.run({sym: d}, bench, p, cost=cost, start=s, end=e, market_key="crypto", rhythm=rh, market=m)["metrics"]
+    b = ms.run(base_bars, bench, p, cost=cost, start=s, end=e, market_key="crypto", rhythm=rh, market=m)["metrics"]
+    ok = c["entries"] >= 5 and c.get("ret_dd") is not None and b.get("ret_dd") is not None and c["ret_dd"] >= b["ret_dd"]
+    why = (f"{sym} 收益回撤比 {c.get('ret_dd') or 0:.2f}（年化 {c['cagr_pct']:.1f}%，回撤 {c['max_drawdown_pct']:.1f}%，"
+           f"{c['entries']} 轮）vs BTC/ETH {b.get('ret_dd') or 0:.2f}")
+    return {"symbol": sym, "pass": bool(ok), "why": why, "window": (s.isoformat(), e.isoformat()),
+            "candidate": {k: c.get(k) for k in ("cagr_pct", "max_drawdown_pct", "ret_dd", "entries")},
+            "base": {k: b.get(k) for k in ("cagr_pct", "max_drawdown_pct", "ret_dd", "entries")}}
+
+
+def add_symbol(sym: str, why: str, *, actor: str = "系统（候选币研究）") -> bool:
+    """把通过研究的候选币加入加密货币部署（执行器从下一次检查起跟随；加入之前引擎里的历史信号不补）。写审计。"""
+    from . import console
+    deps = deployments("crypto")
+    if not deps:
+        return False
+    d = deps[0]
+    cfg = d["config"]
+    if sym in (cfg.get("symbols") or []):
+        return False
+    cfg["symbols"] = list(cfg.get("symbols") or []) + [sym]
+    cfg["rebase"] = True                          # 下一次检查重新对齐引擎持仓：新币加入前的历史信号不补
+    db.ex("UPDATE paper_deployments SET config_json=?, updated_at=? WHERE id=?",
+          (json.dumps(cfg, ensure_ascii=False), db.now_iso(), d["id"]))
+    console.audit(actor, "admin", "加入标的", key_of("crypto"), cfg.get("label"), d["id"], d["version_id"], d["version_id"],
+                  f"加入 {sym}", why)
+    from .paper import runner as pr
+    pr.event(d["id"], "INFO", f"[我的交易系统] 加入标的 {sym}：{why}")
+    return True
+
+
+_cand_running = False
+
+
+def maybe_candidates(now: datetime | None = None) -> bool:
+    """后台每天最多一次：还没研究过（或上次失败）的候选币，下载数据、做训练期研究，通过的逐个加入。单独线程，不拖慢交易循环。"""
+    global _cand_running
+    from .data import http
+    now = now or datetime.now(timezone.utc)
+    if _cand_running or not deployments("crypto") or not http.paper_orders_unlocked() or not config.secret("ALPACA_API_KEY_ID"):
+        return False
+    todo = []
+    for c in CANDIDATES:
+        st = db.get_setting(f"my_system_candidate::{c}") or {}
+        if st.get("done"):
+            continue
+        if st.get("at") and st["at"][:10] == now.strftime("%Y-%m-%d"):
+            continue
+        todo.append(c)
+    if not todo:
+        return False
+    _cand_running = True
+
+    def work():
+        global _cand_running
+        try:
+            for c in todo:
+                try:
+                    r = study_candidate(c)
+                    added = add_symbol(c, r["why"]) if r["pass"] else False
+                    db.set_setting(f"my_system_candidate::{c}", dict(r, done=True, added=added, at=db.now_iso()))
+                except Exception as e:  # noqa: BLE001  下载失败等：明天再试
+                    log.warning("candidate %s failed", c, exc_info=True)
+                    db.set_setting(f"my_system_candidate::{c}", {"done": False, "at": db.now_iso(),
+                                                                  "why": f"{type(e).__name__}: {str(e)[:160]}"})
+        finally:
+            _cand_running = False
+    import threading
+    threading.Thread(target=work, daemon=True, name="aiquant-ms-candidates").start()
+    return True

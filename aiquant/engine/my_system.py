@@ -50,6 +50,9 @@ class Params:
     add_pct: float = 25.0         # 加仓比例（额度的 %，规则给的范围 20~30）
     max_loss_pct: float = 3.0     # 单笔最大亏损（额度的 %）
     max_positions: int = 3        # 最多持有品种数
+    be_r: float = 1.0             # 保本触发倍数：某一批赚到它自己几倍止损距离后止损移到成本价；0 = 关闭
+    add_rule: str = "quiet3"      # 加仓时机：quiet3 = 回调后连续 3 根日线振幅 < 0.7 ATR 且缩量（原定义）；
+                                  # a = 回调后连续 2 根日线振幅 < 1 ATR；b = 回调幅度达到突破后涨幅的 30%~60% 后收阳线
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -59,7 +62,12 @@ class Params:
         if not d:
             return cls()
         ok = {k: v for k, v in d.items() if k in cls.__dataclass_fields__}
-        cast = {k: (int(v) if isinstance(cls.__dataclass_fields__[k].default, int) else float(v)) for k, v in ok.items()}
+        def _c(k, v):
+            dflt = cls.__dataclass_fields__[k].default
+            if isinstance(dflt, str):
+                return str(v)
+            return int(v) if isinstance(dflt, int) else float(v)
+        cast = {k: _c(k, v) for k, v in ok.items()}
         return cls(**cast)
 
 
@@ -72,6 +80,14 @@ PARAM_LABELS = {
     "add_pct": ("加仓比例", "% 额度", (5, 50)),
     "max_loss_pct": ("单笔最大亏损", "% 额度", (0.5, 10)),
     "max_positions": ("最多持有品种数", "个", (1, 10)),
+    "be_r": ("保本触发倍数", "倍止损距离（0 = 关闭）", (0, 10)),
+}
+
+
+ADD_RULE_TEXT = {
+    "quiet3": "突破后第一次回调、连续 3 根日线振幅都小于 0.7 倍 ATR 且缩量时加",
+    "a": "突破后第一次回调、连续 2 根日线振幅都小于 1 倍 ATR 时加",
+    "b": "突破后回调到涨幅的 30%~60%、然后收出一根阳线时加",
 }
 
 
@@ -85,10 +101,11 @@ def describe(p: Params, market_key: str = "crypto", symbols: list[str] | None = 
         f"2. 大势过滤：{bench} 日线收盘低于 200 日均线时不开新仓（持仓照常按规则卖出）。",
         f"3. 首次建仓用额度的 {p.first_pct:g}%，止损放在突破当天日线最低点；如果亏到止损会超过额度的 {p.max_loss_pct:g}%，"
         "自动缩小仓位。",
-        f"4. 加仓最多 2 次，每次额度的 {p.add_pct:g}%：突破后第一次回调、连续 3 根日线振幅都小于 0.7 倍 ATR 且缩量时加，"
-        "止损放在回调低点；之前每一批的止损都移到保本价后才能加下一批；总仓位不超过额度的 100%；加仓那批止损时，"
-        "同时从底仓卖出与这笔亏损等额的金额。",
-        "5. 保本：某一批赚到它自己 1 倍止损距离后，这一批的止损移到成本价。",
+        f"4. 加仓最多 2 次，每次额度的 {p.add_pct:g}%：{ADD_RULE_TEXT.get(p.add_rule, ADD_RULE_TEXT['quiet3'])}，"
+        "止损放在回调低点；" + ("之前每一批的止损都移到保本价后才能加下一批；" if p.be_r > 0 else "")
+        + "总仓位不超过额度的 100%；加仓那批止损时，同时从底仓卖出与这笔亏损等额的金额。",
+        (f"5. 保本：某一批赚到它自己 {p.be_r:g} 倍止损距离后，这一批的止损移到成本价。" if p.be_r > 0
+         else "5. 保本止损：关闭（研究显示在加密货币上过早把仓位打回成本价）。"),
         f"6. 卖出：涨到首仓止损距离的 {p.half_r:g} 倍卖一半；回调到突破位附近（±2%）再次企稳时带止损买回这一半（只买回一次）；"
         f"涨到过去 365 天最高点下方 {p.near_high_pct:g}% 以内卖剩下的一半；第一次卖出后，剩余仓位用移动止盈"
         "（从最高价回撤 2 倍 ATR）。",
@@ -125,6 +142,7 @@ def indicators(d: pd.DataFrame, p: Params, year_bars: int) -> pd.DataFrame:
     if has_vol:
         small = small & (x["volume"] < x["volume"].rolling(20).mean())
     x["quiet3"] = small.rolling(QUIET_BARS).sum() >= QUIET_BARS
+    x["quiet2a"] = (rng < 1.0 * x["atr"]).rolling(2).sum() >= 2
     return x
 
 
@@ -171,6 +189,7 @@ class Pos:
     entry_i: int = 0
     entry_ts: object = None
     half_usd: float = 0.0
+    max_cost: float = 0.0  # 这一轮同时持有的最大成本（看「总仓位做到多少」）
 
     @property
     def qty(self) -> float:
@@ -217,11 +236,14 @@ def run(bars: dict[str, pd.DataFrame], bench: pd.DataFrame, p: Params, *, cost: 
     blocked = {"大势过滤": 0, "持仓已满": 0, "交易节奏": 0, "现金不足": 0}
     last_px: dict[str, float] = {}
     holds: list[float] = []
+    peaks: list[float] = []     # 每一轮的最大总仓位（占额度 %）
+    held_pct: list[float] = []  # 每个持仓日的总仓位（持仓市值 ÷ 权益）
 
     def gone(s: str, ts, why: str) -> None:
         """该品种全部离场：记持仓天数和事件。"""
         ps = pos.pop(s)
         holds.append((pd.Timestamp(ts) - pd.Timestamp(ps.entry_ts)).total_seconds() / 86400)
+        peaks.append(ps.max_cost / budget * 100)
         events.append({"ts": pd.Timestamp(ts).isoformat(), "symbol": s, "event": "全部离场", "why": why})
 
     def close_tranche(s: str, t: Tranche, qty: float, mid: float, ts, reason: str) -> float:
@@ -387,7 +409,7 @@ def run(bars: dict[str, pd.DataFrame], bench: pd.DataFrame, p: Params, *, cost: 
                 if ps.half_sold:
                     ps.pulled_back = False
             for t in ps.tranches:
-                if not t.breakeven and "be" not in off and hi >= t.entry + t.r:
+                if not t.breakeven and "be" not in off and p.be_r > 0 and hi >= t.entry + p.be_r * t.r:
                     t.pending_be = True
             if not ps.tranches:
                 gone(s, today, "卖出")
@@ -419,8 +441,8 @@ def run(bars: dict[str, pd.DataFrame], bench: pd.DataFrame, p: Params, *, cost: 
             if ps.pulled_back:
                 ps.pull_low = min(ps.pull_low, lo)
             # 加仓：回调后横盘缩量，之前每一批都已保本
-            if ("adds" not in off and not ps.half_sold and ps.adds < MAX_ADDS and ps.pulled_back and bool(x["quiet3"])
-                    and (all(t.breakeven for t in ps.tranches) or "be" in off)
+            if ("adds" not in off and not ps.half_sold and ps.adds < MAX_ADDS and ps.pulled_back and _add_ok(p, ps, x)
+                    and (all(t.breakeven for t in ps.tranches) or "be" in off or p.be_r <= 0)
                     and sum(t.qty * t.entry for t in ps.tranches) < budget * 0.999):
                 pending.append({"symbol": s, "kind": "add", "stop": ps.pull_low})
             # 买回：卖一半之后回到突破位附近并企稳
@@ -459,10 +481,13 @@ def run(bars: dict[str, pd.DataFrame], bench: pd.DataFrame, p: Params, *, cost: 
             px = float(ind[s].iloc[i]["close"]) if i is not None else last_px.get(s, ps.base_entry)
             last_px[s] = px
             val += ps.qty * px
+            ps.max_cost = max(ps.max_cost, sum(t.qty * t.entry for t in ps.tranches))
+        if val > 0:
+            held_pct.append(val / (cash + val) * 100)
         eq_curve.append((today, cash + val))
 
     if live:
-        rep = _report(eq_curve, trades, events, fees, initial_cash, year_bars, p, blocked, market_key, list(bars), holds)
+        rep = _report(eq_curve, trades, events, fees, initial_cash, year_bars, p, blocked, market_key, list(bars), holds, peaks, held_pct)
         rep["state"] = {s: {"qty": ps.qty, "base_entry": ps.base_entry, "r0": ps.r0, "half_sold": ps.half_sold,
                             "trailing": ps.trailing, "hi_since": ps.hi_since,
                             "tranches": [{"kind": t.kind, "qty": t.qty, "entry": t.entry, "stop": t.stop,
@@ -476,7 +501,7 @@ def run(bars: dict[str, pd.DataFrame], bench: pd.DataFrame, p: Params, *, cost: 
         for s in list(pos):
             exit_all(s, last_px.get(s, pos[s].base_entry), dates[-1], "回测结束平仓")
         eq_curve[-1] = (dates[-1], cash)
-    return _report(eq_curve, trades, events, fees, initial_cash, year_bars, p, blocked, market_key, list(bars), holds)
+    return _report(eq_curve, trades, events, fees, initial_cash, year_bars, p, blocked, market_key, list(bars), holds, peaks, held_pct)
 
 
 def _asof(s: pd.Series, t) -> bool:
@@ -496,7 +521,21 @@ def _sold_usd(trades: list[dict], s: str, key: str) -> float:
     return out
 
 
-def _report(eq_curve, trades, events, fees, initial_cash, year_bars, p, blocked, market_key, symbols, holds) -> dict:
+def _add_ok(p: Params, ps: "Pos", x) -> bool:
+    """加仓时机（回调之后）：quiet3 原定义；a 连续 2 根日线振幅 < 1 ATR；b 回调幅度达到突破后涨幅的 30%~60% 且今天收阳线。"""
+    if p.add_rule == "a":
+        return bool(x["quiet2a"])
+    if p.add_rule == "b":
+        gain = ps.hi_since - ps.box_hi
+        if gain <= 0:
+            return False
+        depth = (ps.hi_since - ps.pull_low) / gain
+        return 0.30 <= depth <= 0.60 and float(x["close"]) > float(x["open"])
+    return bool(x["quiet3"])
+
+
+def _report(eq_curve, trades, events, fees, initial_cash, year_bars, p, blocked, market_key, symbols, holds,
+            peaks=None, held_pct=None) -> dict:
     eq = pd.Series([e for _, e in eq_curve], index=[t for t, _ in eq_curve], dtype=float)
     if eq.empty:
         return {"metrics": {}, "trades": [], "equity": [], "yearly": [], "params": p.to_dict()}
@@ -519,6 +558,9 @@ def _report(eq_curve, trades, events, fees, initial_cash, year_bars, p, blocked,
         "fee_share_pct": fees / (abs(pnl) + fees) * 100 if (abs(pnl) + fees) else 0.0,
         "avg_hold_days": float(np.mean(holds)) if holds else 0.0, "win_rate_pct": (
             sum(1 for t in trades if t["pnl"] > 0) / len(trades) * 100 if trades else None),
+        "adds": sum(1 for e in events if str(e["event"]).startswith("加仓")),
+        "avg_round_peak_pct": float(np.mean(peaks)) if peaks else 0.0,
+        "avg_held_pct": float(np.mean(held_pct)) if held_pct else 0.0,
         "blocked": blocked, "exposure_note": "额度 = 初始资金；最多同时持有 " + str(p.max_positions) + " 个品种",
     }
     return {"metrics": m, "trades": trades, "events": events,
