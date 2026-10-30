@@ -114,6 +114,8 @@ def _card(r: dict, actor: str, rl: str, focus: bool) -> None:
         st.markdown(f'<div class="aq-slothead"><div><span class="aq-slotname">{C.esc(r["name"])}</span> '
                     f'<span class="aq-meta">{C.esc(r["origin"])} · 来源：{C.esc(r["source_cn"])}</span></div>'
                     f'<div>{pills}</div></div>', unsafe_allow_html=True)
+        if dep:
+            _scorecard_line(dep["id"])
         cols = st.columns([1.5, 1.2, 1.0, 1.4])
         with cols[0]:
             tf = r["signal_tf"]
@@ -230,6 +232,20 @@ def _actions(r: dict, actor: str, rl: str) -> None:
             st.rerun()
 
 
+def _scorecard_line(did: int) -> None:
+    """策略成绩单摘要（每天重新回测实际运行区间、逐笔对比模拟盘）：一致 / 偏差原因分类 / 样本不足。"""
+    from .. import scorecard
+    try:
+        cs = scorecard.card_summary(did)
+    except Exception:  # noqa: BLE001
+        cs = None
+    if not cs:
+        st.markdown(f'<div class="aq-meta">{C.pill("成绩单：明天早上 6 点后生成", "gray")}</div>', unsafe_allow_html=True)
+        return
+    det = f' <span class="aq-meta">{C.esc(cs["detail"])}</span>' if cs.get("detail") else ""
+    st.markdown(f'<div>{C.pill(cs["text"], cs["tone"])}{det}</div>', unsafe_allow_html=True)
+
+
 def _etf_card(r: dict, actor: str, rl: str, focus: bool) -> None:
     """美股 ETF 择时卡片：与 BTC 策略同样的版本 / 锁定 / 待确认 / 上下线 / 审计，参数版本来自策略实验室。"""
     from ..paper import etf_versions as ev
@@ -252,6 +268,13 @@ def _etf_card(r: dict, actor: str, rl: str, focus: bool) -> None:
                     f'<span class="aq-meta">{C.esc(r["signal_symbol"])} → {C.esc(r["trade_symbol"])} · 来源：策略实验室参数版本'
                     f'</span></div><div>{pills}</div></div>',
                     unsafe_allow_html=True)
+        try:
+            from ..paper import us_exec
+            _ed = us_exec.etf_deployment()
+            if _ed:
+                _scorecard_line(_ed["id"])
+        except Exception:  # noqa: BLE001
+            pass
         cols = st.columns([1.5, 1.2, 1.0, 1.4])
         with cols[0]:
             st.markdown(C.kv([("实验室最新", ev.label(lab) if lab else "--"), ("模拟盘", ev.label(run)),
@@ -384,6 +407,8 @@ def _capital_panel(eq: float | None, actor: str, rl: str) -> None:
                      f"现金 {l1['cash_pct']:.1f}%（账户权益 {C.usd(eq) if eq else '--'}）"):
         st.markdown("**第一层：市场之间（上下限可配置）**")
         st.markdown("".join(f"<div>• {C.esc(x)}</div>" for x in l1["steps"]), unsafe_allow_html=True)
+        if l1.get("trial_hint"):
+            st.info(l1["trial_hint"])
         st.markdown("**第二层：市场内部按实力公式**（只在「正式」策略之间分配：长周期 年均收益 / 年均回撤，没有长周期结果时用训练集 "
                     "收益 / 回撤；权重有上下限）。新部署的策略先「试用」：固定额度从现金层出，满期后转正式")
         if ex["us"]:

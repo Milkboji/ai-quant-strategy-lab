@@ -113,7 +113,10 @@ def _loop() -> None:
             log.error("uptime beat error: %s", traceback.format_exc())
         try:
             if http.paper_orders_unlocked():
-                tick()
+                try:   # BTC 出错不影响后面的美股、通知等（2026-10-30：行情文件损坏时整轮都被跳过）
+                    tick()
+                except Exception:  # noqa: BLE001
+                    log.error("paper loop error: %s", traceback.format_exc())
             try:   # 美股 ETF 趋势择时（QQQ 均线 → QLD）；下单锁未开时只记录「为什么没有动作」
                 from . import etf_trend
                 etf_trend.step()
@@ -158,6 +161,16 @@ def _loop() -> None:
             except Exception:  # noqa: BLE001
                 log.error("snapshot error: %s", traceback.format_exc())
             _maybe_evolve()
+            try:   # 策略成绩单：每天一次（北京时间早上 6 点后，美股日线入库之后），后台线程
+                from .. import scorecard
+                scorecard.maybe_daily()
+            except Exception:  # noqa: BLE001
+                log.error("scorecard error: %s", traceback.format_exc())
+            try:   # 点差模型：每轮最多 10 次历史报价请求（美股开盘前后暂停）
+                from .. import spread_model
+                spread_model.collect()
+            except Exception:  # noqa: BLE001
+                log.error("spread sampling error: %s", traceback.format_exc())
             try:   # 通知：重试发件箱 + 每日运行摘要
                 from .. import notify
                 notify.flush()
@@ -202,5 +215,23 @@ def ensure_loop() -> None:
     with _lock:
         if _started:
             return
-        threading.Thread(target=_loop, daemon=True, name="aiquant-paper-loop").start()
+        threading.Thread(target=_locked_loop, daemon=True, name="aiquant-paper-loop").start()
         _started = True
+
+
+LOOP_LOCK = "trading_loop"
+
+
+def _locked_loop() -> None:
+    """只有拿到跨进程锁的进程才运行交易循环；拿不到（另一个服务进程正在跑）就每 30 秒再试，对方退出后接手。"""
+    from .. import proc_lock
+    warned = False
+    while not proc_lock.acquire(LOOP_LOCK):
+        if not warned:
+            log.warning("另一个服务进程（PID %s）正在运行交易循环，本进程不重复运行，等它退出后接手",
+                        proc_lock.holder(LOOP_LOCK))
+            warned = True
+        time.sleep(30)
+    if warned:
+        log.warning("已接手交易循环（之前的进程已退出）")
+    _loop()

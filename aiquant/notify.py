@@ -1,11 +1,13 @@
-"""通知模块：邮件 + Telegram。
+"""通知模块：邮件 + Telegram + 企业微信群机器人 + 飞书群机器人（并行发送，每个通道单独开关）。
 
 - 账号配置只放在 config/secrets.local（或 .env），不进代码仓库：
     NOTIFY_SMTP_HOST=smtp.qq.com        NOTIFY_SMTP_PORT=465
     NOTIFY_SMTP_USER=xxx@qq.com         NOTIFY_SMTP_PASSWORD=邮箱授权码
     NOTIFY_EMAIL_TO=a@x.com,b@y.com     NOTIFY_EMAIL_FROM=（可选，默认同 USER）
     NOTIFY_TELEGRAM_BOT_TOKEN=123:abc   NOTIFY_TELEGRAM_CHAT_ID=123456
-- 所有发送都走 aiquant/data/http.py 这个唯一出口：主机白名单 + 审计（token / 密码不写入审计）。
+    NOTIFY_WECOM_WEBHOOK=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=…（企业微信群机器人，国内直连）
+    NOTIFY_FEISHU_WEBHOOK=https://open.feishu.cn/open-apis/bot/v2/hook/…   NOTIFY_FEISHU_SECRET=（可选，签名校验）
+- 所有发送都走 aiquant/data/http.py 这个唯一出口：主机白名单 + 审计（token / 密码 / webhook key 不写入审计，错误信息也打码）。
 - 开关（哪些通道、哪些事件、每日摘要时间）存在 settings.notify_config，在「系统设置」页修改（仅管理员）。
 - 先写入发件箱 notify_outbox，再尝试发送；网络断开时保留，后台循环每分钟重试（最多 5 次）。
 - 测试数据（is_test）产生的事件不发通知。
@@ -32,10 +34,11 @@ EVENTS = {
     "rhythm_review": "美股节奏待确认转正",
     "watchdog_restart": "守护进程重启",
     "tunnel_down": "外网通道断开超过 60 秒",
+    "scorecard": "策略成绩单偏差",
     "daily_summary": "每日运行摘要",
 }
-CHANNELS = {"email": "邮件", "telegram": "Telegram"}
-DEFAULTS = {"email": False, "telegram": False, "events": {k: True for k in EVENTS}, "daily_hour": 21}
+CHANNELS = {"email": "邮件", "telegram": "Telegram", "wecom": "企业微信", "feishu": "飞书"}
+DEFAULTS = {"email": False, "telegram": False, "wecom": False, "feishu": False, "events": {k: True for k in EVENTS}, "daily_hour": 21}
 MAX_ATTEMPTS = 5
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS notify_outbox (
@@ -60,14 +63,14 @@ def get_config() -> dict:
 
 
 def set_config(*, actor: str | None, role: str | None, email: bool | None = None, telegram: bool | None = None,
+               wecom: bool | None = None, feishu: bool | None = None,
                events: dict | None = None, daily_hour: int | None = None) -> dict:
     if role != "admin":
         raise PermissionError("只有管理员可以修改通知设置")
     c = get_config()
-    if email is not None:
-        c["email"] = bool(email)
-    if telegram is not None:
-        c["telegram"] = bool(telegram)
+    for k, v in (("email", email), ("telegram", telegram), ("wecom", wecom), ("feishu", feishu)):
+        if v is not None:
+            c[k] = bool(v)
     if events:
         c["events"].update({k: bool(v) for k, v in events.items() if k in EVENTS})
     if daily_hour is not None:
@@ -78,7 +81,7 @@ def set_config(*, actor: str | None, role: str | None, email: bool | None = None
     try:
         from . import auth
         auth.audit(actor or "", "修改通知设置", "notify",
-                   f"邮件 {'开' if c['email'] else '关'}，Telegram {'开' if c['telegram'] else '关'}，"
+                   "，".join(f"{n} {'开' if c[k] else '关'}" for k, n in CHANNELS.items()) + "，"
                    f"事件 {sum(c['events'].values())}/{len(EVENTS)}，摘要 {c['daily_hour']}:00")
     except Exception:  # noqa: BLE001
         log.exception("notify settings audit failed")
@@ -104,10 +107,33 @@ def _tg_cfg() -> dict | None:
     return {"token": tok, "chat_id": chat} if tok and chat else None
 
 
+def _wecom_url() -> str | None:
+    u = (config.secret("NOTIFY_WECOM_WEBHOOK") or "").strip()
+    if u and not u.startswith("https://"):       # 只填了 key
+        u = f"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={u}"
+    return u or None
+
+
+def _feishu_cfg() -> dict | None:
+    u = (config.secret("NOTIFY_FEISHU_WEBHOOK") or "").strip()
+    if not u:
+        return None
+    if not u.startswith("https://"):
+        u = f"https://open.feishu.cn/open-apis/bot/v2/hook/{u}"
+    return {"url": u, "secret": (config.secret("NOTIFY_FEISHU_SECRET") or "").strip() or None}
+
+
+def _hook_mask(url: str) -> str:
+    """只显示主机 + 密钥前后几位。"""
+    from urllib.parse import urlparse
+    tail = url.split("key=")[-1] if "key=" in url else url.rstrip("/").split("/")[-1]
+    return f"{urlparse(url).hostname} · {config.mask(tail)}"
+
+
 def channel_status() -> dict:
     """{channel: {"configured": bool, "enabled": bool, "detail": 打码后的配置}}"""
     c = get_config()
-    e, t = _email_cfg(), _tg_cfg()
+    e, t, w, f = _email_cfg(), _tg_cfg(), _wecom_url(), _feishu_cfg()
     return {
         "email": {"configured": bool(e), "enabled": bool(c["email"]),
                   "detail": (f"{e['host']}:{e['port']} · {config.mask(e['user'])} → {len(e['to'])} 个收件人" if e
@@ -115,6 +141,11 @@ def channel_status() -> dict:
         "telegram": {"configured": bool(t), "enabled": bool(c["telegram"]),
                      "detail": (f"机器人 {config.mask(t['token'])} · 会话 {config.mask(t['chat_id'])}" if t
                                 else "未配置（需要 NOTIFY_TELEGRAM_BOT_TOKEN / NOTIFY_TELEGRAM_CHAT_ID）")},
+        "wecom": {"configured": bool(w), "enabled": bool(c["wecom"]),
+                  "detail": (f"群机器人 {_hook_mask(w)}" if w else "未配置（需要 NOTIFY_WECOM_WEBHOOK）")},
+        "feishu": {"configured": bool(f), "enabled": bool(c["feishu"]),
+                   "detail": (f"群机器人 {_hook_mask(f['url'])}" + (" · 已开签名校验" if f["secret"] else "") if f
+                              else "未配置（需要 NOTIFY_FEISHU_WEBHOOK，可选 NOTIFY_FEISHU_SECRET）")},
     }
 
 
@@ -137,7 +168,59 @@ def _send(channel: str, title: str, body: str) -> None:
         if r.status_code != 200:
             raise RuntimeError(f"Telegram 返回 {r.status_code}")
         return
+    if channel == "wecom":
+        u = _wecom_url()
+        if not u:
+            raise RuntimeError("企业微信未配置")
+        text = f"【AI Quant】{title}\n{body}"
+        r = http.request("POST", u, json_body={"msgtype": "text", "text": {"content": _cut_bytes(text, 2000)}}, timeout=15)
+        _check_json(r, "企业微信", "errcode", "errmsg")
+        return
+    if channel == "feishu":
+        f = _feishu_cfg()
+        if not f:
+            raise RuntimeError("飞书未配置")
+        payload = {"msg_type": "text", "content": {"text": f"【AI Quant】{title}\n{body}"[:4000]}}
+        if f["secret"]:
+            payload.update(feishu_sign(f["secret"]))
+        r = http.request("POST", f["url"], json_body=payload, timeout=15)
+        _check_json(r, "飞书", "code", "msg")
+        return
     raise ValueError(f"未知通道 {channel}")
+
+
+def _cut_bytes(text: str, n: int) -> str:
+    """企业微信文本消息上限 2048 字节（UTF-8）。"""
+    b = text.encode("utf-8")
+    return text if len(b) <= n else b[:n].decode("utf-8", "ignore") + "…"
+
+
+def _check_json(r, name: str, code_key: str, msg_key: str) -> None:
+    if r.status_code != 200:
+        raise RuntimeError(f"{name}返回 HTTP {r.status_code}")
+    try:
+        j = r.json()
+    except Exception:  # noqa: BLE001
+        raise RuntimeError(f"{name}返回内容不是 JSON") from None
+    code = j[code_key] if code_key in j else j.get("StatusCode")
+    if code != 0:
+        raise RuntimeError(f"{name}返回错误 {code}：{str(j.get(msg_key) or j.get('StatusMessage') or '')[:120]}")
+
+
+def feishu_sign(secret: str, ts: int | None = None) -> dict:
+    """飞书群机器人签名：base64(HMAC-SHA256(key = f"{timestamp}\\n{secret}", message = 空))。"""
+    import base64
+    import hashlib
+    import hmac
+    import time
+    ts = int(ts if ts is not None else time.time())
+    sig = hmac.new(f"{ts}\n{secret}".encode("utf-8"), b"", hashlib.sha256).digest()
+    return {"timestamp": str(ts), "sign": base64.b64encode(sig).decode("ascii")}
+
+
+def _err(e: Exception) -> str:
+    from .data import http
+    return http.redact_text(f"{type(e).__name__}: {e}")[:300]
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +268,7 @@ def flush(limit: int = 20) -> int:
         except Exception as e:  # noqa: BLE001
             n = int(r["attempts"]) + 1
             db.ex("UPDATE notify_outbox SET status=?, attempts=?, last_error=? WHERE id=?",
-                  ("failed" if n >= MAX_ATTEMPTS else "pending", n, f"{type(e).__name__}: {e}"[:300], r["id"]))
+                  ("failed" if n >= MAX_ATTEMPTS else "pending", n, _err(e), r["id"]))
     return ok
 
 
@@ -201,9 +284,8 @@ def send_test(channel: str, *, actor: str | None, role: str | None) -> str:
         db.ex("UPDATE notify_outbox SET status='sent', attempts=1, sent_at=? WHERE id=?", (db.now_iso(), rid))
         return "已发送"
     except Exception as e:  # noqa: BLE001
-        db.ex("UPDATE notify_outbox SET status='failed', attempts=1, last_error=? WHERE id=?",
-              (f"{type(e).__name__}: {e}"[:300], rid))
-        raise
+        db.ex("UPDATE notify_outbox SET status='failed', attempts=1, last_error=? WHERE id=?", (_err(e), rid))
+        raise RuntimeError(_err(e)) from None
 
 
 def recent(limit: int = 50) -> list[dict]:

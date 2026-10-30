@@ -271,3 +271,53 @@ tests/                     pytest 单元/集成测试 + e2e_browser.py（Playwri
   `regime_bt.simulate(cap_frac=)`；`research.bt_config(..., account_share_pct=)`。为 None 时代码路径完全跳过。
   跳空止损按 `min(开盘, 止损价)` 成交，测试锁定。
 - 脚本：`scripts/us_stop_regress.py`（美股止损回测 30 组新旧比对）。
+
+## 通知渠道、止盈对齐、10-30 事故修复、策略成绩单、点差模型（2026-10-30，见 docs/策略成绩单与点差模型报告.md）
+
+- **通知渠道**
+  - `notify.CHANNELS` 新增 `wecom`（企业微信群机器人）和 `feishu`（飞书群机器人），与邮件、Telegram 并行，每个通道单独开关。
+  - 密钥：`NOTIFY_WECOM_WEBHOOK`（完整地址或只填 key）、`NOTIFY_FEISHU_WEBHOOK`、`NOTIFY_FEISHU_SECRET`（签名，可选）。
+  - `http.check_url`：qyapi.weixin.qq.com 只允许 POST `/cgi-bin/webhook/send`；open.feishu.cn 只允许 POST `/open-apis/bot/v2/hook/<token>`。
+  - 打码：`http.redact` / `redact_text` 处理 Telegram token、`key=`、hook token；发件箱的错误信息也打码。
+  - Worker `quant-guard.js`：`notify()` 并行发 telegram / wecom / feishu，Secrets 为 `WECOM_WEBHOOK`、`FEISHU_WEBHOOK`、`FEISHU_SECRET`。
+    普通变量 `NOTIFY_CHANNELS` 控制开关；任一渠道成功即算已通知。
+- **试用额度为 0 的提示**：`allocation.trial_zero_hint()` 写明要调「加密货币上限 %」，以及调到多少能腾出多少；
+  `explain()["layer1"]["trial_hint"]` 显示在资金两层分配面板上。
+- **止盈**：回测本来就是 `max(开盘, 止盈价)`。新增假设文字和测试。`scripts/us_stop_regress.py` 增加止盈 5% / 10% 组，
+  并统计跳空高开按开盘价成交的笔数。
+- **10-30 事故修复（hotfix 53687e5）**
+  - `market_data._recover_master`：主行情缓存读不出来时，逐行保留损坏前的部分，原文件改名为 `.corrupt-时间`，覆盖区间截短，
+    其余自动重新下载。
+  - `_save_master` 使用每个进程 / 线程专用的临时文件。
+  - `proc_lock`：跨进程文件锁（msvcrt / fcntl），`paper.service._locked_loop` 拿到锁才跑交易循环，拿不到的每 30 秒再试。
+  - `scripts/run_server.py`：8501 已有正常服务时直接退出。
+  - `scripts/service.py watch()`：PID 文件里的进程已退出、但端口上有正常实例时接管它（写 PID），不再重启。
+  - 后台循环里 BTC `tick()` 单独 try：出错不影响美股、通知等后续步骤。
+- **策略成绩单** `aiquant/scorecard.py`
+  - 运行区间 `segment_start`：`live_since` → 审计里的部署记录 → `created_at`。ETF 择时取 `etf_versions.deployed_at`，
+    没有就取 `etf_orders` 第一笔成交的那天。
+  - 重新回测 `_rebacktest`：BTC / 实验室版本用 `research.bt_config`；ETF 用 `regime_bt.simulate`，从空仓开始。
+  - 模拟盘成交 `paper_fills`：BTC 来自 paper_orders；美股来自 us_order_allocs，ETF 另含迁移前的 etf_orders。
+  - `match`：同方向、按时间顺序、取最近的一笔、在容差内配对。BTC 容差为 max(2 × 周期, 120 分钟)，美股为 4 天。
+  - `classify_missed` / `classify_extra`：中断（service_outages）、事件流关键词、资金调整用途、继承持仓。
+    入场漏掉时，对应的离场继承同一原因。
+  - `actual_curve`：每笔成交处切分子区间连乘（时间加权）。预期曲线来自回测权益，基准为交易品种买入持有。
+  - `build` 汇总：一致 / 时间偏差 / 漏单 / 多单、成交价偏差（bps，正数表示更差）、成本（实际相对中间价，加手续费）对比模型、
+    收益差、样本不足。
+  - 阈值 `settings.scorecard_config`（DEFAULTS），`NON_STRATEGY` 里的原因不通知。
+  - `_notify`：每个偏差只通知一次（`scorecard_notified::<did>::<vid>`），事件类型 `scorecard`。
+  - `maybe_daily`：UTC 22 点后，每天在后台线程跑一次。`card_summary` 供策略总台卡片使用。表 `scorecards`。
+  - 页面 `ui/page_scorecard.py`（导航「策略成绩单」，所有角色可见；按钮只对管理员 / 交易员开放，后端 `console.require_role`）。
+- **点差模型** `aiquant/spread_model.py`
+  - 采样 `collect()`：后台每轮最多 10 次只读 GET，美东 9:25~9:50 暂停。写入 `spread_samples`。
+  - 估计：`estimate()` / `proposal()`，每个时段至少 10 天样本。
+  - `build_report()` 写入 `spread_reports`，只生成报告、不切换。
+  - `enable()` 只允许管理员调用，把快照冻结到 `settings.spread_basis`，并清掉 rhythm_long 缓存。
+  - 引擎：`CostModel.spread_hourly` / `basis` / `spread_at()`，`fill(..., at)`。只有 spread_hourly 不为空时才按成交 K 线的
+    UTC 小时取点差，旧口径路径不变（逐笔回归相同）。
+  - 其他模块的配合：
+    - `regime_bt.simulate(spread_bps=)`；
+    - `research.base_cost_model` / `cost_model`（后者按当前口径调用 `spread_model.apply`）；
+    - `params_key` 加入口径；
+    - `backtests.cost_basis` 列，NULL 表示固定代理（旧口径），页面上标出；
+    - challenger / rhythm 的 ETF 回测传入开盘点差。

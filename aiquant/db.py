@@ -63,7 +63,8 @@ CREATE TABLE IF NOT EXISTS backtests (
     signal_tf INTEGER NOT NULL, aux_tf INTEGER,
     split_label TEXT NOT NULL, assumptions_json TEXT NOT NULL,
     metrics_json TEXT NOT NULL, equity_json TEXT NOT NULL,
-    created_at TEXT NOT NULL, is_test INTEGER NOT NULL DEFAULT 0
+    created_at TEXT NOT NULL, is_test INTEGER NOT NULL DEFAULT 0,
+    cost_basis TEXT
 );
 CREATE TABLE IF NOT EXISTS benchmarks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -146,6 +147,9 @@ def init_db() -> None:
     with _lock:
         c = _connect()
         c.executescript(SCHEMA)
+        # 成本口径列（2026-10-30）：之前的回测为空 = 固定点差代理（旧口径），不重算、不覆盖
+        if "cost_basis" not in {r[1] for r in c.execute("PRAGMA table_info(backtests)")}:
+            c.execute("ALTER TABLE backtests ADD COLUMN cost_basis TEXT")
         for i in range(1, 6):
             c.execute(
                 "INSERT OR IGNORE INTO slots(slot_no, updated_at) VALUES(?, ?)", (i, now_iso())

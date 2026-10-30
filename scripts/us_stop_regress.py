@@ -41,7 +41,8 @@ def schema(sig, n, stop=None, trail=None, tp=None):
 cases = []
 for sig, trade in (("QQQ", "QLD"), ("SPY", "SSO")):
     for n in (5, 10, 50):
-        for stop, trail, tp in ((None, None, None), (3, None, None), (5, None, None), (None, (5, 3), None), (5, (8, 4), 20)):
+        for stop, trail, tp in ((None, None, None), (3, None, None), (5, None, None), (None, (5, 3), None), (5, (8, 4), 20),
+                                (None, None, 5), (None, None, 10)):
             cases.append((sig, trade, n, stop, trail, tp))
 B = {s: bars(s) for s in ("QQQ", "QLD", "SPY", "SSO")}
 res = {}
@@ -54,15 +55,19 @@ for sig, trade, n, stop, trail, tp in cases:
     r = bt.run(df, obj, 1440, None, cfg, df_signal=ds)
     key = f"{sig}->{trade} SMA{n} stop={stop} trail={trail} tp={tp}"
     from aiquant.engine.execution import fill
-    gaps = 0       # 跳空：开盘价已低于止损价 → 按开盘价成交（成交价 = 开盘价扣成本）
+    gaps = tp_gaps = 0   # 跳空：开盘价已越过止损 / 止盈价 → 按开盘价成交（成交价 = 开盘价扣成本）
     o = dict(zip(df["ts"].astype(str), df["open"]))
     for t in r["trades"]:
-        if t["exit_reason"] in ("止损", "移动止损"):
+        if t["exit_reason"] in ("止损", "移动止损", "止盈"):
             op = o.get(str(pd.Timestamp(t["exit_fill_ts"])))
             if op and abs(fill("sell", op, t["qty"], cfg.cost).price - t["exit_price"]) < 1e-6 * op:
-                gaps += 1
+                if t["exit_reason"] == "止盈":
+                    tp_gaps += 1
+                else:
+                    gaps += 1
     res[key] = {"final": round(r["metrics"]["final_equity"], 6), "trades": len(r["trades"]),
                 "stops": sum(1 for t in r["trades"] if t["exit_reason"] in ("止损", "移动止损")), "gap_fills": gaps,
+                "tps": sum(1 for t in r["trades"] if t["exit_reason"] == "止盈"), "tp_gap_fills": tp_gaps,
                 "rows": [[t["entry_fill_ts"], round(t["entry_price"], 6), t["exit_fill_ts"], round(t["exit_price"], 6),
                           t["exit_reason"], round(t["pnl"], 6)] for t in r["trades"]]}
 json.dump(res, open(out, "w"), ensure_ascii=False)

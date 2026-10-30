@@ -191,10 +191,22 @@ def trial_plan(equity: float, l1: dict | None = None, now: datetime | None = Non
         pct = max(0.0, min(float(c["trial_pct"]), pool))
         pool -= pct
         why = (f"{st['text']}：固定额度 {pct:g}% × 权益 {equity:,.0f} = {equity * pct / 100:,.0f} USD（从现金层出）"
-               if pct > 0 else f"{st['text']}：现金层没有空余（现金 {l1['cash_pct']:.1f}% 只够现金保留 {l1['reserve_pct']:g}%），"
-                               "试用额度为 0；可在资金分层里调低加密货币上限腾出空间")
+               if pct > 0 else f"{st['text']}：{trial_zero_hint(l1, c)}")
         out[dep["id"]] = {"budget": equity * pct / 100 if equity else 0.0, "pct": pct, "status": st, "why": why}
     return out
+
+
+def trial_zero_hint(l1: dict, c: dict | None = None) -> str:
+    """现金层没有空余时的提示：写明要调哪个参数、调到多少。"""
+    c = c or get_config()
+    free = max(0.0, l1["cash_pct"] - l1["reserve_pct"])
+    want = float(c["trial_total_pct"])
+    cr_max = float(c["crypto"]["max"])
+    to = max(0.0, min(cr_max, float(l1["crypto_pct"])) - (want - free))
+    return (f"现金层没有空余（现金 {l1['cash_pct']:.1f}% 只够现金保留 {l1['reserve_pct']:g}%），试用额度为 0。"
+            f"要给试用留出空间，请调「策略总台 → 资金两层分配 → 加密货币上限 %」（当前设置 {cr_max:g}%，实际 {float(l1['crypto_pct']):.0f}%）："
+            f"调到 {to:.0f}% 可腾出 {want:g}%（{int(want // float(c['trial_pct']) or 1)} 个试用额度，每个 {float(c['trial_pct']):g}%）。"
+            "调低后不会强制卖出 BTC 持仓，新额度在各策略下一次开仓时生效")
 
 
 def position_cap(equity: float) -> float:
@@ -379,4 +391,6 @@ def explain(equity: float | None) -> dict:
                                    f"{max(0.0, l1['cash_pct'] - l1['reserve_pct']):.1f}%）分配 "
                                    f"{sum(t['pct'] for t in trials.values()):g}%（每个最多 {get_config()['trial_pct']:g}%，"
                                    f"合计最多 {get_config()['trial_total_pct']:g}%）"])
+    free = max(0.0, l1["cash_pct"] - l1["reserve_pct"])
+    l1["trial_hint"] = ("新部署的策略将进入试用：" + trial_zero_hint(l1)) if free < 0.01 else None
     return {"layer1": l1, "us": rows_us, "crypto": rows_c}

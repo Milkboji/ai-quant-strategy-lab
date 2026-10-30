@@ -15,10 +15,23 @@ sys.path.insert(0, str(ROOT))
 os.chdir(ROOT)
 
 
+def _already_serving() -> bool:
+    """8501 端口上已经有一个正常响应的服务：不再启动第二个实例（否则两个交易循环会同时运行）。"""
+    import urllib.request
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:8501/_stcore/health", timeout=3) as r:
+            return r.status == 200
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def main() -> None:
     from aiquant import config
     logging.basicConfig(filename=str(config.LOG_DIR / "app.log"), level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    if _already_serving():
+        logging.getLogger("aiquant").warning("端口 8501 已有服务在运行，本次启动直接退出（不重复运行交易循环）")
+        return
     from aiquant import actions
     actions.init()
     logging.getLogger("aiquant").info("后台循环已在服务启动时开启（无需打开网页）")

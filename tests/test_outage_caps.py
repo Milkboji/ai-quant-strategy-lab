@@ -105,13 +105,15 @@ def _daily(opens, lows, highs, closes, start="2026-01-05"):
                          "open": opens, "high": highs, "low": lows, "close": closes, "volume": 1.0})
 
 
-def _always_long(stop=None):
+def _always_long(stop=None, tp=None):
     from aiquant.strategy.schema import validate
     sch = {"name": "t", "signal_tf": 1440, "indicators": [{"id": "m", "type": "SMA", "params": {"period": 2}}],
            "entry": {"mode": "all", "conditions": [{"left": {"ref": "close"}, "op": ">", "right": {"value": 0}}]},
            "exit": {"mode": "any", "conditions": [{"left": {"ref": "close"}, "op": "<", "right": {"value": 0}}]}}
     if stop:
         sch["stop_loss_pct"] = stop
+    if tp:
+        sch["take_profit_pct"] = tp
     obj, errs = validate(sch)
     assert not errs, errs
     return obj
@@ -136,6 +138,27 @@ def test_backtest_gap_below_stop_fills_at_open_not_stop_price():
     res2 = bt.run(_daily(o2, lo2, hi, c), _always_long(stop=5.0), 1440, None, cfg)
     t2 = [x for x in res2["trades"] if x["exit_reason"] == "止损"][0]
     assert t2["exit_price"] == pytest.approx(95.0)
+
+
+def test_backtest_take_profit_intraday_at_trigger_gap_up_at_open():
+    """回测止盈与执行一致：盘中触及按止盈价成交；开盘已跳空高于止盈价 → 按开盘价成交。"""
+    from aiquant import market as mk
+    from aiquant.engine import backtest as bt
+    from aiquant.engine.execution import CostModel
+    n = 8
+    o = [100.0] * n; lo = [99.0] * n; hi = [101.0] * n; c = [100.0] * n
+    o[4], lo[4], hi[4], c[4] = 112.0, 111.0, 113.0, 112.0       # 第 5 天跳空高开到 112（止盈价 105）
+    df = _daily(o, lo, hi, c)
+    cfg = bt.BTConfig(start=df["ts"].iloc[0].to_pydatetime(), end=(df["ts"].iloc[-1] + pd.Timedelta(days=1)).to_pydatetime(),
+                      initial_cash=10_000, cost=CostModel(0, 0, 0), market=mk.US_EQUITY)
+    t = [x for x in bt.run(df, _always_long(tp=5.0), 1440, None, cfg)["trades"] if x["exit_reason"] == "止盈"][0]
+    assert t["exit_price"] == pytest.approx(112.0)
+    o2, hi2, c2 = list(o), list(hi), list(c)
+    o2[4], hi2[4], c2[4] = 101.0, 106.0, 104.0                    # 盘中涨到 106 → 按 105
+    t2 = [x for x in bt.run(_daily(o2, lo, hi2, c2), _always_long(tp=5.0), 1440, None, cfg)["trades"]
+          if x["exit_reason"] == "止盈"][0]
+    assert t2["exit_price"] == pytest.approx(105.0)
+    assert any("跳空高开越过止盈价时按开盘价成交" in a for a in bt.ASSUMPTIONS_DAILY)
 
 
 def test_backtest_position_cap_trims_and_noop_when_not_binding():

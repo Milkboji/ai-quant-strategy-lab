@@ -427,9 +427,11 @@ def etf_long_metrics(compute: bool = False) -> dict | None:
     if cached and cached.get("rules") == sig and cached.get("params") == p and cached.get("hist_end") == end:
         return cached
     from . import allocation
+    from . import spread_model
     years = regime_bt.yearly(df, p["sma"], p["band"], max(2017, df.index[0].year + 1), df.index[-1].year,
                              market=mk.US_EQUITY, rhythm=configured(mk.US_EQUITY),
-                             cap_frac=allocation.backtest_cap_frac(allocation.get_config()["us_equity"]["target"]))
+                             cap_frac=allocation.backtest_cap_frac(allocation.get_config()["us_equity"]["target"]),
+                             spread_bps=spread_model.open_spread(p["trade"]))
     if not years:
         return None
     mr = sum(y["ret"] for y in years) / len(years)

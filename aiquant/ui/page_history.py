@@ -24,10 +24,13 @@ def render() -> None:
         st.dataframe(j, use_container_width=True, hide_index=True, height=420)
     with t2:
         b = db.q("SELECT id,job_id,version_id,slot_no,dataset_id,dataset_hash,window_start,window_end,signal_tf,aux_tf,"
-                 "split_label,metrics_json,is_test,created_at FROM backtests ORDER BY id DESC LIMIT 500")
+                 "split_label,metrics_json,is_test,created_at,cost_basis FROM backtests ORDER BY id DESC LIMIT 500")
         rows = []
+        from .. import spread_model
         for x in b:
             m = json.loads(x.pop("metrics_json"))
+            cb = x.pop("cost_basis")
+            x["成本口径"] = spread_model.basis_label(cb) + ("（与当前不同）" if spread_model.current() and spread_model.is_old(cb) else "")
             x.update({"净收益%": m.get("net_return_pct"), "最大回撤%": m.get("max_drawdown_pct"), "交易": m.get("trades"),
                       "总成本": m.get("total_cost")})
             x["dataset_hash"] = x["dataset_hash"][:12]

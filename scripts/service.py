@@ -366,6 +366,14 @@ def watch() -> int:
             _wlog(f"状态：{'正常' if healthy() else '无响应'}，PID {pid}，内存 {mem} MB")
             last_mem_log = time.time()
         reason = None
+        if not _alive(pid) and healthy():
+            # PID 文件里的进程已退出，但端口上有一个正常响应的实例（例如开机自启和保活同时启动了两个）：
+            # 接管它，不再启动新进程（否则新进程会因端口被占退出，每分钟循环一次）
+            live = _port_pid() or _app_pid()
+            if live and _alive(live):
+                PID.write_text(str(live))
+                _wlog(f"接管正在运行的实例（PID {live}），不重复启动")
+                pid = live
         if not _alive(pid):
             reason = "服务进程已退出"
         elif mem and mem > MEM_LIMIT_MB:

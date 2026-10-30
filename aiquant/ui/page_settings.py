@@ -65,14 +65,15 @@ def notify_panel() -> None:
     cfg = notify.get_config()
     stt = notify.channel_status()
     with st.container(border=True):
-        C.section("通知（邮件 / Telegram）")
+        C.section("通知（邮件 / Telegram / 企业微信 / 飞书）")
         st.caption("账号只写在本机 config/secrets.local（不进代码仓库），这里只显示掩码。所有发送都走系统唯一的对外出口："
                    "主机白名单 + 审计（下方「外部端点访问审计」可查，token 和密码不会被记录）。"
-                   "发送失败的通知会保留，后台每分钟重试，最多 5 次。修改 secrets.local 后需要重启。")
+                   "发送失败的通知会保留，后台每分钟重试，最多 5 次。修改 secrets.local 后需要重启。"
+                   "启用的通道并行发送、互不影响；在国内建议启用企业微信或飞书（Telegram 需要代理）。")
         cols = st.columns(2)
         new_ch = {}
         for i, (ch, name) in enumerate(notify.CHANNELS.items()):
-            with cols[i]:
+            with cols[i % 2]:
                 s_ = stt[ch]
                 st.markdown(f"**{name}** " + (C.pill("已配置", "green") if s_["configured"] else C.pill("未配置", "gray")),
                             unsafe_allow_html=True)
@@ -97,7 +98,8 @@ def notify_panel() -> None:
         if c[1].button("保存通知设置", key="nt_save", type="primary", use_container_width=True):
             try:
                 notify.set_config(actor=effective_user(), role=role(), email=new_ch["email"],
-                                  telegram=new_ch["telegram"], events=new_ev, daily_hour=int(hour))
+                                  telegram=new_ch["telegram"], wecom=new_ch["wecom"], feishu=new_ch["feishu"],
+                                  events=new_ev, daily_hour=int(hour))
                 flash("set", "ok", "通知设置已保存")
             except Exception as e:  # noqa: BLE001
                 flash("set", "err", str(e))
@@ -106,6 +108,10 @@ def notify_panel() -> None:
             st.code("NOTIFY_SMTP_HOST=smtp.qq.com\nNOTIFY_SMTP_PORT=465\nNOTIFY_SMTP_USER=你的邮箱@qq.com\n"
                     "NOTIFY_SMTP_PASSWORD=邮箱授权码（不是登录密码）\nNOTIFY_EMAIL_TO=收件人1@x.com,收件人2@y.com\n"
                     "NOTIFY_TELEGRAM_BOT_TOKEN=123456:ABC...\nNOTIFY_TELEGRAM_CHAT_ID=你的 chat id\n"
+                    "# 企业微信群机器人（群设置 → 群机器人 → 添加 → 复制 Webhook 地址）：\n"
+                    "NOTIFY_WECOM_WEBHOOK=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...\n"
+                    "# 飞书群机器人（可选；开了签名校验再填 SECRET）：\n"
+                    "NOTIFY_FEISHU_WEBHOOK=https://open.feishu.cn/open-apis/bot/v2/hook/...\n# NOTIFY_FEISHU_SECRET=...\n"
                     "# 不在内置白名单里的邮件服务商：\n# NOTIFY_SMTP_ALLOW_HOST=smtp.example.com", language="ini")
         rec = notify.recent(30)
         if rec:

@@ -30,6 +30,7 @@ ASSUMPTIONS = [
     "成交在信号后第一根可用5分钟K线开盘价（作为中间价代理）",
     "同一5分钟K线同时触及止损和止盈时按先止损处理（保守假设，非真实盘中顺序）",
     "跳空穿越止损价时按开盘价成交",
+    "止盈：盘中触及按止盈价成交，跳空高开越过止盈价时按开盘价成交",
     "移动止损最高价仅使用此前已完成5分钟K线",
     "手续费每边计一次，滑点每笔成交计一次，点差每笔成交计半个价差，不重复扣费",
     "仅做多、1倍、无杠杆、不允许负现金",
@@ -65,6 +66,7 @@ ASSUMPTIONS_DAILY = [
     "成交在信号后下一交易日的开盘价（作为中间价代理）；休市日、节假日按交易日历顺延",
     "止损 / 止盈按日线最高价、最低价检查；同一天同时触及时按先止损处理（保守假设）",
     "跳空穿越止损价时按开盘价成交",
+    "止盈：盘中触及按止盈价成交，跳空高开越过止盈价时按开盘价成交（模拟盘交易时段内每 5 分钟检查最新价，开盘后第一次检查即卖出）",
     "成本按美股：佣金 0，滑点与半个点差每笔成交计一次，卖出另计监管费",
     "仅做多、1倍、无杠杆、不允许负现金（杠杆来自杠杆 ETF 本身）",
     "窗口结束仍持仓时按最后收盘价平仓并计入成本",
@@ -166,9 +168,11 @@ def run(df5: pd.DataFrame, s: StrategySchema, signal_tf: int, aux_tf: int | None
     eq = np.empty(n - i0)
     blocked = 0
 
+    hourly = cm.spread_hourly is not None   # 分时段点差（实测口径）；旧口径为 False，成交路径与之前完全相同
+
     def do_sell(i, mid, reason, signal_ts):
         nonlocal cash, qty, entry_fill
-        f = fill("sell", mid, qty, cm)
+        f = fill("sell", mid, qty, cm, ts[i] if hourly else None)
         rd = risk.check_sell(qty, f.qty)
         assert rd.ok, rd.reason
         cash += f.notional - f.fee
@@ -195,7 +199,7 @@ def run(df5: pd.DataFrame, s: StrategySchema, signal_tf: int, aux_tf: int | None
         q = qty - target_qty
         if q <= 1e-12:
             return
-        f = fill("sell", o[i], q, cm)
+        f = fill("sell", o[i], q, cm, ts[i] if hourly else None)
         cash += f.notional - f.fee
         totals["fee"] += f.fee; totals["spread"] += f.spread_cost; totals["slip"] += f.slippage_cost
         ef = entry_fill
@@ -237,7 +241,7 @@ def run(df5: pd.DataFrame, s: StrategySchema, signal_tf: int, aux_tf: int | None
                 rhythm_skipped += 1
             elif ent[mi] and not ex[mi]:
                 q = max_buy_qty(cash, o[i], alloc * float(vmult[mi]), cm, cfg.reserve_pct)
-                f = fill("buy", o[i], q, cm)
+                f = fill("buy", o[i], q, cm, ts[i] if hourly else None)
                 rd = risk.check_buy(cash, f.notional, f.fee, alloc, max_alloc_pct=cfg.max_alloc_pct)
                 if rd.ok:
                     cash -= f.notional + f.fee
@@ -320,10 +324,10 @@ def buy_and_hold(df5: pd.DataFrame, cfg: BTConfig) -> dict:
         raise ValueError("基准区间无数据")
     cm = cfg.cost
     q = max_buy_qty(cfg.initial_cash, d["open"].iloc[0], 100.0, cm, cfg.reserve_pct)
-    b = fill("buy", d["open"].iloc[0], q, cm)
+    b = fill("buy", d["open"].iloc[0], q, cm, d["ts"].iloc[0] if cm.spread_hourly is not None else None)
     cash = cfg.initial_cash - b.notional - b.fee
     eq = cash + q * d["close"].to_numpy(float)
-    sl = fill("sell", d["close"].iloc[-1], q, cm)
+    sl = fill("sell", d["close"].iloc[-1], q, cm, d["ts"].iloc[-1] if cm.spread_hourly is not None else None)
     final = cash + sl.notional - sl.fee
     eq[-1] = final
     raw = (d["close"].iloc[-1] / d["open"].iloc[0] - 1) * 100

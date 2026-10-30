@@ -31,8 +31,29 @@ def paper_orders_unlocked() -> bool:
 
 
 _ALLOWED_HOSTS = {"data.alpaca.markets", "paper-api.alpaca.markets", "api.deepseek.com",
-                  "api.telegram.org"}   # Telegram 只允许 POST /bot<token>/sendMessage（通知模块）
+                  "api.telegram.org",       # Telegram 只允许 POST /bot<token>/sendMessage（通知模块）
+                  "qyapi.weixin.qq.com",    # 企业微信群机器人只允许 POST /cgi-bin/webhook/send?key=…
+                  "open.feishu.cn"}         # 飞书群机器人只允许 POST /open-apis/bot/v2/hook/<token>
 _TG_SEND = re.compile(r"^/bot[^/]+/sendmessage$")
+_WECOM_SEND = "/cgi-bin/webhook/send"
+_FEISHU_HOOK = re.compile(r"^/open-apis/bot/v2/hook/[a-z0-9-]+$")
+_WEBHOOK_ONLY = {"api.telegram.org": "Telegram 只允许发送消息（POST sendMessage）",
+                 "qyapi.weixin.qq.com": "企业微信只允许群机器人发消息（POST /cgi-bin/webhook/send）",
+                 "open.feishu.cn": "飞书只允许群机器人发消息（POST /open-apis/bot/v2/hook/…）"}
+
+
+def _webhook_ok(host: str, method: str, path: str) -> bool:
+    if method != "POST":
+        return False
+    if host == "api.telegram.org":
+        return bool(_TG_SEND.match(path))
+    if host == "qyapi.weixin.qq.com":
+        return path == _WECOM_SEND
+    if host == "open.feishu.cn":
+        return bool(_FEISHU_HOOK.match(path))
+    return False
+
+
 # 通知邮件的 SMTP 主机白名单（常见邮箱服务商）。如用其他服务商，在 config/secrets.local 写 NOTIFY_SMTP_ALLOW_HOST=主机名
 SMTP_HOSTS = {"smtp.qq.com", "smtp.exmail.qq.com", "smtp.163.com", "smtp.126.com", "smtp.yeah.net", "smtp.sina.com",
               "smtp.aliyun.com", "smtp.qiye.aliyun.com", "smtp.gmail.com", "smtp.office365.com",
@@ -49,14 +70,14 @@ def check_url(method: str, url: str) -> None:
         raise ForbiddenEndpoint("禁止访问 Alpaca Live 端点 api.alpaca.markets")
     if host not in _ALLOWED_HOSTS:
         raise ForbiddenEndpoint(f"未在白名单中的端点被拒绝: {host}")
-    if host == "api.telegram.org" and not (method.upper() == "POST" and _TG_SEND.match(unquote(u.path).lower().rstrip("/"))):
-        raise ForbiddenEndpoint("Telegram 只允许发送消息（POST sendMessage）")
     path = unquote(u.path).lower().rstrip("/")
     m = method.upper()
+    if host in _WEBHOOK_ONLY:
+        if not _webhook_ok(host, m, path):
+            raise ForbiddenEndpoint(_WEBHOOK_ONLY[host])
+        return
     if m in _WRITE_METHODS:
         if host == "api.deepseek.com" and m == "POST" and path == "/chat/completions":
-            return
-        if host == "api.telegram.org" and m == "POST" and _TG_SEND.match(path):
             return
         if host == "paper-api.alpaca.markets" and paper_orders_unlocked() and (
                 (m == "POST" and path == "/v2/orders")
@@ -79,8 +100,15 @@ def request(method: str, url: str, *, headers: dict | None = None, params: dict 
 
 
 def redact(url: str) -> str:
-    """审计记录里不保存密钥：Telegram 机器人 token 打码。"""
-    return re.sub(r"/bot[^/]+/", "/bot***/", url)
+    """审计记录里不保存密钥：Telegram 机器人 token、企业微信 key、飞书 hook token 打码。"""
+    return redact_text(url)
+
+
+def redact_text(text: str) -> str:
+    """任意文本（地址、错误信息）里的通知密钥打码，用于审计和发件箱的错误记录。"""
+    t = re.sub(r"/bot[^/\s]+/", "/bot***/", str(text))
+    t = re.sub(r"([?&]key=)[^&\s'\"]+", r"\1***", t)
+    return re.sub(r"(/bot/v2/hook/)[^/?\s'\"]+", r"\1***", t)
 
 
 def smtp_allowed(host: str) -> bool:

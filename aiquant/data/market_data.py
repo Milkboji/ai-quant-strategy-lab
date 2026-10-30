@@ -105,7 +105,12 @@ def load_master(venue: str = alpaca.VENUE, symbol: str = "BTC/USD") -> pd.DataFr
         hit = _master_cache.get(str(p))
         if hit and hit[0] == sig:
             return hit[1].copy()
-    df = pd.read_csv(p)
+    try:
+        df = pd.read_csv(p)
+    except Exception as e:  # noqa: BLE001  文件损坏（例如两个进程同时写）：隔离、保留能读出的部分、其余重新下载
+        df = _recover_master(p, venue, symbol, e)
+        st_ = p.stat() if p.exists() else None
+        sig = (st_.st_mtime_ns, st_.st_size) if st_ else (0, 0)
     df["ts"] = pd.to_datetime(df["ts"], utc=True)
     with _master_lock:
         _master_cache.clear()          # 只保留最新一份
@@ -113,11 +118,76 @@ def load_master(venue: str = alpaca.VENUE, symbol: str = "BTC/USD") -> pd.DataFr
     return df.copy()
 
 
+def _recover_master(p: Path, venue: str, symbol: str, err: Exception) -> pd.DataFrame:
+    """主行情缓存损坏：
+    1. 逐行读出损坏位置之前的完整 K 线（文件按时间排序，所以是从最早开始的连续一段）；
+    2. 原文件改名为 .corrupt-时间 隔离（不删除，便于排查）；
+    3. 保存读出的部分，覆盖区间截到最后一根读出的 K 线 → 之后缺的部分在下次更新时自动重新下载。"""
+    import gzip
+    import logging
+    lines: list[str] = []
+    try:   # 逐行读到第一行坏数据为止（字段数不对、时间或价格不是数字），之后的全部丢弃
+        with gzip.open(p, "rt", encoding="utf-8", errors="strict") as f:
+            header = f.readline()
+            ncol = len(header.strip().split(","))
+            lines.append(header)
+            for line in f:
+                parts = line.rstrip("\n").split(",")
+                if len(parts) != ncol or not line.endswith("\n"):
+                    break
+                try:
+                    pd.Timestamp(parts[0])
+                    [float(x) for x in parts[1:5]]
+                except Exception:  # noqa: BLE001
+                    break
+                lines.append(line)
+    except Exception:  # noqa: BLE001
+        pass
+    good = pd.DataFrame(columns=COLS)
+    if len(lines) > 2:
+        try:
+            good = pd.read_csv(io.StringIO("".join(lines[:-1])))    # 再去掉一行，避免损坏前最后一行不完整
+            good = good.dropna(subset=["ts", "open", "high", "low", "close"])
+            good["ts"] = pd.to_datetime(good["ts"], utc=True, errors="coerce")
+            good = good.dropna(subset=["ts"])
+            good, _ = clean_bars(good)
+        except Exception:  # noqa: BLE001
+            good = pd.DataFrame(columns=COLS)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    bad = p.with_name(f"{p.name}.corrupt-{stamp}")
+    try:
+        p.replace(bad)
+    except OSError:          # 另一个进程已经处理过
+        pass
+    last = pd.Timestamp(good["ts"].max()) + pd.Timedelta(minutes=5) if len(good) else None
+    if len(good):
+        _save_master(good, venue, symbol)
+        cov = [(s_, min(e_, last.to_pydatetime())) for s_, e_ in get_coverage(venue, symbol) if s_ < last.to_pydatetime()]
+    else:
+        cov = []
+    _set_coverage(cov, venue, symbol)
+    msg = (f"行情缓存文件损坏（{type(err).__name__}: {str(err)[:80]}），已隔离为 {bad.name}；"
+           + (f"保留 {len(good)} 根 K 线（到 {last:%Y-%m-%d %H:%M} UTC），之后的部分自动重新下载" if len(good)
+              else "没有可用的 K 线，全部重新下载"))
+    logging.getLogger("aiquant.data").error(msg)
+    try:
+        from ..paper import runner as pr
+        pr.event(None, "ERROR", msg)
+    except Exception:  # noqa: BLE001
+        pass
+    return good if len(good) else pd.DataFrame(columns=COLS)
+
+
 def _save_master(df: pd.DataFrame, venue: str, symbol: str) -> None:
+    """先写本进程 / 本线程专用的临时文件，再原子替换：多个进程同时写也不会把文件写坏（最多后写的覆盖先写的）。"""
+    import os
     p = _master_path(venue, symbol)
-    tmp = p.with_name(p.name + ".tmp")
-    df.to_csv(tmp, index=False, compression="gzip")
-    tmp.replace(p)
+    tmp = p.with_name(f"{p.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        df.to_csv(tmp, index=False, compression="gzip")
+        tmp.replace(p)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def clean_bars(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:

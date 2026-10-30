@@ -3,8 +3,14 @@
 // 这个 Worker 在通道断开时先自动重试几秒（GET 请求），仍不通就返回一个会自动刷新的"正在重新连接"页面，
 // 用户不会再看到 Cloudflare 的错误页。WebSocket（Streamlit 实时连接）直接透传，断开时由页面自己重连。
 // 外部心跳监控（2026-10-30）：定时任务（Cron Trigger，每 5 分钟）读取健康检查文件 /app/static/health.json
-// （只含 {"status":"ok","ts":秒}，不含任何数据）。连续 2 次失败 → Telegram 通知；恢复后再发一条。
-// 需要的绑定：KV 命名空间 GUARD_KV（记连续失败次数）；Secrets TG_TOKEN、TG_CHAT（在 Cloudflare 控制台填写，不进仓库）。
+// （只含 {"status":"ok","ts":秒}，不含任何数据）。连续 2 次失败 → 通知；恢复后再发一条。
+// 通知渠道（并行发送，任一渠道成功即算已通知）：
+//   Telegram：Secrets TG_TOKEN、TG_CHAT
+//   企业微信群机器人：Secret WECOM_WEBHOOK（完整地址 https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=…）
+//   飞书群机器人（可选）：Secret FEISHU_WEBHOOK（https://open.feishu.cn/open-apis/bot/v2/hook/…），
+//     机器人开了「签名校验」时再加 Secret FEISHU_SECRET
+// 每个渠道单独开关：普通变量 NOTIFY_CHANNELS，例如 "wecom,feishu"；不设 = 已配置的渠道全部启用。
+// 需要的绑定：KV 命名空间 GUARD_KV（记连续失败次数）。所有地址 / token 只放在 Cloudflare 控制台的 Secrets 里，不进仓库。
 const HEALTH_URL = "https://your-domain.example/app/static/health.json";
 const STALE_S = 600;          // 健康文件超过 10 分钟没更新 = 后台交易循环停了（网页还在也算失败）
 const FAILS_TO_ALERT = 2;
@@ -57,13 +63,59 @@ async function probe() {
   return { ok: false, err: last };
 }
 
-async function telegram(env, text) {
-  if (!env.TG_TOKEN || !env.TG_CHAT) { console.log("telegram secrets missing:", text); return false; }
-  const r = await fetch(`https://api.telegram.org/bot${env.TG_TOKEN}/sendMessage`, {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: env.TG_CHAT, text, disable_web_page_preview: true }),
-  });
-  return r.ok;
+const CHANNELS = ["telegram", "wecom", "feishu"];
+
+function enabled(env) {
+  const raw = String(env.NOTIFY_CHANNELS || "").trim().toLowerCase();
+  const want = raw ? raw.split(/[\s,;]+/).filter(Boolean) : CHANNELS;
+  const configured = {
+    telegram: !!(env.TG_TOKEN && env.TG_CHAT),
+    wecom: !!env.WECOM_WEBHOOK,
+    feishu: !!env.FEISHU_WEBHOOK,
+  };
+  return CHANNELS.filter((c) => want.includes(c) && configured[c]);
+}
+
+async function feishuSign(secret) {
+  // 飞书签名：base64(HMAC-SHA256(key = timestamp + "\n" + secret, message = 空))
+  const ts = Math.floor(Date.now() / 1000);
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(`${ts}\n${secret}`),
+    { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sig = new Uint8Array(await crypto.subtle.sign("HMAC", key, new Uint8Array(0)));
+  return { timestamp: String(ts), sign: btoa(String.fromCharCode(...sig)) };
+}
+
+async function sendOne(env, ch, text) {
+  const post = (url, body) => fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  if (ch === "telegram") {
+    const r = await post(`https://api.telegram.org/bot${env.TG_TOKEN}/sendMessage`,
+      { chat_id: env.TG_CHAT, text, disable_web_page_preview: true });
+    return r.ok;
+  }
+  if (ch === "wecom") {
+    const r = await post(env.WECOM_WEBHOOK, { msgtype: "text", text: { content: text.slice(0, 1800) } });
+    if (!r.ok) return false;
+    const j = await r.json().catch(() => ({}));
+    return j.errcode === 0;
+  }
+  if (ch === "feishu") {
+    const body = { msg_type: "text", content: { text } };
+    if (env.FEISHU_SECRET) Object.assign(body, await feishuSign(env.FEISHU_SECRET));
+    const r = await post(env.FEISHU_WEBHOOK, body);
+    if (!r.ok) return false;
+    const j = await r.json().catch(() => ({}));
+    return (j.code ?? j.StatusCode) === 0;
+  }
+  return false;
+}
+
+// 已启用的渠道并行发送；任一成功即返回 true。失败只写日志（不打印地址 / token）。
+async function notify(env, text) {
+  const chans = enabled(env);
+  if (!chans.length) { console.log("no notify channel configured:", text); return false; }
+  const res = await Promise.all(chans.map((c) => sendOne(env, c, text).catch((e) => { console.log(c, "failed", String(e).slice(0, 80)); return false; })));
+  chans.forEach((c, i) => { if (!res[i]) console.log(c, "send failed"); });
+  return res.some(Boolean);
 }
 
 function bj(ms) {
@@ -78,7 +130,7 @@ async function heartbeat(env) {
   if (res.ok) {
     if (st.alerted) {
       const mins = Math.round((now - (st.down_since || now)) / 60000);
-      await telegram(env, `✅ 量化服务已恢复（外部心跳监控）\n中断约 ${mins} 分钟：${bj(st.down_since || now)} → ${bj(now)}（北京时间）\n`
+      await notify(env, `✅ 量化服务已恢复（外部心跳监控）\n中断约 ${mins} 分钟：${bj(st.down_since || now)} → ${bj(now)}（北京时间）\n`
         + "恢复后本机会立即补做一次全策略检查，详见事件流。");
     }
     if (st.fails || st.alerted || !st.last_ok || now - st.last_ok > 3600 * 1000) {
@@ -90,7 +142,7 @@ async function heartbeat(env) {
   const down_since = st.down_since || now;
   let alerted = !!st.alerted;
   if (fails >= FAILS_TO_ALERT && !alerted) {
-    alerted = await telegram(env, `⚠️ 量化服务失联（外部心跳监控，连续 ${fails} 次检查失败）\n原因：${res.err}\n`
+    alerted = await notify(env, `⚠️ 量化服务失联（外部心跳监控，连续 ${fails} 次检查失败）\n原因：${res.err}\n`
       + `最后一次正常：${st.last_ok ? bj(st.last_ok) : "未知"}（北京时间）\n`
       + "电脑可能关机、睡眠、断网或断电；本机此时自己发不出通知。");
   }

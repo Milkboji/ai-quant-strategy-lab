@@ -172,14 +172,23 @@ def resolve_window(r: dict) -> tuple[datetime, datetime]:
     return end - timedelta(days=days), end
 
 
-def cost_model(r: dict, market=None) -> CostModel:
-    """研究设置里的成本（加密货币）；美股使用市场配置里的成本（佣金 0、滑点、点差、卖出监管费）。"""
+def base_cost_model(r: dict, market=None) -> CostModel:
+    """固定代理值（旧口径）：研究设置里的成本（加密货币）；美股使用市场配置里的成本（佣金 0、滑点、点差、卖出监管费）。"""
     from . import market as mk
     m = market or mk.of_symbol(r.get("symbol"))
     if m.key != "crypto":
         return m.cost()
     return CostModel(fee_bps=float(r["fee_bps"]), slippage_bps=float(r["slippage_bps"]),
                      spread_bps=float(r["spread_bps"]), spread_source="冻结代理模型（未使用历史逐笔报价）")
+
+
+def cost_model(r: dict, market=None) -> CostModel:
+    """当前口径的成本模型：管理员确认切换到实测点差后，点差按交易品种的分时段估计（spread_model）；否则为固定代理值。"""
+    from . import market as mk
+    from . import spread_model
+    m = market or mk.of_symbol(r.get("symbol"))
+    sym = r.get("symbol") if m.key != "crypto" else "BTC/USD"
+    return spread_model.apply(base_cost_model(r, m), sym)
 
 
 def bt_config(start: datetime, end: datetime, r: dict, market=None, account_share_pct: float | None = None) -> bt.BTConfig:
@@ -226,6 +235,9 @@ def params_key(version_id: int, tf: int, aux: int | None, start: datetime, end: 
     m = mk.of_symbol(r.get("symbol"))
     if rhythm.current(m) is not None:   # 交易节奏规则变化 → 之前的回测结果不再复用
         d["rh"] = rhythm.rules_hash(m)
+    from . import spread_model
+    if spread_model.current_name() != spread_model.FIXED:   # 成本口径变化 → 旧口径的结果不复用（保留，不覆盖）
+        d["basis"] = spread_model.current_name()
     return hashlib.sha256(json.dumps(d, sort_keys=True).encode()).hexdigest()[:32]
 
 
@@ -285,7 +297,7 @@ def store_backtest(*, job_id, version: dict, slot_no, ds: dict, start: datetime,
                    market=None) -> int:
     """持久化一次回测（成交、权益曲线、留出集触及记录）。供任务队列与自动进化共用。"""
     v = version
-    assumptions = {"cost_model": cfg.cost.as_dict(), "rules": res["assumptions"],
+    assumptions = {"cost_model": cfg.cost.as_dict(), "cost_basis": cfg.cost.basis, "rules": res["assumptions"],
                    "initial_cash": cfg.initial_cash, "max_alloc_pct": cfg.max_alloc_pct,
                    "warmup_start": json.loads(ds["quality_json"]).get("warmup_start"),
                    "data_source": ds["source"], "venue": ds["venue"]}
@@ -294,11 +306,11 @@ def store_backtest(*, job_id, version: dict, slot_no, ds: dict, start: datetime,
     with db.tx() as c:
         cur = c.execute(
             "INSERT INTO backtests(job_id,version_id,slot_no,dataset_id,dataset_hash,window_start,window_end,"
-            "signal_tf,aux_tf,split_label,assumptions_json,metrics_json,equity_json,created_at,is_test) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "signal_tf,aux_tf,split_label,assumptions_json,metrics_json,equity_json,created_at,is_test,cost_basis) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (job_id, v["id"], slot_no, ds["id"], ds["sha256"], start.isoformat(), end.isoformat(),
              tf, aux, split, json.dumps(clean(assumptions), ensure_ascii=False),
-             json.dumps(clean(res["metrics"])), json.dumps(res["equity"]), db.now_iso(), is_test))
+             json.dumps(clean(res["metrics"])), json.dumps(res["equity"]), db.now_iso(), is_test, cfg.cost.basis))
         bid = cur.lastrowid
         for t in res["trades"]:
             t = clean(t)

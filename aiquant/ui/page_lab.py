@@ -524,8 +524,17 @@ def slot_card(n: int, r: dict) -> None:
         if res:
             st.markdown(f'<div class="aq-sub">结果：v{registry.get_version(res["version_id"])["version_no"]} · '
                         f'{res["split_label"]}{" · <b class=neg>测试数据</b>" if res["is_test"] else ""} · '
-                        f'{res["window_start"][:10]}→{res["window_end"][:10]}</div>', unsafe_allow_html=True)
+                        f'{res["window_start"][:10]}→{res["window_end"][:10]}{_basis_note(res)}</div>', unsafe_allow_html=True)
         st.markdown(C.metrics_grid(m), unsafe_allow_html=True)
+
+
+def _basis_note(res: dict) -> str:
+    """成本口径与当前不同（切换到实测点差之前的结果）→ 标为旧口径，不重算、不覆盖。"""
+    from .. import spread_model
+    b = res.get("cost_basis")
+    if spread_model.is_old(b):
+        return f' · <b class=neg>旧口径：{C.esc(spread_model.basis_label(b))}</b>'
+    return ""
 
 
 def params_form(n: int, draft: dict | None) -> None:

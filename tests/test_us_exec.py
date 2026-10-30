@@ -294,6 +294,8 @@ def test_trial_budget_from_cash_layer_not_from_formal_strategies(env, monkeypatc
         formal_before = allocation.plan_us(100_000)[us_exec.etf_deployment()["id"]]["budget"]
         tp = allocation.trial_plan(100_000)
         assert all(tp[x]["budget"] == 0 for x in (a, b, c, d)) and "现金层没有空余" in tp[a]["why"]
+        assert "加密货币上限 %" in tp[a]["why"] and "调到 51%" in tp[a]["why"]
+        assert "加密货币上限 %" in allocation.explain(100_000)["layer1"]["trial_hint"]
         allocation.set_config(actor="t", role="trader", crypto_max=46)     # 腾出 20% 现金层（现金保留 4% 之外）
         tp = allocation.trial_plan(100_000)
         assert [tp[x]["pct"] for x in (a, b, c, d)] == [5, 5, 5, 0]      # 合计不超过 15%

@@ -24,14 +24,15 @@ def regime_series(close: pd.Series, n: int, band: float) -> pd.Series:
     return st.ffill().fillna(0.0)
 
 
-def _side_cost(market, side: str) -> float:
+def _side_cost(market, side: str, spread_bps: float | None = None) -> float:
+    """spread_bps：实测口径下交易品种开盘时段的完整点差（None = 市场配置的固定代理值，旧口径）。"""
     c = market.cost()
-    bps = c.spread_bps / 2 + c.slippage_bps + c.fee_bps + (c.sell_fee_bps if side == "sell" else 0.0)
+    bps = (c.spread_bps if spread_bps is None else float(spread_bps)) / 2 + c.slippage_bps + c.fee_bps + (c.sell_fee_bps if side == "sell" else 0.0)
     return bps / 1e4
 
 
 def simulate(df: pd.DataFrame, sma: int, band: float, *, market=None, rhythm: Rhythm | None = None,
-             cap_frac: float | None = None) -> pd.DataFrame:
+             cap_frac: float | None = None, spread_bps: float | None = None) -> pd.DataFrame:
     """逐日模拟。cap_frac：单个策略持仓上限（占本策略资金的比例，按账户口径换算；None 或 ≥ 1 = 不限）。df：index=美东交易日（naive Timestamp），列 sig_close / open / close（交易品种）。
     返回每日一行：size（当日开盘后持有的仓位比例）、cost、r（开盘→次日开盘收益）、pr（净收益）、event、blocked。"""
     from .. import market as mk
@@ -52,7 +53,7 @@ def simulate(df: pd.DataFrame, sma: int, band: float, *, market=None, rhythm: Rh
         _, vmult = lookup(ctx, t_open)
     else:
         vmult = np.ones(n)
-    c_buy, c_sell = _side_cost(m, "buy"), _side_cost(m, "sell")
+    c_buy, c_sell = _side_cost(m, "buy", spread_bps), _side_cost(m, "sell", spread_bps)
     size = np.zeros(n)
     cost = np.zeros(n)
     event = [""] * n
@@ -104,18 +105,19 @@ def metrics(sim: pd.DataFrame, start: str, end: str, periods_per_year: int = 252
 
 
 def backtest(df: pd.DataFrame, sma: int, band: float, start: str, end: str, *, market=None,
-             rhythm: Rhythm | None = None, cap_frac: float | None = None) -> dict:
+             rhythm: Rhythm | None = None, cap_frac: float | None = None, spread_bps: float | None = None) -> dict:
     from .. import market as mk
     m = market or mk.US_EQUITY
-    return metrics(simulate(df, sma, band, market=m, rhythm=rhythm, cap_frac=cap_frac), start, end, m.periods_per_year)
+    return metrics(simulate(df, sma, band, market=m, rhythm=rhythm, cap_frac=cap_frac, spread_bps=spread_bps),
+                   start, end, m.periods_per_year)
 
 
 def yearly(df: pd.DataFrame, sma: int, band: float, first_year: int, last_year: int, *, market=None,
-           rhythm: Rhythm | None = None, cap_frac: float | None = None) -> list[dict]:
+           rhythm: Rhythm | None = None, cap_frac: float | None = None, spread_bps: float | None = None) -> list[dict]:
     """逐个自然年的结果（长周期体检用）：一次模拟，按年切片。"""
     from .. import market as mk
     m = market or mk.US_EQUITY
-    sim = simulate(df, sma, band, market=m, rhythm=rhythm, cap_frac=cap_frac)
+    sim = simulate(df, sma, band, market=m, rhythm=rhythm, cap_frac=cap_frac, spread_bps=spread_bps)
     out = []
     for y in range(first_year, last_year + 1):
         k = metrics(sim, f"{y}-01-01", f"{y}-12-31", m.periods_per_year)
