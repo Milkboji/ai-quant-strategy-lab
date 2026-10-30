@@ -73,6 +73,7 @@ def render() -> None:
         _card(r, effective_user(), role(), focus == r["key"])
     if etf:
         _etf_card(etf, effective_user(), role(), focus == "etf")
+    _my_system_cards(effective_user(), role())
     _audit_panel()
 
 
@@ -230,6 +231,76 @@ def _actions(r: dict, actor: str, rl: str) -> None:
             except Exception as e:  # noqa: BLE001
                 flash("console", "err", f"{r['name']}：{e}")
             st.rerun()
+
+
+def _my_system_cards(actor: str, rl: str) -> None:
+    """我的交易系统 v1：每个市场一张卡片（状态、试用期、各品种分批止损、为什么）+ 一个参数面板（改参数 → 冻结新版本 → 部署）。"""
+    from .. import allocation, my_system as S
+    from ..engine import my_system as ms
+    from ..paper import my_system_exec as mx
+    for mkey, mname in (("crypto", "加密货币"), ("us_equity", "美股")):
+        deps = S.deployments(mkey)
+        dep = deps[0] if deps else None
+        vers = S.versions(mkey)
+        run_v = S.get_version(dep["version_id"]) if dep else None
+        base = run_v or (vers[0] if vers else None)
+        params = ms.Params.from_dict(base["params"] if base else S.default_params(mkey))
+        with st.container(border=True):
+            pills = C.pill({"running": "运行中", "paused_entries": "暂停中"}.get(dep["status"], dep["status"]) if dep else "未部署",
+                           "green" if dep and dep["status"] == "running" else "gray") + " " + C.pill(f"{mname} · 日线", "blue")
+            if dep:
+                ts = allocation.trial_status(dep)
+                pills += " " + C.pill(ts["text"], "orange" if ts["trial"] else "green")
+                if dep["config"].get("pending_switch"):
+                    pills += " " + C.pill("等待空仓后切换", "purple")
+                if dep["config"].get("pending_offline"):
+                    pills += " " + C.pill("等待空仓后下线", "orange")
+            st.markdown(f'<div class="aq-slothead"><div><span class="aq-slotname">{C.esc(S.NAME)} v1（{mname}）</span> '
+                        f'<span class="aq-meta">{C.esc("、".join(S.universe(mkey)))} · 只做多 · 分批建仓</span></div>'
+                        f'<div>{pills}</div></div>', unsafe_allow_html=True)
+            if dep:
+                snap = mx.snapshot(dep)
+                rows = [("模拟盘版本", f"v{run_v['version_no']}" if run_v else "--"),
+                        ("额度", C.usd(dep["config"].get("budget_usd")) + "（试用期从现金层出）"),
+                        ("台账持仓", "；".join(f"{k} {v:.6g}" for k, v in snap["positions"].items()) or "空仓")]
+                for sym, e in (snap["engine"] or {}).items():
+                    rows.append((sym, "；".join(f"{t['kind']} 止损 {t['stop']:,.4g}{'（保本）' if t['breakeven'] else ''}"
+                                                for t in e["tranches"]) or "--"))
+                st.markdown(C.kv(rows), unsafe_allow_html=True)
+                why = snap.get("why")
+                if why:
+                    st.caption(f"为什么：{why['text']}")
+            else:
+                st.caption("还没有部署。研究结论和部署条件见 docs/my_system.md；下面的参数面板可以冻结版本并部署（进入试用期）。")
+            with st.expander("规则（大白话）"):
+                st.markdown("\n\n".join(C.esc(x) for x in ms.describe(params, mkey, S.universe(mkey))))
+            with st.expander("参数面板（改完冻结为新版本并部署；持仓中则空仓后切换）"):
+                cols = st.columns(4)
+                new = {}
+                for i, (k, (name, unit, (lo, hi))) in enumerate(ms.PARAM_LABELS.items()):
+                    cur = getattr(params, k)
+                    step = 1 if isinstance(cur, int) else 0.5
+                    new[k] = cols[i % 4].number_input(f"{name}（{unit}）", min_value=type(cur)(lo), max_value=type(cur)(hi),
+                                                      value=cur, step=type(cur)(step), key=f"ms_{mkey}_{k}",
+                                                      disabled=rl not in console.EDIT_ROLES)
+                if st.button("冻结为新版本并部署", key=f"ms_save_{mkey}", type="primary",
+                             disabled=rl not in console.EDIT_ROLES):
+                    try:
+                        console.require_role(rl)
+                        v = S.freeze(mkey, new, actor=actor, note="策略总台参数面板")
+                        flash("console", "ok", S.deploy(v["id"], actor=actor, role=rl)["message"])
+                    except Exception as e:  # noqa: BLE001
+                        flash("console", "err", str(e))
+                    st.rerun()
+                if vers:
+                    st.caption("版本：" + "；".join(f"v{v['version_no']}（{v['created_at'][:10]}，{v['created_by'] or '--'}）"
+                                                     for v in vers[:5]))
+            if dep and st.button("下线", key=f"ms_stop_{mkey}", disabled=rl not in console.EDIT_ROLES):
+                try:
+                    flash("console", "ok", S.stop(dep["id"], actor=actor, role=rl))
+                except Exception as e:  # noqa: BLE001
+                    flash("console", "err", str(e))
+                st.rerun()
 
 
 def _scorecard_line(did: int) -> None:

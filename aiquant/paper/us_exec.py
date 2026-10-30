@@ -45,7 +45,8 @@ def deployments(include_paused: bool = True, include_test: bool = False, statuse
     from . import runner as pr
     st = tuple(statuses or (("running", "paused_entries") if include_paused else ("running",)))
     rows = db.q("SELECT id FROM paper_deployments WHERE broker=? AND status IN "
-                f"({','.join('?' * len(st))})" + ("" if include_test else " AND is_test=0") + " ORDER BY id",
+                f"({','.join('?' * len(st))})" + ("" if include_test else " AND is_test=0")
+                + " AND COALESCE(json_extract(config_json,'$.kind'),'')<>'my_system' ORDER BY id",   # 我的交易系统有自己的执行器
                 (BROKER, *st))
     return [pr.get_deployment(r["id"]) for r in rows]
 

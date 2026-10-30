@@ -323,6 +323,49 @@ def _on_aux_change(n: int):
     registry.save_draft(n, aux_tf=None if v == "schema" else int(v))
 
 
+SYSTEM_TPL = "我的交易系统 v1"
+
+
+def _system_template(n: int) -> None:
+    """「我的交易系统 v1」模板：分批仓位、多品种，规则写在引擎里（不是条件表达式），所以不填充到策略位；
+    这里复述规则、在训练期回测，部署和改参数在策略总台的 v1 卡片上。"""
+    from .. import my_system as S
+    from ..engine import my_system as ms
+    mkey = st.radio("市场", ["crypto", "us_equity"], format_func=lambda k: "加密货币" if k == "crypto" else "美股",
+                    horizontal=True, key=f"sys_mkt_{n}")
+    p = ms.Params.from_dict(S.default_params(mkey))
+    st.markdown("\n\n".join(C.esc(x) for x in ms.describe(p, mkey, S.universe(mkey))))
+    st.caption("这是独立的系统模板（分批建仓、多品种），不填充到策略位；部署和改参数在「策略总台 → 我的交易系统 v1」卡片上。"
+               "回测只用训练期（不触及验证集和测试集）。")
+    if st.button("用训练期回测", key=f"sys_bt_{n}", use_container_width=True):
+        try:
+            with st.spinner("回测中…"):
+                st.session_state[f"sys_res_{n}"] = (mkey, S.backtest(mkey))
+        except Exception as e:  # noqa: BLE001
+            flash(f"slot{n}", "err", str(e))
+    got = st.session_state.get(f"sys_res_{n}")
+    if got and got[0] == mkey:
+        r = got[1]
+        m = r["metrics"]
+        st.markdown(C.kv([("窗口", f"{r['window'][0][:10]} → {r['window'][1][:10]}（训练期）"),
+                          ("品种", "、".join(r["symbols"]) + (f"（缺数据：{'、'.join(r['missing'])}）" if r["missing"] else "")),
+                          ("年化 / 最大回撤", f"{m['cagr_pct']:+.2f}% / {m['max_drawdown_pct']:.2f}%"),
+                          ("收益回撤比", f"{m['ret_dd']:.2f}" if m.get("ret_dd") is not None else "--"),
+                          ("建仓次数 / 分批成交", f"{m['entries']} / {m['tranche_trades']}"),
+                          ("手续费占比 / 平均持仓", f"{m['fee_share_pct']:.1f}% / {m['avg_hold_days']:.1f} 天")]),
+                    unsafe_allow_html=True)
+        if r["yearly"]:
+            st.dataframe(pd.DataFrame([{"年份": y["year"], "收益 %": y["ret"]} for y in r["yearly"]]), hide_index=True,
+                         use_container_width=True)
+        if r["trades"]:
+            st.markdown("**按批次的成交明细**")
+            st.dataframe(pd.DataFrame([{"品种": t["symbol"], "批次": t["tranche"], "买入": t["entry_ts"][:10],
+                                        "买入价": round(t["entry_price"], 4), "卖出": t["exit_ts"][:10],
+                                        "卖出价": round(t["exit_price"], 4), "止损": round(t["stop"], 4),
+                                        "原因": t["exit_reason"], "盈亏 USD": round(t["pnl"], 2)} for t in r["trades"]]),
+                         hide_index=True, use_container_width=True, height=300)
+
+
 def _fill_template(n: int):
     name = st.session_state[f"tpl_{n}"]
     t = TEMPLATES[name]
@@ -428,9 +471,12 @@ def slot_card(n: int, r: dict) -> None:
         with t2:
             params_form(n, draft)
         with t3:
-            st.selectbox("选择模板", list(TEMPLATES), key=f"tpl_{n}")
-            st.caption(TEMPLATES[st.session_state.get(f"tpl_{n}", "趋势跟踪")]["text"])
-            st.button("填充到本策略位", key=f"tplbtn_{n}", on_click=_fill_template, args=(n,), use_container_width=True)
+            st.selectbox("选择模板", list(TEMPLATES) + [SYSTEM_TPL], key=f"tpl_{n}")
+            if st.session_state.get(f"tpl_{n}") == SYSTEM_TPL:
+                _system_template(n)
+            else:
+                st.caption(TEMPLATES[st.session_state.get(f"tpl_{n}", "趋势跟踪")]["text"])
+                st.button("填充到本策略位", key=f"tplbtn_{n}", on_click=_fill_template, args=(n,), use_container_width=True)
         show_flash(f"slot{n}")
         # 固定格式字段
         obj = None

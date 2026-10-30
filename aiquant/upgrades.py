@@ -74,7 +74,13 @@ def _bb_mid_exit() -> dict:
     return {"registered": out}
 
 
-UPGRADES = [("bb_mid_exit_v1", _bb_mid_exit)]
+def _my_system_v1() -> dict:
+    """我的交易系统 v1（10-30 研究结论：两个市场的最大回撤都不比现役主力策略差）：加密货币上限 → 56%，部署加密货币和美股各一个（试用期）。"""
+    from . import my_system
+    return my_system.initial_deploy()
+
+
+UPGRADES = [("bb_mid_exit_v1", _bb_mid_exit), ("my_system_v1_deploy", _my_system_v1)]
 
 
 def run_pending() -> list[str]:

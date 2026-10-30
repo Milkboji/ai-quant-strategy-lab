@@ -227,7 +227,8 @@ def us_deployments(include_paused: bool = True, include_test: bool = False) -> l
     from .paper import runner as pr
     st = ACTIVE if include_paused else ("running",)
     rows = db.q("SELECT id FROM paper_deployments WHERE broker='alpaca_us' AND status IN "
-                f"({','.join('?' * len(st))})" + ("" if include_test else " AND is_test=0") + " ORDER BY id", st)
+                f"({','.join('?' * len(st))})" + ("" if include_test else " AND is_test=0")
+                + " AND COALESCE(json_extract(config_json,'$.kind'),'')<>'my_system' ORDER BY id", st)   # 我的交易系统：额度见 trial_plan
     return [pr.get_deployment(r["id"]) for r in rows]
 
 

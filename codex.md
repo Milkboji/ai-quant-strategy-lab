@@ -321,3 +321,37 @@ tests/                     pytest 单元/集成测试 + e2e_browser.py（Playwri
     - `params_key` 加入口径；
     - `backtests.cost_basis` 列，NULL 表示固定代理（旧口径），页面上标出；
     - challenger / rhythm 的 ETF 回测传入开盘点差。
+
+## 我的交易系统 v1（2026-10-30，见 docs/my_system.md）
+
+- **引擎** `aiquant/engine/my_system.py`（独立模块，主引擎未改）
+  - `Params`（8 个可调参数，`PARAM_LABELS`），`describe()` 用大白话复述规则，`indicators()`，`regime_series()`。
+  - `run(bars, bench, p, cost, start, end, ...)`：多品种日线，每个品种 `Pos` 内分 `Tranche`（各自的入场价 / 止损 / 是否保本）。
+    - 当天的处理顺序：开盘执行挂单 → 盘中止损和目标（先止损；跳空按开盘价）→ 收盘决定，下一根开盘成交。
+    - 返回 metrics / trades（按批次）/ events / equity / yearly。
+    - `off=`：研究用的逐条开关。
+    - `live=True`：最后一根是今天的部分日线，不做收盘决定、不平仓，返回分批 `state` 和 `pending`。
+  - 成本用 `execution.fill`，交易节奏用 `Gate`（只用冷却和连亏刹车；大势过滤用本系统自己的 200 日均线）。
+- **服务** `aiquant/my_system.py`
+  - 版本：`system_versions`（market、version_no、params_json、哈希去重）。
+    `freeze()`（写审计「冻结版本」）、`deploy()`（新部署进入试用期；已有部署空仓时切换，否则 `pending_switch`）、`stop()`。
+    以上都要求 `console.require_role`，写 `strategy_audit`，key 为 `my_system:<market>`。
+  - 数据：`crypto_daily()` 由 5 分钟 K 线聚合成 UTC 日线，缓存在 `data/my_system/`；第一次从 `data/history` 生成，缺的天用 Alpaca 补。
+    `us_daily_bars()` 读本地美股日线。
+  - `backtest()`：训练期回测（策略实验室模板用）。
+  - `initial_deploy()`：一次性升级 `my_system_v1_deploy`。加密货币上限改为 56%，冻结两个市场的选定参数并部署（试用期）。
+- **执行器** `aiquant/paper/my_system_exec.py`（后台循环每轮调用，每个部署每 5 分钟检查一次）
+  - `engine_state()` 从 `live_since` 重放引擎。今天这根部分日线存在 `config.today`，开盘价为今天第一次看到的价格。
+  - 和 `config.engine_state` 比较：引擎增加持仓 → 按「增加量 × 价格 × 额度 / 10000」买入（金额）；减少持仓 → 卖出同样比例的台账持仓。
+  - 订单走 `us_ledger`（purpose 为 system），加密货币用 GTC。`_fee_adjust` 给加密货币买入补记手续费卖出行。
+  - 额度：试用期内按 `allocation.trial_plan` 计算；转正后保持最后一次的额度（还没接入按实力分配）。
+- **与其他模块的边界**
+  - 部署的 broker 为 `alpaca_us`，`config.kind` 为 `my_system`，`config.market` 为 `crypto` 或 `us_equity`。
+  - 不参与以下模块：`us_exec.deployments`、`allocation.us_deployments`、成绩单、点差对比报告。
+  - `allocation.trial_plan` 包含它们（试用额度从现金层出）。
+  - `PaperRunner.ledger_qty_all` 把 `us_ledger` 里的 BTC/USD 也算入 BTC 对账。
+  - `etf_trend._submit(tif=)` 支持 GTC。
+- **页面**
+  - 策略实验室「示例模板」里的「我的交易系统 v1」（`page_lab._system_template`）：复述规则，训练期回测，按批次的明细。
+  - 策略总台 `_my_system_cards`：两张卡片，参数面板冻结新版本并部署，另有下线按钮。
+- **研究脚本** `scripts/my_system_research.py <数据目录> <输出.json>`：27 组参数网格、对照组、逐条规则开关，只读本地文件。

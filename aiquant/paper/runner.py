@@ -230,6 +230,11 @@ class PaperRunner:
         rows = db.q("SELECT o.side, o.filled_qty FROM paper_orders o JOIN paper_deployments d ON d.id=o.deployment_id "
                     "WHERE d.broker=? AND o.status='filled'", (self.broker.name,))
         q = sum(r["filled_qty"] if r["side"] == "buy" else -r["filled_qty"] for r in rows)
+        try:   # 「我的交易系统」也可能持有 BTC（记在通用台账 us_ledger，品种 BTC/USD）
+            from . import us_ledger
+            q += us_ledger.symbol_totals().get("BTC/USD", 0.0)
+        except Exception:  # noqa: BLE001
+            pass
         return max(q, 0.0)
 
     def last_entry(self) -> dict | None:

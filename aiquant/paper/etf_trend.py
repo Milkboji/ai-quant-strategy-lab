@@ -227,11 +227,11 @@ def _account() -> dict | None:
 
 def _submit(sym: str, side: str, *, notional: float | None = None, qty: float | None = None,
             signal_date: str | None = None, reason: str | None = None, coid: str | None = None,
-            order_type: str = "market", stop_price: float | None = None) -> dict:
+            order_type: str = "market", stop_price: float | None = None, tif: str = "day") -> dict:
     """向 Alpaca Paper 提交当日有效（DAY）订单：市价单，或止损单（order_type="stop"，碎股只支持 DAY）。
     迁移后由通用美股执行器调用（订单与分账记在 us_orders / us_order_allocs）。"""
     coid = coid or f"etf-{sym.lower()}-{side}-{signal_date}-{uuid.uuid4().hex[:6]}"
-    body = {"symbol": sym, "side": side, "type": order_type, "time_in_force": "day", "client_order_id": coid}
+    body = {"symbol": sym, "side": side, "type": order_type, "time_in_force": tif, "client_order_id": coid}
     if order_type == "stop":
         body["stop_price"] = f"{float(stop_price):.2f}"
     if notional is not None:

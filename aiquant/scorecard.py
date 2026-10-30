@@ -614,7 +614,8 @@ def deployments() -> list[dict]:
     from .paper import runner as pr
     return [pr.get_deployment(r["id"]) for r in db.q(
         "SELECT id FROM paper_deployments WHERE broker IN ('alpaca_paper','alpaca_us') AND is_test=0 "
-        "AND status IN ('running','paused_entries') ORDER BY id")]
+        "AND status IN ('running','paused_entries') "
+        "AND COALESCE(json_extract(config_json,'$.kind'),'')<>'my_system' ORDER BY id")]   # 我的交易系统（多品种）暂不在成绩单里
 
 
 def run_all(now: datetime | None = None, notify_: bool = True) -> list[dict]:

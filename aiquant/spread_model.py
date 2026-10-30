@@ -341,7 +341,8 @@ def _train_window(market) -> tuple[datetime, datetime]:
 
 def _deployed() -> list[dict]:
     return db.q("SELECT * FROM paper_deployments WHERE broker IN ('alpaca_paper','alpaca_us') AND is_test=0 "
-                "AND status IN ('running','paused_entries') ORDER BY id")
+                "AND status IN ('running','paused_entries') "
+                "AND COALESCE(json_extract(config_json,'$.kind'),'')<>'my_system' ORDER BY id")
 
 
 def _bt_pair(cand: dict, dep: dict) -> dict | None:
