@@ -86,14 +86,39 @@ def _mem_mb(pid: int | None) -> int | None:
         return None
 
 
+def _netstat() -> str:
+    """netstat -ano 的输出。中文 Windows 输出是 GBK，PYTHONUTF8=1 时按 utf-8 解码会失败（10-30：stop 因此杀不掉旧实例），所以按字节读、宽松解码。"""
+    raw = subprocess.run("netstat -ano", capture_output=True, shell=True, **NO_WINDOW).stdout or b""
+    for enc in ("utf-8", "gbk", "mbcs"):
+        try:
+            return raw.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return raw.decode("latin-1", errors="replace")
+
+
+def _listen_pids(netstat_out: str, port: int = 8501) -> list[int]:
+    """netstat -ano 输出里监听该端口的进程（本地地址可能是 127.0.0.1 / 0.0.0.0 / [::]，10-30：只认 127.0.0.1 时漏掉了旧实例）。"""
+    pids = []
+    for line in (netstat_out or "").splitlines():
+        parts = line.split()
+        if len(parts) >= 5 and parts[0].upper() == "TCP" and parts[1].endswith(f":{port}") and parts[3] == "LISTENING":
+            try:
+                pid = int(parts[-1])
+            except ValueError:
+                continue
+            if pid > 0 and pid not in pids:
+                pids.append(pid)
+    return pids
+
+
 def _port_pid() -> int | None:
     """实际监听 8501 端口的进程（Windows 虚拟环境的 python.exe 是启动器，真正占内存的是它的子进程）。"""
     try:
         if os.name == "nt":
-            out = subprocess.run("netstat -ano", capture_output=True, text=True, shell=True, **NO_WINDOW).stdout
-            for line in out.splitlines():
-                if "127.0.0.1:8501" in line and "LISTENING" in line:
-                    return int(line.split()[-1])
+            out = _netstat()
+            pids = _listen_pids(out)
+            return pids[0] if pids else None
         return None
     except Exception:
         return None
@@ -520,10 +545,9 @@ def stop() -> int:
             pass
         PID.unlink(missing_ok=True)
     if os.name == "nt" and healthy():
-        out = subprocess.run("netstat -ano", capture_output=True, text=True, shell=True, **NO_WINDOW).stdout
-        for line in out.splitlines():
-            if "127.0.0.1:8501" in line and "LISTENING" in line:
-                subprocess.run(["taskkill", "/PID", line.split()[-1], "/T", "/F"], capture_output=True, **NO_WINDOW)
+        out = _netstat()
+        for lp in _listen_pids(out):
+            subprocess.run(["taskkill", "/PID", str(lp), "/T", "/F"], capture_output=True, **NO_WINDOW)
     time.sleep(1)
     print("[OK] 已停止" if not healthy() else "[WARN] 端口 8501 仍有服务在运行")
     return 0
