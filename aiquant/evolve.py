@@ -776,6 +776,12 @@ def health_check(price: float | None = None) -> list[str]:
         if cfg.get("pending_offline"):   # 策略总台已下线、等待空仓：不自动恢复 / 暂停
             continue
         ap = cfg.get("auto_pause")
+        if not c.get("pause_losers"):
+            # 10-31 用户决定：策略不再自动暂停，新策略上线就开仓做即时测试；之前被自动暂停的立即恢复
+            if dep["status"] == "paused_entries" and ap:
+                _resume(dep, "已关闭自动暂停：策略上线即开仓做即时测试，好坏由成绩单、进化和实验位决定")
+                out.append(f"#{dep['id']} 恢复（关闭自动暂停）")
+            continue
         # 用户手动恢复了被自动暂停的策略：记住这个版本，不再反复暂停
         if dep["status"] == "running" and ap:
             cfg["auto_pause_override"] = ap.get("version_id")

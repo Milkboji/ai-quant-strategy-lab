@@ -105,9 +105,18 @@ def _autopilot() -> dict:
     return autopilot.setup_once()
 
 
+def _no_auto_pause() -> dict:
+    """10-31 用户决定：策略不自动暂停，新策略即时开仓测试（下一轮 health_check 会恢复被暂停的策略）。"""
+    from . import console, evolve
+    evolve.set_config(pause_losers=False)
+    console.audit("系统（自动驾驶）", "admin", "关闭自动暂停", None, None, None, None, None, "已关闭",
+                  "长期体检 / 回测亏损 / 模拟盘亏损都不再暂停新开仓；之前暂停的策略自动恢复")
+    return {"pause_losers": False, "resumed": evolve.health_check()}
+
+
 UPGRADES = [("bb_mid_exit_v1", _bb_mid_exit), ("my_system_v1_deploy", _my_system_v1),
             ("my_system_adjust_1030", _my_system_adjust_1030), ("experiments_backfill_1031", _experiments_backfill),
-            ("autopilot_1031", _autopilot)]
+            ("autopilot_1031", _autopilot), ("no_auto_pause_1031", _no_auto_pause)]
 
 
 def run_pending() -> list[str]:

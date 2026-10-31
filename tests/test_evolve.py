@@ -241,3 +241,25 @@ def test_plan_budgets_weights_by_strength():
     assert p[1]["weight"] == 2.0 and p[2]["weight"] == 0.25
     assert p[1]["budget"] > p[2]["budget"]
     assert sum(x["budget"] for x in p.values()) <= 96000
+
+
+def test_auto_pause_off_resumes_and_never_pauses(evo_env):
+    """10-31：关闭自动暂停后，被暂停的策略恢复开仓；亏损策略也不再被暂停（即时测试）。"""
+    evolve.set_config(pause_losers=True, pause_train_loss_pct=-10.0, pause_live_loss_pct=-10.0)
+    sch = {"name": "关闭暂停测试", "indicators": [
+        {"id": "f", "type": "EMA", "params": {"period": 9}}, {"id": "s", "type": "EMA", "params": {"period": 21}}],
+        "entry": {"mode": "all", "conditions": [{"left": {"ref": "f"}, "op": "cross_above", "right": {"ref": "s"}}]},
+        "exit": {"mode": "any", "conditions": [{"left": {"ref": "f"}, "op": "cross_below", "right": {"ref": "s"}}]}}
+    did = _deploy(sch, 60)
+    _fake_result(did, pr.get_deployment(did)["version_id"], -35.0)
+    evolve.health_check()
+    assert pr.get_deployment(did)["status"] == "paused_entries"
+    try:
+        evolve.set_config(pause_losers=False)
+        out = evolve.health_check()
+        d = pr.get_deployment(did)
+        assert d["status"] == "running" and "auto_pause" not in d["config"] and any("关闭自动暂停" in x for x in out)
+        evolve.health_check()
+        assert pr.get_deployment(did)["status"] == "running"
+    finally:
+        evolve.set_config(pause_losers=True)
