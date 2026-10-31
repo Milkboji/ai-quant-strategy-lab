@@ -26,7 +26,10 @@ def _bj(ts: str | None) -> str:
 
 def _curve(sc: dict) -> go.Figure:
     df = pd.DataFrame(sc["curve"], columns=["ts", "actual", "expected", "bench"])
-    df["ts"] = pd.to_datetime(df["ts"], utc=True).dt.tz_convert(BJ)
+    # 曲线里的时间点来自不同来源（日期、带时区的 ISO、带微秒的 ISO），格式不统一：逐个解析，解析不了的丢掉
+    df["ts"] = pd.to_datetime(df["ts"], utc=True, format="mixed", errors="coerce")
+    df = df.dropna(subset=["ts"]).sort_values("ts")
+    df["ts"] = df["ts"].dt.tz_convert(BJ)
     fig = go.Figure()
     for col, name, color, dash in (("actual", "实际（模拟盘）", "#2563EB", None), ("expected", "回测（同一区间）", "#7C3AED", "dash"),
                                    ("bench", f"基准（{sc.get('symbol') or ''} 买入持有）", "#9CA3AF", "dot")):
@@ -115,13 +118,16 @@ def _scorecards(rl: str) -> None:
         st.info("还没有成绩单：每天北京时间早上 6 点后自动生成，也可以点「立即重新生成」。")
         return
     for did in sorted(last):
-        _one(last[did])
+        try:   # 一张成绩单出错不影响其他成绩单和「点差模型」页
+            _one(last[did])
+        except Exception as e:  # noqa: BLE001
+            st.warning(f"成绩单 #{did} 显示失败：{type(e).__name__}")
 
 
 def _spread(rl: str) -> None:
     cur = spread_model.current()
     st.caption("用 Alpaca 历史报价按时段估计真实点差（BTC/USD 按 24 个 UTC 小时；美股取 09:35 开盘点差和盘中点差），"
-               "替换回测里的固定代理值。后台每轮最多请求 10 次，美股开盘前后暂停。切换需要管理员确认；"
+               "替换回测里的固定代理值。后台每轮最多请求 10 次，美股开盘前后暂停。样本满 10 天后系统自动生成对比报告并切换；"
                "切换前生成的回测结果不重算、不覆盖，标为「旧口径」。")
     st.markdown(C.kv([("当前口径", spread_model.basis_label(spread_model.current_name())
                        + (f"（{cur['enabled_at'][:16].replace('T', ' ')} UTC 由 {cur.get('enabled_by') or '--'} 切换）" if cur else "")),
@@ -177,6 +183,12 @@ def render() -> None:
     C.section("策略成绩单")
     t1, t2 = st.tabs(["成绩单", "点差模型"])
     with t1:
-        _scorecards(rl)
+        try:
+            _scorecards(rl)
+        except Exception as e:  # noqa: BLE001
+            st.error(f"成绩单读取失败：{type(e).__name__}: {str(e)[:200]}")
     with t2:
-        _spread(rl)
+        try:
+            _spread(rl)
+        except Exception as e:  # noqa: BLE001
+            st.error(f"点差模型读取失败：{type(e).__name__}: {str(e)[:200]}")

@@ -178,3 +178,12 @@ def test_spread_report_runs_old_and_new_basis_for_deployed_versions(sc, monkeypa
     assert f"#{did} 成绩单测试" in rep["markdown"]
     assert spread_model.current_name() == "fixed_v1"
     db.ex("DELETE FROM spread_samples")
+
+
+def test_curve_accepts_mixed_timestamp_formats():
+    """10-31：曲线时间点格式不统一（日期 / ISO / 带微秒）时页面报错。"""
+    from aiquant.ui import page_scorecard
+    fig = page_scorecard._curve({"symbol": "BTC/USD", "curve": [
+        ["2026-10-21", 0.0, 0.0, 0.0], ["2026-10-21T08:00:00+00:00", 0.1, 0.0, -0.2],
+        ["2026-10-22T08:00:00.123456+00:00", 0.2, 0.1, -0.5], [None, 0, 0, 0]]})
+    assert len(fig.data[0].x) == 3
