@@ -95,9 +95,12 @@ def tick(now: datetime | None = None) -> list[dict]:
         evolve.health_check(float(df5["close"].iloc[-1]) if len(df5) else None)
     except Exception:  # noqa: BLE001
         log.error("health check error: %s", traceback.format_exc())
-    try:   # 2 倍杠杆模拟账户：跟随核心策略成交本地记账
+    try:   # 2 倍杠杆模拟账户：跟随全部 BTC 策略成交 + 自动资格通过的做空腿，本地记账（不下单）
         from . import leverage_shadow
-        leverage_shadow.update(float(df5["close"].iloc[-1]) if len(df5) else None, now)
+        from .. import shortside
+        shortside.maybe_qualify()
+        leverage_shadow.update(float(df5["close"].iloc[-1]) if len(df5) else None, now,
+                               df5[df5["ts"] >= df5["ts"].max() - pd.Timedelta(days=300)] if len(df5) else None)   # 熊市过滤要 200 日均线
     except Exception:  # noqa: BLE001
         log.error("leverage shadow error: %s", traceback.format_exc())
     return results

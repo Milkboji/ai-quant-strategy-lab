@@ -196,18 +196,21 @@ def leverage_panel() -> None:
     except Exception:  # noqa: BLE001
         pass
     sm = ls.summary(price)
-    lbl = (registry_label_for(sm["source"]) or f"部署 #{sm['source']}")
     with st.container(border=True):
-        C.section(f"{sm['leverage']:g} 倍杠杆模拟账户", purple=True,
-                  right=C.pill(f"跟随 {lbl}", "purple"))
-        st.caption("把核心策略的每一笔真实 Paper 成交，按永续合约逐仓规则放大到 2 倍记账：含 0.07% 手续费、每 8 小时 0.01% 资金费率、"
-                   "强平规则。只是本地计算，不连接任何交易所、不下单。用来实时观察“加杠杆后会怎样”。")
+        C.section(f"{sm['leverage']:g} 倍杠杆模拟账户（全部 BTC 策略 · 多空）", purple=True,
+                  right=C.pill(f"多头腿 {sm['n_long']} · 空头腿 {sm['n_short']}", "purple"))
+        st.caption("做多：跟随全部 BTC 策略（含实验位）的每一笔真实 Paper 成交；做空：每个策略的规则上下翻转成「做空版」，训练期赚钱的才启用，"
+                   "只在熊市（BTC 日线低于 200 日均线）开空（Alpaca 现货不能做空，所以只在这里记账）。每条腿名义价值 = 2 倍 × 起始保证金 × 该策略额度占比；"
+                   "含 0.07% 手续费、每 8 小时 0.01% 资金费率、整体强平。只是本地计算，不连接任何交易所、不下单。")
         c = st.columns(5)
         c[0].metric("保证金权益 USD", f"{sm['equity']:,.2f}", f"{sm['pnl_pct']:+.2f}%")
-        c[1].metric("持仓 BTC", f"{sm['qty']:.6f}")
-        c[2].metric("开仓价", f"{sm['entry']:,.2f}" if sm["entry"] else "--")
+        c[1].metric("净持仓 BTC", f"{sm['qty']:+.6f}")
+        c[2].metric("持仓腿", f"多头腿 {sm['n_long']} · 空头腿 {sm['n_short']}")
         c[3].metric("强平价", f"{sm['liq']:,.2f}" if sm["liq"] else "--")
         c[4].metric("已付手续费 / 资金费", f"{sm['fees']:,.2f} / {sm['funding']:,.2f}")
+        if sm["legs"]:
+            st.dataframe(pd.DataFrame([{"策略": x["label"], "方向": x["side"], "数量 BTC": x["qty"], "开仓价": x["entry"],
+                                        "浮动盈亏": x["pnl"]} for x in sm["legs"]]), hide_index=True, use_container_width=True)
         tr = ls.trades(20)
         if tr:
             st.dataframe(pd.DataFrame([{"时间(UTC)": t["ts"][:16].replace("T", " "), "类型": t["kind"],
@@ -215,7 +218,8 @@ def leverage_panel() -> None:
                                         "盈亏": t["pnl"], "之后权益": t["equity_after"], "说明": t["note"]} for t in tr]),
                          hide_index=True, use_container_width=True, height=200)
         else:
-            st.caption(f"起始保证金 {sm['margin0']:,.0f} USD，自 {sm['started_at'][:16].replace('T', ' ')} UTC 起等待核心策略的下一次买入。")
+            st.caption(f"起始保证金 {sm['margin0']:,.0f} USD，自 {sm['started_at'][:16].replace('T', ' ')} UTC 起跟随全部 BTC 策略；"
+                       "还没有任何策略买入或开空。")
 
 
 def registry_label_for(did: int) -> str | None:

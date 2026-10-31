@@ -192,12 +192,14 @@ def _card_shadow() -> None:
     except Exception:  # noqa: BLE001
         pass
     sm = ls.summary(price)
-    _card(f"BTC {sm['leverage']:g} 倍杠杆模拟", "持仓中" if sm["qty"] else "等待买入信号", "purple" if sm["qty"] else "gray",
+    held = sm["n_long"] or sm["n_short"]
+    _card(f"BTC {sm['leverage']:g} 倍杠杆模拟（多空）", f"多头腿 {sm['n_long']} · 空头腿 {sm['n_short']}" if held else "等待信号",
+          "purple" if held else "gray",
           f"{sm['pnl_pct']:+.2f}%", "pos" if sm["pnl"] > 0 else ("neg" if sm["pnl"] < 0 else "muted"),
           [("保证金权益", f"{sm['equity']:,.2f}"),
            ("强平价", f"{sm['liq']:,.0f}" if sm["liq"] else "--"),
            ("手续费+资金费", f"{sm['fees'] + sm['funding']:,.2f}")],
-          "只在本地记账，不下单；观察加杠杆的效果")
+          "跟随全部 BTC 策略做多 + 做空版，只在本地记账，不下单")
     st.page_link(st.session_state["_pages"]["paper"], label="查看杠杆账户 →")
 
 
