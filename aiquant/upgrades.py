@@ -96,8 +96,18 @@ def _experiments_backfill() -> dict:
     return out
 
 
+def _autopilot() -> dict:
+    """10-31 用户决定：所有人工确认交给系统（关闭晋级人工确认、不再锁定、进化每天一轮、加密上限 51%）。"""
+    from . import autopilot
+    from .data import http
+    if not http.paper_orders_unlocked():          # 只在用户自己的模拟盘上执行（公开版默认不改设置）
+        return {"skipped": "模拟盘下单锁未开启"}
+    return autopilot.setup_once()
+
+
 UPGRADES = [("bb_mid_exit_v1", _bb_mid_exit), ("my_system_v1_deploy", _my_system_v1),
-            ("my_system_adjust_1030", _my_system_adjust_1030), ("experiments_backfill_1031", _experiments_backfill)]
+            ("my_system_adjust_1030", _my_system_adjust_1030), ("experiments_backfill_1031", _experiments_backfill),
+            ("autopilot_1031", _autopilot)]
 
 
 def run_pending() -> list[str]:

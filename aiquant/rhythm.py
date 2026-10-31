@@ -246,7 +246,7 @@ def us_promotion_status() -> dict:
     elif days < SHADOW_MIN_DAYS:
         text = f"影子模式已记录 {days}/{SHADOW_MIN_DAYS} 个交易日（{start} 起），没有异常"
     else:
-        text = f"影子模式已记录 {days} 个交易日（{start} 起），没有计算错误或异常：可以把连亏刹车切为生效（需管理员确认）"
+        text = f"影子模式已记录 {days} 个交易日（{start} 起），没有计算错误或异常：系统会自动把连亏刹车切为生效"
     if missing and shadow:
         text += f"；服务未运行、没有记录的交易日 {len(missing)} 个（不计入天数）"
     if broken and shadow:

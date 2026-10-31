@@ -158,6 +158,11 @@ def _loop() -> None:
                     challenger.evaluate_all()
             except Exception:  # noqa: BLE001
                 log.error("challenger error: %s", traceback.format_exc())
+            try:   # 自动驾驶：待确认队列自动批准、美股节奏自动转正、点差口径自动切换（每小时一次，后台线程）
+                from .. import autopilot
+                autopilot.maybe_run()
+            except Exception:  # noqa: BLE001
+                log.error("autopilot error: %s", traceback.format_exc())
             try:   # 实验位：挑战者有结论（晋级 / 淘汰）后下线；空仓立即停止，有持仓卖完再停
                 from .. import experiments
                 experiments.sync()
