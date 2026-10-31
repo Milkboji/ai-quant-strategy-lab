@@ -50,3 +50,39 @@ def test_setup_once_turns_off_manual_steps(ap):
     assert float(allocation.get_config()["crypto"]["max"]) <= 51.0
     assert "promotion" in out
     assert db.q("SELECT * FROM strategy_audit WHERE action='修改晋级规则' AND actor LIKE '%自动驾驶%'")
+
+
+def test_newer_lab_version_becomes_challenger_once(ap):
+    import json
+    from datetime import timedelta
+    from aiquant import challenger
+    from aiquant.data import market_data as md
+    from aiquant.strategy import registry
+    md.install_synthetic_test_data(md.to_utc(ap_env_val()) - timedelta(days=440), md.to_utc(ap_env_val()) + timedelta(days=200))
+    base = {"name": "自动驾驶实验室", "signal_tf": 60,
+            "indicators": [{"id": "f", "type": "EMA", "params": {"period": 9}}, {"id": "s", "type": "EMA", "params": {"period": 21}}],
+            "entry": {"mode": "all", "conditions": [{"left": {"ref": "f"}, "op": "cross_above", "right": {"ref": "s"}}]},
+            "exit": {"mode": "any", "conditions": [{"left": {"ref": "f"}, "op": "cross_below", "right": {"ref": "s"}}]}}
+    v1 = registry.freeze(3, base, source="manual", new_lineage=True)
+    cfg = {"label": "策略位3·自动驾驶实验室", "strategy_key": "slot:3", "signal_tf": 60, "budget_usd": 1000}
+    did = db.ex("INSERT INTO paper_deployments(version_id,config_json,broker,status,created_at,updated_at,is_test) "
+                "VALUES(?,?,?,?,?,?,0)", (v1["id"], json.dumps(cfg, ensure_ascii=False), "alpaca_paper", "running",
+                                          db.now_iso(), db.now_iso()))
+    try:
+        b2 = json.loads(json.dumps(base))
+        b2["indicators"][1]["params"]["period"] = 30
+        v2 = registry.freeze(3, b2, source="manual", parent_id=v1["id"])          # 实验室新版本（策略位指针指向 v2）
+        out = autopilot.lab_versions()
+        ch = db.q1("SELECT * FROM evolve_challengers WHERE deployment_id=? AND status='running'", (did,))
+        assert ch and "实验室新版本" in ch["change"] and out
+        assert json.loads(ch["candidate_json"])["indicators"][1]["params"]["period"] == 30
+        assert autopilot.lab_versions() == []                                     # 只登记一次
+        assert db.get_setting(f"lab_challenged::{v2['id']}")
+    finally:
+        db.ex("UPDATE paper_deployments SET status='stopped' WHERE id=?", (did,))
+        db.ex("UPDATE evolve_challengers SET status='expired' WHERE deployment_id=?", (did,))
+
+
+def ap_env_val():
+    from aiquant import research
+    return research.get_split()["val_start"]

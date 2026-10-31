@@ -65,6 +65,35 @@ def spread() -> str | None:
     return msg
 
 
+def lab_versions() -> list[str]:
+    """实验室里比模拟盘更新的 BTC 版本：不再等人点「部署此版本」，而是登记为挑战者（同时自动开实验位）。
+    跑赢现役（快速检验 / 前向测试，与进化挑战者同一套规则）→ 自动晋级部署；跑输 → 淘汰。每个实验室版本只登记一次。"""
+    from . import challenger, console, evolve, research
+    from .data import market_data as md
+    out = []
+    for r in console.rows():
+        dep, lab, run = r.get("deployment"), r.get("lab"), r.get("run")
+        if not (dep and lab and run and r.get("lab_newer")) or dep["broker"] != "alpaca_paper":
+            continue
+        key = f"lab_challenged::{lab['id']}"
+        if db.get_setting(key):
+            continue
+        if db.q1("SELECT id FROM evolve_challengers WHERE kind='btc' AND deployment_id=? AND status='running'",
+                 (dep["id"],)):
+            continue          # 同一部署同时只跑一个挑战者，等现在这个有结论
+        rr = research.get_research()
+        tr = evolve._windows()["train"]
+        sch = dict(lab["schema"])
+        sch.setdefault("signal_tf", int(dep["config"].get("signal_tf") or 15))
+        ev = evolve.evaluate(md.load_dataset(md.get_dataset(*tr, source=rr["source"])), sch, tr[0], tr[1], rr)
+        brief = dict(evolve._brief(ev), source="实验室新版本")
+        raw = dict(dep, config_json=__import__("json").dumps(dep["config"], ensure_ascii=False))
+        cid = challenger.register_btc(raw, run, sch, f"实验室新版本 v{lab['version_no']}", brief, False)
+        db.set_setting(key, {"at": db.now_iso(), "challenger_id": cid})
+        out.append(f"{r['name']} v{lab['version_no']} → 挑战者 #{cid}")
+    return out
+
+
 _running = False
 
 
@@ -91,7 +120,7 @@ def maybe_run() -> bool:
 
 def run() -> list[str]:
     out = []
-    for name, fn in (("待确认", approve_queue), ("美股节奏", us_rhythm), ("点差", spread)):
+    for name, fn in (("待确认", approve_queue), ("实验室新版本", lab_versions), ("美股节奏", us_rhythm), ("点差", spread)):
         try:
             r = fn()
             if r:
