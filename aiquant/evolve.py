@@ -561,6 +561,7 @@ def run(job: dict, stage, should_stop) -> int:
     deps = db.q("SELECT * FROM paper_deployments WHERE status IN ('running','paused_entries') AND is_test=? "
                 "AND broker<>'alpaca_us' ORDER BY id", (is_test,))   # 自动进化只针对 BTC 部署
     deps = [d for d in deps if not json.loads(d["config_json"] or "{}").get("pending_offline")]   # 待下线的不再进化
+    deps = [d for d in deps if not json.loads(d["config_json"] or "{}").get("experiment")]   # 实验位不再进化（不会再生出实验位）
     r = research.get_research()
     if is_test:
         r = dict(r, source="test")

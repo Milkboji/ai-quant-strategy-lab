@@ -194,6 +194,12 @@ def register_btc(dep: dict, champion: dict, cand_schema: dict, change: str, trai
                  json.dumps(train_brief, ensure_ascii=False), db.now_iso(), "running", 1 if is_test else 0))
     _event(dep["id"], "INFO", f"自动进化：挑战者 #{cid} 开始在实时行情上模拟运行（{change}）。"
                               f"训练集稳健分 {train_brief.get('score')}，收益 {train_brief.get('return_pct')}%", is_test)
+    if not is_test:
+        try:   # 同时开到实验位：小额度真实模拟盘下单（不替换现役），挑战者有结论后自动下线
+            from . import experiments
+            experiments.launch(cid)
+        except Exception:  # noqa: BLE001
+            log.exception("experiment launch failed")
     return cid
 
 

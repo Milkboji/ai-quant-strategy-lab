@@ -74,6 +74,7 @@ def render() -> None:
     if etf:
         _etf_card(etf, effective_user(), role(), focus == "etf")
     _my_system_cards(effective_user(), role())
+    _experiments_panel(effective_user(), role())
     _audit_panel()
 
 
@@ -314,6 +315,73 @@ def _my_system_cards(actor: str, rl: str) -> None:
                 except Exception as e:  # noqa: BLE001
                     flash("console", "err", str(e))
                 st.rerun()
+
+
+def _experiments_panel(actor: str, rl: str) -> None:
+    """实验位：每轮进化产生的挑战者，在小额模拟盘上真实下单运行（不替换现役），有结论后自动下线。"""
+    from .. import experiments
+    c = experiments.get_config()
+    rows = console.experiment_rows(price=_price())
+    with st.container(border=True):
+        C.section("实验位（进化出的新策略直接上模拟盘跑）", purple=True,
+                  right=C.pill(f"{len(rows)} / {int(c['max_slots'])} 个运行中", "purple" if rows else "gray"))
+        st.caption(f"每轮自动进化产生新的挑战者时，自动开一个实验位：额度 {c['pct']:g}% × 账户权益（从现金层出），"
+                   f"最多 {int(c['max_slots'])} 个，不替换现役版本。挑战者胜出晋级（现役切换到它）或被淘汰后，"
+                   "实验位自动下线（有持仓先按规则卖完）。实验位本身不再进化。")
+        cols = st.columns([1, 1, 1, 1.2])
+        en = cols[0].toggle("开启实验位", value=bool(c["enabled"]), key="exp_en", disabled=rl not in console.EDIT_ROLES)
+        pct = cols[1].number_input("每个额度（%）", 0.5, 10.0, float(c["pct"]), 0.5, key="exp_pct",
+                                   disabled=rl not in console.EDIT_ROLES)
+        mx_ = cols[2].number_input("最多几个", 0, 10, int(c["max_slots"]), 1, key="exp_max",
+                                   disabled=rl not in console.EDIT_ROLES)
+        if cols[3].button("保存实验位规则", key="exp_save", disabled=rl not in console.EDIT_ROLES):
+            try:
+                experiments.set_config(actor=actor, role=rl, enabled=en, pct=pct, max_slots=mx_)
+                flash("console", "ok", "实验位规则已保存")
+            except Exception as e:  # noqa: BLE001
+                flash("console", "err", str(e))
+            st.rerun()
+        if not rows:
+            st.caption("现在没有运行中的实验位。下一次自动进化产生挑战者时会自动开出来。")
+        for r in rows:
+            dep, run, ex = r["deployment"], r["run"], r["exp"]
+            with st.container(border=True):
+                pills = C.pill(r["status"], STATUS_TONE.get(r["status"], "gray")) + " " + C.pill("实验位", "purple")
+                if r["pending_offline"]:
+                    pills += " " + C.pill("等待空仓后下线", "orange")
+                st.markdown(f'<div class="aq-slothead"><div><span class="aq-slotname">{C.esc(r["name"])}</span> '
+                            f'<span class="aq-meta">来自 {C.esc(ex.get("parent_label") or "--")} · 自动进化</span></div>'
+                            f'<div>{pills}</div></div>', unsafe_allow_html=True)
+                tf = r["signal_tf"]
+                prog = (f"{float(ex['days'] or 0):.1f} / {ex['need_days']} 天" if ex.get("need_days") else "等待首次评估")
+                cv, mv = ex.get("challenger") or {}, ex.get("champion") or {}
+                fwd = (f"实验位 {cv.get('return_pct', 0):+.2f}% · 现役 {mv.get('return_pct', 0):+.2f}%" if cv and mv else "--")
+                cc = st.columns([1.5, 1.3, 1.0])
+                cc[0].markdown(C.kv([("版本", f"{_vlabel(run)} · {registry.label(run)}" if run else "--"),
+                                     ("改动", ex.get("change") or "--"),
+                                     ("K线周期", TF_CN.get(int(tf), f"{tf}分钟") if tf else "--"),
+                                     ("开始", _bj(ex.get("since")))]), unsafe_allow_html=True)
+                cc[1].markdown(C.kv([("挑战者", f"#{ex.get('challenger_id')}"), ("前向进度", prog), ("前向收益", fwd),
+                                     ("模拟盘成交", f"{ex.get('fills', 0)} 笔")]), unsafe_allow_html=True)
+                cc[2].markdown(C.kv([("持仓", f"{r['qty']:.6f} BTC"),
+                                     ("市值", C.usd(r["value"]) if r["value"] is not None else "--"),
+                                     ("额度", C.usd(r["budget"]))]), unsafe_allow_html=True)
+                if cc[2].button("下线", key=f"exp_off_{dep['id']}", disabled=rl not in console.EDIT_ROLES):
+                    try:
+                        flash("console", "ok", console.take_offline(r["key"], actor=actor, role=rl)["message"])
+                    except Exception as e:  # noqa: BLE001
+                        flash("console", "err", str(e))
+                    st.rerun()
+                if r.get("why"):
+                    why_block(r["why"], key=r["key"])
+        done = [d for d in experiments.history(10) if (d["config"]["experiment"] or {}).get("ended")]
+        if done:
+            with st.expander(f"已结束的实验位（最近 {len(done)} 个）"):
+                st.dataframe(pd.DataFrame([{"实验位": d["config"].get("label"),
+                                            "开始": _bj(d["config"]["experiment"].get("since")),
+                                            "结束": _bj(d["config"]["experiment"]["ended"].get("at")),
+                                            "结果": d["config"]["experiment"]["ended"].get("why")} for d in done]),
+                             hide_index=True, use_container_width=True)
 
 
 def _scorecard_line(did: int) -> None:

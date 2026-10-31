@@ -24,7 +24,8 @@ ACTIVE = ("configured", "running", "paused_entries")
 OPEN_ORDER_STATES = ("new", "submitted", "partially_filled", "unknown_after_restart")
 STATUSES = ("草稿", "已回测", "已验证", "已部署", "运行中", "暂停中", "已下线")
 SOURCE_CN = {"manual": "手写", "deepseek": "DeepSeek 优化", "deepseek_parse": "DeepSeek 解析", "copy": "复制",
-             "auto_evolve": "自动进化", "preset": "实时预设", "test": "测试"}
+             "auto_evolve": "自动进化", "preset": "实时预设", "test": "测试",
+             "experiment": "实验位"}
 TRIGGER_CN = {"manual": "手动部署", "evolve": "自动进化", "challenger": "挑战者晋级"}
 
 SCHEMA_SQL = """
@@ -312,6 +313,29 @@ def rows(broker: str = "alpaca_paper", price: float | None = None) -> list[dict]
             "why": (_us_explain(dep, us_equity) if is_us else
                     explain(dep, plans.get(dep["id"]) if dep else None, price, vol)) if dep else None,
         })
+    return out
+
+
+def experiment_rows(broker: str = "alpaca_paper", price: float | None = None) -> list[dict]:
+    """策略总台「实验位」卡片：每轮进化产生的挑战者，在小额模拟盘上真实运行（aiquant/experiments.py）。"""
+    from . import experiments
+    from .strategy import registry
+    deps = [d for d in _deployments(broker) if d["status"] in ACTIVE and experiments.is_experiment(d)]
+    if not deps:
+        return []
+    plans = plans_for(broker)
+    vol = vol_sizing()
+    out = []
+    for dep in deps:
+        run = registry.get_version(dep["version_id"])
+        qty = _ledger_qty(dep["id"])
+        out.append({"key": _dep_key(dep), "deployment": dep, "run": run, "name": dep["config"].get("label"),
+                    "status": {"running": "运行中", "paused_entries": "暂停中"}.get(dep["status"], "已部署"),
+                    "pending_offline": bool(dep["config"].get("pending_offline")),
+                    "budget": float(dep["config"].get("budget_usd") or 0), "qty": qty,
+                    "value": qty * price if price else None, "signal_tf": dep["config"].get("signal_tf"),
+                    "exp": experiments.summary(dep),
+                    "why": explain(dep, plans.get(dep["id"]), price, vol)})
     return out
 
 
@@ -853,6 +877,8 @@ def weight_text(p: dict | None) -> str | None:
         return "长期体检暂停：额度 0（释放给长期有优势的策略）"
     if m == "paused_floor":
         return f"暂停新开仓：只保留最低额度（账户权益的 {d['floor_pct']:g}%）"
+    if m == "trial":      # 试用期 / 实验位：固定额度从现金层出，不参与按实力分配
+        return p.get("why")
     share = f"；占全部运行策略权重的 {p['share_pct']:.1f}%" if p.get("share_pct") is not None else ""
     if m == "long":
         head = (f"权重 = 2 × 长期年均收益 ÷ max(年均回撤, 1) = 2 × {d['mean_ret']:+.1f}% ÷ {max(d['mean_dd'], 1.0):.1f}% "

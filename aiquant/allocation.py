@@ -154,6 +154,8 @@ def graduate_trials(now: datetime | None = None) -> list[str]:
                   "AND json_extract(config_json,'$.trial') IS NOT NULL"):
         dep = pr.get_deployment(r["id"])
         st = trial_status(dep, now)
+        if dep["config"]["trial"].get("experiment"):   # 实验位不转正：由挑战者结论决定去留（aiquant/experiments.py）
+            continue
         if st.get("due") and not dep["config"]["trial"].get("graduated_at"):
             cfg = dep["config"]
             cfg["trial"] = dict(cfg["trial"], graduated_at=db.now_iso())
@@ -188,7 +190,8 @@ def trial_plan(equity: float, l1: dict | None = None, now: datetime | None = Non
         if dep["status"] != "running" or dep["config"].get("pending_offline"):
             out[dep["id"]] = {"budget": 0.0, "pct": 0.0, "status": st, "why": f"{st['text']}；暂停中，不分配额度"}
             continue
-        pct = max(0.0, min(float(c["trial_pct"]), pool))
+        want = float((dep["config"].get("trial") or {}).get("pct") or c["trial_pct"])   # 实验位：每个 2%（experiments）
+        pct = max(0.0, min(want, pool))
         pool -= pct
         why = (f"{st['text']}：固定额度 {pct:g}% × 权益 {equity:,.0f} = {equity * pct / 100:,.0f} USD（从现金层出）"
                if pct > 0 else f"{st['text']}：{trial_zero_hint(l1, c)}")

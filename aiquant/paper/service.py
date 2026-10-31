@@ -158,6 +158,11 @@ def _loop() -> None:
                     challenger.evaluate_all()
             except Exception:  # noqa: BLE001
                 log.error("challenger error: %s", traceback.format_exc())
+            try:   # 实验位：挑战者有结论（晋级 / 淘汰）后下线；空仓立即停止，有持仓卖完再停
+                from .. import experiments
+                experiments.sync()
+            except Exception:  # noqa: BLE001
+                log.error("experiments error: %s", traceback.format_exc())
             try:   # 交易节奏：每天一次长周期体检 → 暂停/恢复 → 重新分配额度（后台线程）
                 from .. import rhythm
                 rhythm.maybe_daily()

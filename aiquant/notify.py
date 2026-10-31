@@ -35,6 +35,7 @@ EVENTS = {
     "watchdog_restart": "守护进程重启",
     "tunnel_down": "外网通道断开超过 60 秒",
     "scorecard": "策略成绩单偏差",
+    "experiment": "实验位开始 / 结束",
     "daily_summary": "每日运行摘要",
 }
 CHANNELS = {"email": "邮件", "telegram": "Telegram", "wecom": "企业微信", "feishu": "飞书"}

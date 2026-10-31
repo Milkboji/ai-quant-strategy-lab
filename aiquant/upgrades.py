@@ -86,8 +86,18 @@ def _my_system_adjust_1030() -> dict:
     return my_system.adjust_1030()
 
 
+def _experiments_backfill() -> dict:
+    """实验位上线时：已经在前向测试中的 BTC 挑战者也各开一个实验位（满额为止）。"""
+    from . import challenger, experiments
+    challenger.ensure_tables()
+    out = {}
+    for r in db.q("SELECT id FROM evolve_challengers WHERE kind='btc' AND status='running' AND is_test=0 ORDER BY id"):
+        out[f"#{r['id']}"] = experiments.launch(r["id"])["result"]
+    return out
+
+
 UPGRADES = [("bb_mid_exit_v1", _bb_mid_exit), ("my_system_v1_deploy", _my_system_v1),
-            ("my_system_adjust_1030", _my_system_adjust_1030)]
+            ("my_system_adjust_1030", _my_system_adjust_1030), ("experiments_backfill_1031", _experiments_backfill)]
 
 
 def run_pending() -> list[str]:
