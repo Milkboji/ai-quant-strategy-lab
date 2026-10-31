@@ -3,7 +3,8 @@
 2026-10-31 起跟随全部 BTC 策略，并且多空两个方向：
 - 多头腿：每个 BTC 模拟盘部署（含实验位）的真实 Paper 成交都跟。某策略从空仓买入 → 开一条多头腿，
   名义价值 = 杠杆 × 起始保证金 × 该策略额度占全部 BTC 策略额度的比例；卖出多少比例的现货 → 平同样比例的多头腿。
-- 空头腿：shortside 自动资格通过的策略，用规则上下翻转后的「做空版」：熊市（BTC 日线 < 200 日均线）里做空版入场规则成立时开空，
+- 空头腿（默认 short_mode=all，即时测试）：每个 BTC 策略的规则上下翻转成「做空版」，空头腿跟随做空版此刻的持仓状态；
+  short_mode=qualified 时只开训练期做空版赚钱的策略、且只在熊市（BTC 日线 < 200 日均线）里做空版入场规则成立时开空，
   做空版退出规则 / 止损 / 止盈 / 最长持仓时平空，
   名义价值的算法与多头腿相同（同一个策略同时只有多或空其中一条腿）。
 - 成本：手续费 0.07% × 名义价值；资金费每 8 小时 0.01% × 名义价值（多头付、空头收）。
@@ -18,7 +19,10 @@ import pandas as pd
 from .. import db
 
 DEFAULTS = {"enabled": True, "leverage": 2.0, "margin0": 10000.0, "fee_rate": 0.0007, "funding_8h": 0.0001,
-            "maint_margin": 0.004, "shorts": True}
+            "maint_margin": 0.004, "shorts": True,
+            # 做空腿：all = 全部策略的做空版都即时测试（10-31 用户决定：多空即时测试，不等资格、不加熊市过滤）；
+            #         qualified = 只开训练期做空版赚钱的策略，且只在熊市开空
+            "short_mode": "all"}
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS lev_shadow_trades (
@@ -146,14 +150,16 @@ def _shorts(s: dict, c: dict, df5: pd.DataFrame | None, price: float | None, now
     for dep in _btc_deps():
         if dep["status"] not in ("running", "paused_entries"):
             continue
-        q = shortside.status(dep["version_id"])
         key = f"S{dep['id']}"
-        if not q or not q.get("ok"):
-            if key in s["legs"]:
-                _close(s, c, key, price, now.isoformat(), why="做空资格取消，平空")
-            continue
+        strict = c.get("short_mode") == "qualified"
+        if strict:
+            q = shortside.status(dep["version_id"])
+            if not q or not q.get("ok"):
+                if key in s["legs"]:
+                    _close(s, c, key, price, now.isoformat(), why="做空资格取消，平空")
+                continue
         try:
-            sig = shortside.live_signal(dep, df5, now)
+            sig = shortside.live_signal(dep, df5, now, bear_only=strict)
         except Exception:  # noqa: BLE001
             continue
         if not sig:
@@ -170,13 +176,21 @@ def _shorts(s: dict, c: dict, df5: pd.DataFrame | None, price: float | None, now
             continue
         s["short_bar"][str(dep["id"])] = sig["bar"]
         lg = s["legs"].get(key)
+        if not strict:   # 即时测试：空头腿跟随做空版此刻的持仓状态（做空版持有空单 → 开空；不持有 → 平空）
+            if lg and not sig["hold"]:
+                _close(s, c, key, price, now.isoformat(), why="做空版已离场（平空规则 / 止损 / 止盈），平空")
+            elif not lg and sig["hold"] and f"L{dep['id']}" not in s["legs"]:
+                _open(s, c, key, "short", dep["id"], price, now.isoformat(), None,
+                      f"做空版持有空单（{sig['tf']} 分钟K线），即时开空测试")
+            continue
         if lg and sig["cover"]:
             _close(s, c, key, price, now.isoformat(), why="做空版退出规则成立，平空")
         elif lg and sig["max_hold"] and (pd.Timestamp(now) - pd.Timestamp(lg["opened"])) >= \
                 pd.Timedelta(minutes=sig["tf"] * sig["max_hold"]):
             _close(s, c, key, price, now.isoformat(), why="达到最长持仓，平空")
         elif not lg and sig["open"] and f"L{dep['id']}" not in s["legs"]:
-            _open(s, c, key, "short", dep["id"], price, now.isoformat(), None, "做空版入场规则成立（熊市），开空")
+            _open(s, c, key, "short", dep["id"], price, now.isoformat(), None,
+                  "做空版入场规则成立（熊市），开空" if strict else "做空版入场规则成立，开空（即时测试）")
 
 
 def update(price: float | None, now: datetime | None = None, df5: pd.DataFrame | None = None) -> dict:

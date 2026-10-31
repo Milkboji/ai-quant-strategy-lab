@@ -199,8 +199,8 @@ def leverage_panel() -> None:
     with st.container(border=True):
         C.section(f"{sm['leverage']:g} 倍杠杆模拟账户（全部 BTC 策略 · 多空）", purple=True,
                   right=C.pill(f"多头腿 {sm['n_long']} · 空头腿 {sm['n_short']}", "purple"))
-        st.caption("做多：跟随全部 BTC 策略（含实验位）的每一笔真实 Paper 成交；做空：每个策略的规则上下翻转成「做空版」，训练期赚钱的才启用，"
-                   "只在熊市（BTC 日线低于 200 日均线）开空（Alpaca 现货不能做空，所以只在这里记账）。每条腿名义价值 = 2 倍 × 起始保证金 × 该策略额度占比；"
+        st.caption("做多：跟随全部 BTC 策略（含实验位）的每一笔真实 Paper 成交；做空：每个策略的规则上下翻转成「做空版」，全部即时测试——"
+                   "做空版此刻持有空单就开空、离场就平空（Alpaca 现货不能做空，所以只在这里记账）。每条腿名义价值 = 2 倍 × 起始保证金 × 该策略额度占比；"
                    "含 0.07% 手续费、每 8 小时 0.01% 资金费率、整体强平。只是本地计算，不连接任何交易所、不下单。")
         c = st.columns(5)
         c[0].metric("保证金权益 USD", f"{sm['equity']:,.2f}", f"{sm['pnl_pct']:+.2f}%")

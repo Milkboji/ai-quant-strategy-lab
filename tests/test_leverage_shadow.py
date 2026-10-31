@@ -69,10 +69,11 @@ def test_account_liquidation(lev):
 
 def test_short_leg_opens_and_covers_when_qualified(lev, monkeypatch):
     a = lev(1000)
+    db.set_setting("lev_shadow_config", {"short_mode": "qualified"})      # 严格模式：资格 + 熊市
     df5 = pd.DataFrame({"ts": [pd.Timestamp(T0)], "open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0], "volume": [1.0]})
     monkeypatch.setattr(shortside, "status", lambda vid: {"ok": True})
     sig = {"bar": "b1", "open": True, "cover": False, "close": 100000.0, "sl": 3.0, "tp": None, "max_hold": None, "tf": 60}
-    monkeypatch.setattr(shortside, "live_signal", lambda dep, d, now: dict(sig))
+    monkeypatch.setattr(shortside, "live_signal", lambda dep, d, now, bear_only=True: dict(sig))
     s = ls.update(100000, T0, df5)
     assert s["legs"][f"S{a}"]["side"] == "short"
     s = ls.update(99000, T0 + timedelta(minutes=5), df5)            # 同一根K线不重复处理
@@ -115,3 +116,21 @@ def test_inverted_short_version_profits_in_downtrend():
     assert r["trades"] >= 3 and r["return_pct"] > 0
     off = shortside.simulate(fr, sch, fee=0.0007, funding_8h=0.0, bear=np.zeros(n, dtype=bool))
     assert off["trades"] == 0                                      # 不是熊市就不开空
+
+
+def test_instant_mode_short_leg_follows_short_version_state(lev, monkeypatch):
+    """默认即时测试：不等资格、不加熊市过滤，空头腿跟随做空版此刻的持仓状态。"""
+    a = lev(1000)
+    df5 = pd.DataFrame({"ts": [pd.Timestamp(T0)], "open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0], "volume": [1.0]})
+    monkeypatch.setattr(shortside, "status", lambda vid: None)            # 没有资格结论也照样测试
+    sig = {"bar": "b1", "hold": True, "open": False, "cover": False, "close": 100000.0, "sl": None, "tp": None,
+           "max_hold": None, "tf": 60}
+    seen = {}
+    monkeypatch.setattr(shortside, "live_signal",
+                        lambda dep, d, now, bear_only=True: seen.setdefault("bear_only", bear_only) is not None and dict(sig))
+    s = ls.update(100000, T0, df5)
+    assert f"S{a}" in s["legs"] and seen["bear_only"] is False
+    assert ls.summary(99000)["pnl"] > 0                                       # 价格下跌，空头腿权益随之变化
+    sig.update(bar="b2", hold=False)
+    s = ls.update(99000, T0 + timedelta(hours=1), df5)
+    assert f"S{a}" not in s["legs"] and s["cash"] > 10000

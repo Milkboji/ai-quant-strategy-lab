@@ -152,7 +152,7 @@ def simulate(frame: pd.DataFrame, sch, fee: float = 0.0007, funding_8h: float = 
             pos = {"entry": float(cl[i]), "t": ct[i], "i": i}
     ret = (eq - 1) * 100
     dd = mdd * 100
-    return {"trades": len(trades), "return_pct": round(ret, 2), "max_dd_pct": round(dd, 2),
+    return {"open_pos": ({"entry": pos["entry"], "t": str(pos["t"])} if pos is not None else None), "trades": len(trades), "return_pct": round(ret, 2), "max_dd_pct": round(dd, 2),
             "ret_dd": round(ret / abs(dd), 3) if dd else (round(ret, 3) if ret > 0 else 0.0),
             "win_rate": round(sum(1 for t in trades if t["ret_pct"] > 0) / len(trades) * 100, 1) if trades else None,
             "detail": trades[-20:]}
@@ -233,7 +233,7 @@ def maybe_qualify() -> bool:
     return True
 
 
-def live_signal(dep: dict, df5: pd.DataFrame, now: datetime) -> dict | None:
+def live_signal(dep: dict, df5: pd.DataFrame, now: datetime, bear_only: bool = True) -> dict | None:
     """最新一根已完成 K 线上的做空信号：{"bar": iso, "open": bool, "cover": bool, "close": px, "high", "low"}。"""
     from .engine.signals import build_frame
     from .strategy import registry
@@ -248,9 +248,14 @@ def live_signal(dep: dict, df5: pd.DataFrame, now: datetime) -> dict | None:
     frame = build_frame(df5, sch, tf, aux, data_end=pd.Timestamp(now))
     if len(frame) < 3:
         return None
-    opn, cov = signal_arrays(frame, sch, bear_mask(frame, df5))
+    bear = bear_mask(frame, df5) if bear_only else None
+    opn, cov = signal_arrays(frame, sch, bear)
     i = len(frame) - 1
-    return {"bar": pd.Timestamp(frame["close_time"].iloc[i]).isoformat(), "open": bool(opn[i]),
+    tail = max(0, len(frame) - 500)   # 用同一套 simulate 推算做空版「此刻是否持有空单」（含止损止盈），即时测试按这个状态开平
+    st = simulate(frame.iloc[tail:].reset_index(drop=True), sch, fee=0.0, funding_8h=0.0,
+                  bear=bear[tail:] if bear is not None else None)
+    return {"hold": st["open_pos"] is not None, "hold_entry": (st["open_pos"] or {}).get("entry"),
+            "bar": pd.Timestamp(frame["close_time"].iloc[i]).isoformat(), "open": bool(opn[i]),
             "cover": bool(cov[i]), "close": float(frame["close"].iloc[i]), "sl": sch.stop_loss_pct,
             "tp": sch.take_profit_pct, "max_hold": sch.max_hold_bars, "tf": tf}
 
