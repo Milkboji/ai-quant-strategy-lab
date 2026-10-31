@@ -171,6 +171,19 @@ def _card(r: dict, actor: str, rl: str, focus: bool) -> None:
                                            for k, a, b in r["diff"]]), hide_index=True, use_container_width=True)
 
 
+def _synced_toggle(container, label: str, db_on: bool, key: str, help_: str) -> bool:
+    """锁定开关：数据库里的锁定状态在别处变了（例如手动部署后自动锁定 7 天），先把控件同步过来，
+    只有用户真的拨动开关时才返回不同的值（10-31：部署后页面重跑，控件旧值把刚加的锁解除了）。"""
+    seen = f"{key}__db"
+    if st.session_state.get(seen) != db_on:
+        st.session_state[key] = db_on
+        st.session_state[seen] = db_on
+    on = container.toggle(label, key=key, help=help_)
+    if on != db_on:
+        st.session_state[seen] = on      # 用户的改动随后写进数据库
+    return on
+
+
 def _lock_toggle(r: dict, actor: str, rl: str) -> None:
     key, lk = r["key"], r["lock"]
     if lk and lk.get("until"):
@@ -179,8 +192,8 @@ def _lock_toggle(r: dict, actor: str, rl: str) -> None:
         why = f"{lk.get('by') or ''} 手动锁定，不会自动到期"
     else:
         why = "未锁定：挑战者胜出后按规则自动晋级" if not r["block"] else f"未锁定（{r['block']}）"
-    on = st.toggle("锁定版本", value=bool(lk), key=f"cs_lock_{key}", help="锁定后，自动进化仍会生成并前向测试挑战者，"
-                   "但胜出后不会自动替换，只进入待确认队列")
+    on = _synced_toggle(st, "锁定版本", bool(lk), f"cs_lock_{key}", "锁定后，自动进化仍会生成并前向测试挑战者，"
+                        "但胜出后不会自动替换，只进入待确认队列")
     st.caption(why)
     if on != bool(lk):
         try:
@@ -381,8 +394,8 @@ def _etf_card(r: dict, actor: str, rl: str, focus: bool) -> None:
                 why = f"{lk.get('by') or ''} 手动锁定，不会自动到期"
             else:
                 why = "未锁定：挑战者胜出后按规则自动晋级" if not r["block"] else f"未锁定（{r['block']}）"
-            on = st.toggle("锁定版本", value=bool(lk), key="cs_lock_etf", help="锁定后，自动进化仍会生成并前向测试挑战者，"
-                           "但胜出后不会自动替换，只进入待确认队列")
+            on = _synced_toggle(st, "锁定版本", bool(lk), "cs_lock_etf", "锁定后，自动进化仍会生成并前向测试挑战者，"
+                                "但胜出后不会自动替换，只进入待确认队列")
             st.caption(why)
             if on != bool(lk):
                 try:

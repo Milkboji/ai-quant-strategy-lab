@@ -563,3 +563,30 @@ def test_validation_quota_counts_used_runs(clean):
     db.ex("INSERT INTO holdout_touches(version_id,split,window_start,window_end,touched_at) VALUES(?,?,?,?,?)",
           (v["id"], "validation", "a", "b", db.now_iso()))
     assert actions.validation_quota(v["lineage_id"])["remaining"] == 2
+
+
+def test_lock_toggle_follows_lock_set_elsewhere(clean, monkeypatch):
+    """手动部署后自动锁定 7 天：页面重跑时锁定开关要跟上，不能用控件里的旧值把锁解除（10-31 实际发生过）。"""
+    from streamlit.testing.v1 import AppTest
+
+    orig = console.rows
+    monkeypatch.setattr(console, "rows", lambda broker="mock", price=None: orig("mock", price))   # 页面默认只看 alpaca_paper
+
+    def app():
+        from aiquant import auth
+        from aiquant.ui import page_console
+        auth.ensure()
+        page_console.render()                                 # 本机免登录 = 管理员
+
+    v1 = _version(5, "总台测试L", new_lineage=True)
+    did = console.deploy_version("slot:5", v1["id"], actor="tester", role="admin", broker="mock")["deployment_id"]
+    console._set_lock(pr.get_deployment(did), None)
+    at = AppTest.from_function(app, default_timeout=120)
+    at.run()
+    assert not at.exception
+    assert any(t.label == "锁定版本" and t.value is False for t in at.toggle)
+    console.lock_after_manual_deploy(did, "tester")          # 在页面之外加锁（部署按钮的效果）
+    at.run()
+    assert not at.exception
+    assert console.lock_state(pr.get_deployment(did)), "页面重跑后锁被解除了"
+    assert any(t.label == "锁定版本" and t.value is True for t in at.toggle)
